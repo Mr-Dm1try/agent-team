@@ -105,3 +105,12 @@ class LLMClient(Protocol):
     def context_budget(self, agent: AgentName) -> int:
         """Max prompt tokens for this agent's model, from the routing file."""
         ...
+
+    def use_stronger_model(self, task_id: str) -> object:
+        """Route this task's next calls to the routing file's stronger model
+        (the STRONGER_MODEL decision). Returns the route now in force."""
+        ...
+
+    def set_override(self, task_id: str, route: Any) -> None:
+        """Set or, with ``None``, clear a per-task route override."""
+        ...
