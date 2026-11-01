@@ -285,6 +285,7 @@ class Verdict(Contract):
     task_id: str | None = None
     phase: Phase | None = None
     passed: bool
+    summary: str | None = None  # the auditor model's short explanation of the verdict
     findings: list[Finding] = Field(default_factory=list)
     rules_checked: list[str] = Field(default_factory=list)
     model: str | None = None
