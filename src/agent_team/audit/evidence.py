@@ -1,0 +1,926 @@
+"""Evidence helpers: a few lines of Python per rule that gather exact answers.
+
+Each helper reads an ``AuditContext`` and returns a ``HelperResult``: findings for
+exact hits (``from_helper=True``) and notes the auditor model reads as evidence. A
+helper hit on a blocker rule fails the step even if the model misses it. Helpers never
+run code and never write; they read artifacts, the task store, the tool-call log and
+files in the run's workspace.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ValidationError
+
+from agent_team.audit import patterns
+from agent_team.audit.toollog import ToolCall
+from agent_team.core.artifacts import (
+    ARTIFACT_TYPES,
+    PRD,
+    Artifact,
+    ArtifactBase,
+    ArtifactRef,
+    CodeChange,
+    Plan,
+    QAReport,
+    ResearchAnswer,
+    ResearchBrief,
+    Spec,
+)
+from agent_team.core.models import (
+    AgentName,
+    Decision,
+    Finding,
+    Phase,
+    Rule,
+    RuleScope,
+    Run,
+    Severity,
+    Task,
+    TaskOrigin,
+    TaskStatus,
+    Verdict,
+)
+
+#: Upstream order of artifact kinds; used to find the earliest artifact at fault.
+KIND_ORDER: dict[str, int] = {
+    "plan": 0,
+    "research_brief": 1,
+    "research_answer": 1,
+    "prd": 2,
+    "spec": 3,
+    "code_change": 4,
+    "qa_report": 5,
+}
+KIND_PHASE: dict[str, Phase] = {
+    "plan": Phase.PLANNING,
+    "research_brief": Phase.PLANNING,
+    "research_answer": Phase.PLANNING,
+    "prd": Phase.PRD,
+    "spec": Phase.SPEC,
+    "code_change": Phase.IMPLEMENTATION,
+    "qa_report": Phase.IMPLEMENTATION,
+}
+
+MAX_FILE_BYTES = 200_000
+REVISION_ORIGINS = frozenset(
+    {TaskOrigin.REVISION, TaskOrigin.CHANGE_REQUEST, TaskOrigin.GATE_FIX, TaskOrigin.USER_RERUN}
+)
+READ_TOOLS = frozenset({"read_file", "list_dir", "grep", "web_fetch", "fetch", "open_url"})
+OUTGOING_TOOLS = frozenset({"web_fetch", "web_search", "fetch", "http_request", "open_url"})
+
+
+def ref_of(artifact: ArtifactBase) -> ArtifactRef:
+    kind: str = getattr(artifact, "kind")  # noqa: B009 - every concrete artifact has kind
+    return ArtifactRef(kind=kind, version=max(artifact.version, 1))
+
+
+@dataclass
+class AuditContext:
+    """What one sweep can see. Built by the auditor from the stores."""
+
+    run: Run
+    scope: RuleScope
+    phase: Phase | None = None
+    task: Task | None = None
+    artifact: Artifact | None = None  # task sweep: the task's output
+    previous: Artifact | None = None  # task sweep: the version before it, on revisions
+    outputs: list[tuple[Task, Artifact]] = field(default_factory=list)  # in scope
+    latest: dict[str, Artifact] = field(default_factory=dict)  # latest of every kind
+    tasks: list[Task] = field(default_factory=list)  # every task in the run
+    tool_calls: list[ToolCall] = field(default_factory=list)  # in scope
+    decisions: list[Decision] = field(default_factory=list)  # run sweep
+    verdicts: dict[str, list[Verdict]] = field(default_factory=dict)  # run sweep, by task
+
+    # --- lookups ---
+
+    def find(self, kind: str) -> Artifact | None:
+        """The newest artifact of ``kind`` in scope, else the latest in the run."""
+        mine = [a for _, a in self.outputs if getattr(a, "kind") == kind]  # noqa: B009
+        if mine:
+            return max(mine, key=lambda a: a.version)
+        return self.latest.get(kind)
+
+    def of_type[T: ArtifactBase](self, cls: type[T]) -> list[tuple[Task, T]]:
+        return [(t, a) for t, a in self.outputs if isinstance(a, cls)]
+
+    def read_workspace(self, rel: str) -> str | None:
+        if not patterns.inside(rel, self.run.workspace):
+            return None
+        path = Path(rel) if Path(rel).is_absolute() else Path(self.run.workspace) / rel
+        try:
+            if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
+                return None
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def code_files(self) -> list[tuple[Task, CodeChange, str, str]]:
+        """(task, code_change, path, text) for each file the in-scope code changes wrote."""
+        seen: set[str] = set()
+        out: list[tuple[Task, CodeChange, str, str]] = []
+        for task, change in reversed(self.of_type(CodeChange)):
+            for path in change.files_written:
+                if path in seen:
+                    continue
+                seen.add(path)
+                text = self.read_workspace(path)
+                if text is not None:
+                    out.append((task, change, path, text))
+        return out
+
+    @property
+    def allowed_hosts(self) -> list[str]:
+        spec = self.find("spec")
+        return list(spec.allowed_hosts) if isinstance(spec, Spec) else []
+
+    def ran(self) -> list[ToolCall]:
+        """Tool calls that actually ran; the pre-check stopped the others."""
+        return [c for c in self.tool_calls if not c.blocked]
+
+
+@dataclass
+class HelperResult:
+    findings: list[Finding] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+Helper = Callable[[AuditContext, Rule], HelperResult]
+HELPERS: dict[str, Helper] = {}
+
+
+def helper(name: str) -> Callable[[Helper], Helper]:
+    def register(fn: Helper) -> Helper:
+        HELPERS[name] = fn
+        return fn
+
+    return register
+
+
+def hit(
+    rule: Rule,
+    message: str,
+    *,
+    item: str | None = None,
+    artifact: ArtifactBase | ArtifactRef | None = None,
+    evidence: str | None = None,
+    fix: str | None = None,
+    severity: Severity | None = None,
+) -> Finding:
+    ref = ref_of(artifact) if isinstance(artifact, ArtifactBase) else artifact
+    return Finding(
+        rule_id=rule.id,
+        severity=severity or rule.severity,
+        artifact=ref,
+        item=item,
+        message=message,
+        evidence=evidence,
+        suggested_fix=fix,
+        from_helper=True,
+    )
+
+
+def gather(ctx: AuditContext, rules: Iterable[Rule]) -> dict[str, HelperResult]:
+    """Run the helper of each rule. A crashing helper becomes a note, never a pass."""
+    out: dict[str, HelperResult] = {}
+    for rule in rules:
+        fn = HELPERS.get(rule.helper or "")
+        if fn is None:
+            continue
+        try:
+            out[rule.id] = fn(ctx, rule)
+        except Exception as exc:  # a helper bug must not wave a step through
+            out[rule.id] = HelperResult(
+                findings=[
+                    hit(
+                        rule,
+                        f"evidence helper '{rule.helper}' failed: {type(exc).__name__}: {exc}",
+                        severity=Severity.BLOCKER,
+                    )
+                ]
+                if rule.severity is Severity.BLOCKER
+                else [],
+                notes=[f"helper error: {type(exc).__name__}: {exc}"],
+            )
+    return out
+
+
+def _missing(rule: Rule, kind: str) -> HelperResult:
+    return HelperResult(findings=[hit(rule, f"no {kind} artifact to check", item=kind)])
+
+
+# --- planning ----------------------------------------------------------------------
+
+_PLANNABLE = {a.value for a in AgentName} - {AgentName.AUDITOR.value, AgentName.ORCHESTRATOR.value}
+
+
+@helper("plan_graph")
+def plan_graph(ctx: AuditContext, rule: Rule) -> HelperResult:
+    plan = ctx.find("plan")
+    if not isinstance(plan, Plan):
+        return _missing(rule, "plan")
+    res = HelperResult()
+    keys = [t.key for t in plan.tasks]
+    phases = {p.value for p in Phase}
+    if not plan.tasks:
+        res.findings.append(hit(rule, "the plan has no tasks", artifact=plan))
+    for dup in sorted({k for k in keys if keys.count(k) > 1}):
+        res.findings.append(hit(rule, f"task key {dup} is used twice", item=dup, artifact=plan))
+    for t in plan.tasks:
+        if t.agent not in _PLANNABLE:
+            res.findings.append(hit(rule, f"unknown agent '{t.agent}'", item=t.key, artifact=plan))
+        if t.phase not in phases:
+            res.findings.append(hit(rule, f"unknown phase '{t.phase}'", item=t.key, artifact=plan))
+        if not t.objective.strip():
+            res.findings.append(hit(rule, "task has no objective", item=t.key, artifact=plan))
+        if t.output_kind not in ARTIFACT_TYPES:
+            res.findings.append(
+                hit(rule, f"unknown output kind '{t.output_kind}'", item=t.key, artifact=plan)
+            )
+        for dep in t.depends_on:
+            if dep not in keys:
+                res.findings.append(
+                    hit(rule, f"depends on unknown task '{dep}'", item=t.key, artifact=plan)
+                )
+    cycle = _find_cycle({t.key: [d for d in t.depends_on if d in keys] for t in plan.tasks})
+    if cycle:
+        res.findings.append(
+            hit(rule, "dependency cycle: " + " -> ".join(cycle), item=cycle[0], artifact=plan)
+        )
+    ask_ids = {a.id for a in plan.asks}
+    covered = {a for t in plan.tasks for a in t.covers_asks}
+    if not plan.asks:
+        res.findings.append(hit(rule, "the plan lists no asks", artifact=plan))
+    for ask in plan.asks:
+        if ask.id not in covered:
+            res.findings.append(
+                hit(rule, f"{ask.id} is not covered by any task", item=ask.id, artifact=plan)
+            )
+    for t in plan.tasks:
+        for a in t.covers_asks:
+            if a not in ask_ids:
+                res.findings.append(
+                    hit(rule, f"covers unknown ask '{a}'", item=t.key, artifact=plan)
+                )
+    res.notes.append(f"{len(plan.tasks)} tasks, {len(plan.asks)} asks: {sorted(ask_ids)}")
+    return res
+
+
+def _find_cycle(graph: dict[str, list[str]]) -> list[str] | None:
+    state: dict[str, int] = {}
+    stack: list[str] = []
+
+    def visit(node: str) -> list[str] | None:
+        state[node] = 1
+        stack.append(node)
+        for nxt in graph.get(node, []):
+            if state.get(nxt) == 1:
+                return [*stack[stack.index(nxt) :], nxt]
+            if state.get(nxt) is None:
+                found = visit(nxt)
+                if found:
+                    return found
+        stack.pop()
+        state[node] = 2
+        return None
+
+    for node in graph:
+        if state.get(node) is None:
+            found = visit(node)
+            if found:
+                return found
+    return None
+
+
+# --- every task ----------------------------------------------------------------------
+
+
+@helper("schema")
+def schema(ctx: AuditContext, rule: Rule) -> HelperResult:
+    task, artifact = ctx.task, ctx.artifact
+    if task is None:
+        return HelperResult()
+    if artifact is None:
+        return HelperResult(
+            findings=[hit(rule, f"no {task.output_kind} artifact was produced", item=task.id)]
+        )
+    kind: str = getattr(artifact, "kind")  # noqa: B009
+    if kind != task.output_kind:
+        return HelperResult(
+            findings=[
+                hit(
+                    rule,
+                    f"expected a {task.output_kind} artifact, got {kind}",
+                    item=task.id,
+                    artifact=artifact,
+                )
+            ]
+        )
+    try:
+        ARTIFACT_TYPES[kind].model_validate(artifact.model_dump())
+    except ValidationError as exc:
+        return HelperResult(
+            findings=[hit(rule, "artifact fails its schema", artifact=artifact, evidence=str(exc))]
+        )
+    return HelperResult(notes=[f"{kind}@v{artifact.version} parses into its schema"])
+
+
+def _texts(model: BaseModel) -> str:
+    return model.model_dump_json(indent=1)
+
+
+@helper("secrets")
+def secrets(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    sources: list[tuple[str, str, ArtifactBase | None]] = []
+    for _, artifact in ctx.outputs:
+        sources.append((str(ref_of(artifact)), _texts(artifact), artifact))
+    for _, change, path, text in ctx.code_files():
+        sources.append((path, text, change))
+    for call in ctx.ran():
+        sources.append((f"tool call {call.tool}", str(call.args) + "\n" + call.result, None))
+    for where, text, source in sources:
+        for h in patterns.find_secrets(text):
+            res.findings.append(
+                hit(
+                    rule,
+                    f"{h.kind} in {where}",
+                    item=f"{where}:{h.line}",
+                    artifact=source,
+                    evidence=f"{h.redacted} (line {h.line})",
+                    fix="read it from an environment variable or a secrets file outside the "
+                    "workspace",
+                )
+            )
+    res.notes.append(f"scanned {len(sources)} artifacts, files and tool calls for secrets")
+    return res
+
+
+@helper("dangerous_actions")
+def dangerous_actions(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    for call in ctx.ran():
+        command = patterns.command_text(call.args)
+        problem = patterns.is_destructive(command) if command else None
+        if command and not problem and patterns.rm_outside(command, ctx.run.workspace):
+            problem = "deleted files outside the workspace"
+        if not problem and any(
+            patterns.touches_credentials(p) for p in patterns.path_args(call.args)
+        ):
+            problem = "read a credential file"
+        if not problem and command and patterns.touches_credentials(command):
+            problem = "command touches a credential file"
+        if problem:
+            res.findings.append(
+                hit(
+                    rule,
+                    f"{call.agent or 'agent'} {problem}",
+                    item=call.tool,
+                    evidence=str(call.args),
+                )
+            )
+    res.notes.append(f"checked {len(ctx.tool_calls)} tool calls for dangerous actions")
+    return res
+
+
+@helper("injected_instructions")
+def injected_instructions(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    calls = ctx.ran()
+    for i, call in enumerate(calls):
+        if call.tool not in READ_TOOLS:
+            continue
+        markers = patterns.injection_markers(call.result)
+        if not markers:
+            continue
+        after = calls[i + 1 :]
+        res.notes.append(
+            f"{call.tool} {call.args} returned text that looks like instructions "
+            f"({markers[:3]}); the {len(after)} tool calls after it were: "
+            + "; ".join(f"{c.tool} {c.args}" for c in after[:8])
+        )
+        planted = set(patterns.urls_in(call.result))
+        planted |= {
+            line.strip().strip("`$ ")
+            for line in call.result.splitlines()
+            if patterns.is_destructive(line)
+        }
+        for later in after:
+            later_text = str(later.args)
+            used = sorted(p for p in planted if p and p in later_text)
+            if used:
+                res.findings.append(
+                    hit(
+                        rule,
+                        f"after reading injected text from {call.tool}, the agent called "
+                        f"{later.tool} with content from it",
+                        item=later.tool,
+                        evidence=f"injected: {markers[0]!r}; reused: {used[:3]}",
+                    )
+                )
+    return res
+
+
+@helper("data_leaving")
+def data_leaving(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    allowed = ctx.allowed_hosts
+    for call in ctx.ran():
+        if call.tool in OUTGOING_TOOLS:
+            for h in patterns.find_secrets(str(call.args)):
+                res.findings.append(
+                    hit(
+                        rule,
+                        f"{call.tool} sent a {h.kind} out",
+                        item=call.tool,
+                        evidence=h.redacted,
+                    )
+                )
+        command = patterns.command_text(call.args)
+        if command:
+            hosts = patterns.uploads_to_external(command, allowed)
+            if hosts:
+                res.findings.append(
+                    hit(
+                        rule,
+                        f"command sent data to {', '.join(hosts)}",
+                        item=call.tool,
+                        evidence=command[:300],
+                    )
+                )
+    return res
+
+
+@helper("minimal_revision")
+def minimal_revision(ctx: AuditContext, rule: Rule) -> HelperResult:
+    task, new, old = ctx.task, ctx.artifact, ctx.previous
+    if task is None or new is None or old is None:
+        return HelperResult()
+    res = HelperResult()
+    changed = _changed_sections(old, new)
+    res.notes.append(
+        f"revision of {ref_of(old)} -> {ref_of(new)} ({task.origin.value}: {task.reason or ''}); "
+        f"changed: {changed or 'nothing'}"
+    )
+    spec = ctx.latest.get("spec")
+    if isinstance(new, CodeChange) and isinstance(spec, Spec) and spec.affected_files:
+        for path in new.files_written:
+            if path not in spec.affected_files:
+                res.findings.append(
+                    hit(
+                        rule,
+                        f"{path} changed but the spec revision doesn't list it as affected",
+                        item=path,
+                        artifact=new,
+                    )
+                )
+    return res
+
+
+def _changed_sections(old: ArtifactBase, new: ArtifactBase) -> list[str]:
+    skip = {"run_id", "task_id", "version", "built_from"}
+    a, b = old.model_dump(), new.model_dump()
+    out: list[str] = []
+    for key in sorted(set(a) | set(b)):
+        if key in skip or a.get(key) == b.get(key):
+            continue
+        before, after = a.get(key), b.get(key)
+        if isinstance(before, list) and isinstance(after, list):
+            out += [f"{key}[{i}]" for i in _changed_items(before, after)]
+        else:
+            out.append(key)
+    return out
+
+
+def _changed_items(before: list[Any], after: list[Any]) -> list[str]:
+    def key(x: Any, i: int) -> str:
+        if isinstance(x, dict):
+            return str(x.get("id") or x.get("name") or x.get("key") or i)
+        return str(i)
+
+    old = {key(x, i): x for i, x in enumerate(before)}
+    new = {key(x, i): x for i, x in enumerate(after)}
+    return sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+
+
+# --- research ------------------------------------------------------------------------
+
+
+@helper("sources_opened")
+def sources_opened(ctx: AuditContext, rule: Rule) -> HelperResult:
+    artifact = ctx.artifact
+    cited: list[str] = []
+    if isinstance(artifact, ResearchBrief):
+        cited = [s.ref for f in artifact.findings for s in f.sources]
+        cited += [s.ref for a in artifact.answers for s in a.sources]
+        cited += [s.ref for s in artifact.file_excerpts]
+    elif isinstance(artifact, ResearchAnswer):
+        cited = [s.ref for s in artifact.sources]
+    else:
+        return HelperResult()
+    ws = ctx.run.workspace
+    opened: set[str] = set()
+    for call in ctx.ran():
+        if call.tool not in READ_TOOLS or call.is_error:
+            continue
+        for key in ("url", "path", "file", "file_path"):
+            value = call.args.get(key)
+            if isinstance(value, str):
+                opened.add(patterns.normalize_source(value, ws))
+    res = HelperResult(notes=[f"opened in this task: {sorted(opened)}"])
+    for ref in sorted(set(cited)):
+        norm = patterns.normalize_source(ref, ws)
+        if norm not in opened and not any(norm.startswith(o.rstrip("/") + "/") for o in opened):
+            res.findings.append(
+                hit(
+                    rule,
+                    f"cites {ref} but never opened it",
+                    item=ref,
+                    artifact=artifact,
+                    fix="open the source with read_file or web_fetch, or drop the claim",
+                )
+            )
+    return res
+
+
+@helper("brief_complete")
+def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
+    brief = ctx.artifact
+    if not isinstance(brief, ResearchBrief):
+        return HelperResult()
+    res = HelperResult()
+    plan = ctx.latest.get("plan")
+    if isinstance(plan, Plan) and plan.research_questions:
+        res.notes.append(f"research questions in the plan: {plan.research_questions}")
+    if ctx.task is not None:
+        res.notes.append(f"task objective: {ctx.task.objective}")
+    if not brief.answers:
+        res.findings.append(hit(rule, "the brief answers no questions", artifact=brief))
+    for i, ans in enumerate(brief.answers, start=1):
+        if not (ans.answer or "").strip() and not (ans.gap or "").strip():
+            res.findings.append(
+                hit(
+                    rule,
+                    f"question {i} has neither an answer nor a reason it couldn't be answered",
+                    item=ans.question[:80],
+                    artifact=brief,
+                )
+            )
+    return res
+
+
+# --- PRD and spec gates --------------------------------------------------------------
+
+
+@helper("testable_prd")
+def testable_prd(ctx: AuditContext, rule: Rule) -> HelperResult:
+    prd = ctx.find("prd")
+    if not isinstance(prd, PRD):
+        return _missing(rule, "prd")
+    res = HelperResult(notes=[f"{len(prd.requirements)} requirements"])
+    if not prd.requirements:
+        res.findings.append(hit(rule, "the PRD has no requirements", artifact=prd))
+    for req in prd.requirements:
+        if not req.acceptance_criteria:
+            res.findings.append(
+                hit(rule, f"{req.id} has no acceptance criterion", item=req.id, artifact=prd)
+            )
+    return res
+
+
+@helper("spec_coverage")
+def spec_coverage(ctx: AuditContext, rule: Rule) -> HelperResult:
+    spec, prd = ctx.find("spec"), ctx.find("prd")
+    if not isinstance(spec, Spec):
+        return _missing(rule, "spec")
+    if not isinstance(prd, PRD):
+        return _missing(rule, "prd")
+    res = HelperResult()
+    mapped = {r for c in spec.components for r in c.requirements}
+    checked = {ac for chk in spec.checks for ac in chk.criteria}
+    for req in prd.requirements:
+        if req.id not in mapped:
+            res.findings.append(
+                hit(rule, f"{req.id} maps to no component", item=req.id, artifact=spec)
+            )
+        for ac in req.acceptance_criteria:
+            if ac.id not in checked:
+                res.findings.append(
+                    hit(rule, f"{ac.id} has no planned check", item=ac.id, artifact=spec)
+                )
+    return res
+
+
+@helper("coverage_scope")
+def coverage_scope(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    plan, prd, spec = ctx.find("plan"), ctx.find("prd"), ctx.find("spec")
+    if ctx.phase is Phase.PRD:
+        if not isinstance(prd, PRD):
+            return _missing(rule, "prd")
+        if not isinstance(plan, Plan):
+            return _missing(rule, "plan")
+        asks = {a.id for a in plan.asks}
+        cited = {a for r in prd.requirements for a in r.asks}
+        for ask in plan.asks:
+            if ask.id not in cited:
+                res.findings.append(
+                    hit(rule, f"{ask.id} maps to no requirement", item=ask.id, artifact=prd)
+                )
+        for req in prd.requirements:
+            unknown = [a for a in req.asks if a not in asks]
+            if unknown:
+                res.findings.append(
+                    hit(
+                        rule,
+                        f"{req.id} cites asks the request doesn't have: {unknown}",
+                        item=req.id,
+                        artifact=prd,
+                        severity=Severity.WARNING,
+                    )
+                )
+    elif ctx.phase is Phase.SPEC:
+        if not isinstance(spec, Spec):
+            return _missing(rule, "spec")
+        reqs = {r.id for r in prd.requirements} if isinstance(prd, PRD) else set()
+        for comp in spec.components:
+            extra = [r for r in comp.requirements if reqs and r not in reqs]
+            if not comp.requirements or extra:
+                res.findings.append(
+                    hit(
+                        rule,
+                        f"component {comp.name} serves no PRD requirement"
+                        + (f" (unknown: {extra})" if extra else ""),
+                        item=comp.name,
+                        artifact=spec,
+                        severity=Severity.WARNING,
+                    )
+                )
+    return res
+
+
+@helper("open_questions")
+def open_questions(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    for _, artifact in ctx.outputs:
+        for q in artifact.questions:
+            if not (q.answer or "").strip() and not (q.assumption or "").strip():
+                res.findings.append(
+                    hit(
+                        rule,
+                        f"question {q.id} is neither answered nor recorded as an assumption",
+                        item=q.id,
+                        artifact=artifact,
+                        evidence=q.text,
+                        fix="ask the user, or record an assumption",
+                    )
+                )
+    return res
+
+
+# --- implementation gate -------------------------------------------------------------
+
+
+@helper("files_exist")
+def files_exist(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    spec = ctx.find("spec")
+    if not isinstance(spec, Spec):
+        return _missing(rule, "spec")
+    planned = sorted({f for c in spec.components for f in c.files})
+    for path in planned:
+        full = Path(path) if Path(path).is_absolute() else Path(ctx.run.workspace) / path
+        if not patterns.inside(path, ctx.run.workspace) or not full.exists():
+            res.findings.append(
+                hit(rule, f"planned file {path} doesn't exist in the workspace", item=path)
+            )
+    for _task, change in ctx.of_type(CodeChange):
+        for path in change.files_written:
+            if not patterns.inside(path, ctx.run.workspace):
+                res.findings.append(
+                    hit(rule, f"{path} is outside the workspace", item=path, artifact=change)
+                )
+    for call in ctx.ran():
+        if call.tool in ("write_file", "edit_file", "append_file"):
+            for path in patterns.path_args(call.args):
+                if not patterns.inside(path, ctx.run.workspace):
+                    res.findings.append(
+                        hit(rule, f"{call.tool} wrote outside the workspace: {path}", item=path)
+                    )
+    res.notes.append(f"planned files: {planned}")
+    return res
+
+
+@helper("tests_ran")
+def tests_ran(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    changes = ctx.of_type(CodeChange)
+    if not changes:
+        return _missing(rule, "code_change")
+    for task, change in changes:
+        tests = change.tests
+        if tests is None:
+            res.findings.append(
+                hit(rule, "no unit test run is reported", item=task.id, artifact=change)
+            )
+            continue
+        if tests.exit_code != 0 or tests.failed > 0 or tests.passed == 0:
+            res.findings.append(
+                hit(
+                    rule,
+                    f"tests didn't pass: {tests.passed} passed, {tests.failed} failed, "
+                    f"exit {tests.exit_code}",
+                    item=task.id,
+                    artifact=change,
+                    evidence=tests.output_tail[-500:],
+                )
+            )
+        ran = [
+            c
+            for c in ctx.ran()
+            if c.task_id == task.id
+            and tests.command.strip()
+            and tests.command.strip() in patterns.command_text(c.args)
+        ]
+        if not ran:
+            res.findings.append(
+                hit(
+                    rule,
+                    f"the tool log has no run of '{tests.command}' for this task",
+                    item=task.id,
+                    artifact=change,
+                    fix="run the tests with run_command and report that result",
+                )
+            )
+    return res
+
+
+@helper("qa_clean")
+def qa_clean(ctx: AuditContext, rule: Rule) -> HelperResult:
+    reports = ctx.of_type(QAReport)
+    report = reports[-1][1] if reports else ctx.find("qa_report")
+    if not isinstance(report, QAReport):
+        return _missing(rule, "qa_report")
+    res = HelperResult(notes=[f"QA ran end to end: {report.ran_end_to_end}"])
+    for issue in report.issues:
+        if issue.severity != "blocker":
+            continue
+        paths: list[str | None] = [*issue.files] or [None]
+        for path in paths:
+            res.findings.append(hit(rule, f"QA blocker: {issue.text}", item=path, artifact=report))
+    for result in report.results:
+        if result.result == "fail":
+            res.findings.append(
+                hit(
+                    rule,
+                    f"{result.criterion} failed in QA",
+                    item=result.criterion,
+                    artifact=report,
+                    evidence=result.evidence,
+                )
+            )
+        elif result.result == "not_checked":
+            res.notes.append(f"{result.criterion} was not checked")
+    return res
+
+
+@helper("interface_names")
+def interface_names(ctx: AuditContext, rule: Rule) -> HelperResult:
+    spec = ctx.find("spec")
+    if not isinstance(spec, Spec):
+        return HelperResult()
+    code = "\n".join(text for *_, text in ctx.code_files())
+    res = HelperResult()
+    for iface in spec.interfaces:
+        needle = _interface_needle(iface.name)
+        if not needle:
+            continue
+        pattern = re.escape(needle) if "/" in needle else rf"\b{re.escape(needle)}\b"
+        if not re.search(pattern, code):
+            res.findings.append(
+                hit(
+                    rule,
+                    f"interface {iface.name} from the spec isn't in the code",
+                    item=iface.name,
+                    artifact=spec,
+                )
+            )
+    return res
+
+
+def _interface_needle(name: str) -> str:
+    route = re.search(r"/[^\s{]*", name)
+    if route:
+        return route.group(0).rstrip("/") or "/"
+    words = re.findall(r"[A-Za-z_]\w*", name)
+    return words[-1] if words else ""
+
+
+@helper("dangerous_code")
+def dangerous_code(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    files = ctx.code_files()
+    for _, change, path, text in files:
+        for h in patterns.find_dangerous_code(text):
+            res.findings.append(
+                hit(
+                    rule,
+                    f"{h.what} in {path}",
+                    item=path,
+                    artifact=change,
+                    evidence=f"line {h.line}: {h.text}",
+                )
+            )
+    res.notes.append(f"scanned {len(files)} files")
+    return res
+
+
+@helper("unexpected_reach")
+def unexpected_reach(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult(notes=[f"allowed hosts: {ctx.allowed_hosts}"])
+    for _, change, path, text in ctx.code_files():
+        for host in patterns.external_hosts(text, ctx.allowed_hosts):
+            res.findings.append(
+                hit(
+                    rule,
+                    f"{path} reaches {host}, which the spec doesn't allow",
+                    item=path,
+                    artifact=change,
+                )
+            )
+        for h in patterns.find_outside_paths(text):
+            res.findings.append(
+                hit(
+                    rule,
+                    f"{path} uses a path outside the workspace: {h.text}",
+                    item=path,
+                    artifact=change,
+                    evidence=f"line {h.line}",
+                )
+            )
+    return res
+
+
+@helper("risky_dependencies")
+def risky_dependencies(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    spec = ctx.find("spec")
+    deps: list[tuple[str, ArtifactBase | None]] = []
+    if isinstance(spec, Spec):
+        deps += [(d, spec) for d in spec.dependencies]
+    reqs = ctx.read_workspace("requirements.txt")
+    if reqs:
+        deps += [
+            (line.split("#")[0].strip(), None)
+            for line in reqs.splitlines()
+            if line.split("#")[0].strip() and not line.strip().startswith("-")
+        ]
+    for dep, source in deps:
+        for issue in patterns.check_requirement(dep):
+            res.findings.append(hit(rule, f"{dep}: {issue.problem}", item=dep, artifact=source))
+    res.notes.append(f"dependencies: {[d for d, _ in deps]}")
+    return res
+
+
+# --- whole run -----------------------------------------------------------------------
+
+
+@helper("process_trail")
+def process_trail(ctx: AuditContext, rule: Rule) -> HelperResult:
+    res = HelperResult()
+    for task in ctx.tasks:
+        if task.status is TaskStatus.SUPERSEDED or task.agent in (
+            AgentName.USER,
+            AgentName.AUDITOR,
+        ):
+            continue
+        if task.status is not TaskStatus.DONE:
+            res.findings.append(
+                hit(rule, f"task ended as {task.status.value}, not done", item=task.id)
+            )
+            continue
+        if task.started_at is None or task.finished_at is None:
+            res.findings.append(hit(rule, "task has no start or end time", item=task.id))
+        if not ctx.verdicts.get(task.id):
+            res.findings.append(hit(rule, "task has no audit verdict", item=task.id))
+        # max_attempts plus the one attempt the policy may grant on the stronger model
+        if task.attempt > task.max_attempts + 1:
+            res.findings.append(
+                hit(
+                    rule,
+                    f"task ran {task.attempt} attempts, over its limit of {task.max_attempts}",
+                    item=task.id,
+                )
+            )
+    for decision in ctx.decisions:
+        if not decision.reason.strip():
+            res.findings.append(
+                hit(rule, f"decision {decision.kind.value} has no reason", item=decision.id)
+            )
+    res.notes.append(f"{len(ctx.tasks)} tasks, {len(ctx.decisions)} decisions")
+    return res

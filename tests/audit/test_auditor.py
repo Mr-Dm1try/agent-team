@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+
+from agent_team.audit.auditor import AUDIT_RULE, LLMAuditor
+from agent_team.audit.rule_store import SqliteRuleStore
+from agent_team.audit.toollog import InMemoryToolCallLog
+from agent_team.core.artifacts import PRD, AcceptanceCriterion, CodeChange, Requirement
+from agent_team.core.errors import BudgetExceeded, TransientLLMError
+from agent_team.core.models import AgentName, Phase, RuleScope, Run, Severity, TaskStatus
+
+from .fakes import (
+    FakeArtifactStore,
+    FakeDecisionLog,
+    FakeLLM,
+    FakeTaskStore,
+    FakeVerdictStore,
+    call,
+    make_task,
+)
+
+PASS: dict[str, object] = {"summary": "fine", "findings": []}
+
+
+@dataclass
+class Rig:
+    auditor: LLMAuditor
+    llm: FakeLLM
+    tasks: FakeTaskStore
+    artifacts: FakeArtifactStore
+    tool_log: InMemoryToolCallLog
+
+
+@pytest.fixture
+def rig(rule_store: SqliteRuleStore, tool_log: InMemoryToolCallLog) -> Rig:
+    llm, tasks, artifacts = FakeLLM(), FakeTaskStore(), FakeArtifactStore()
+    auditor = LLMAuditor(
+        llm=llm,
+        rules=rule_store,
+        tasks=tasks,
+        artifacts=artifacts,
+        verdicts=FakeVerdictStore(),
+        decisions=FakeDecisionLog(),
+        tool_log=tool_log,
+    )
+    return Rig(auditor, llm, tasks, artifacts, tool_log)
+
+
+def good_prd(**kw: object) -> PRD:
+    req = Requirement(
+        id="REQ-1",
+        text="list",
+        asks=["ASK-1"],
+        acceptance_criteria=[AcceptanceCriterion(id="AC-1.1", text="200")],
+    )
+    return PRD(summary="s", title="t", requirements=[req], **kw)
+
+
+async def test_task_pass(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_task(task, good_prd(), run)
+    assert verdict.passed and verdict.findings == []
+    assert verdict.scope is RuleScope.TASK and verdict.model == "fake-auditor"
+    assert set(verdict.rules_checked) == {"R1", "S1", "S5", "S6", "S7"}  # no R12: not a revision
+    assert rig.llm.requests[0].agent is AgentName.AUDITOR
+
+
+async def test_helper_hit_fails_even_if_model_misses_it(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_task(task, None, run)  # no artifact: R1 hit
+    assert not verdict.passed
+    assert [(f.rule_id, f.from_helper) for f in verdict.blockers] == [("R1", True)]
+
+
+async def test_model_finding_backed_by_helper_needs_no_second_check(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push({"findings": [{"rule_id": "R1", "item": task.id, "message": "nothing came back"}]})
+    verdict = await rig.auditor.audit_task(task, None, run)
+    assert len(rig.llm.requests) == 1
+    assert [(f.message, f.from_helper) for f in verdict.blockers] == [("nothing came back", True)]
+
+
+async def test_unsupported_blocker_downgraded_when_second_check_disagrees(
+    rig: Rig, run: Run
+) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push(
+        {"findings": [{"rule_id": "S6", "severity": "blocker", "message": "looks injected"}]},
+        {"confirmed": False, "reason": "no tool calls at all"},
+    )
+    verdict = await rig.auditor.audit_task(task, good_prd(), run)
+    assert verdict.passed
+    assert verdict.findings[0].severity is Severity.WARNING
+    assert "unconfirmed" in verdict.findings[0].message
+    assert "independently" in rig.llm.requests[1].system
+
+
+async def test_unsupported_blocker_kept_when_confirmed(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push(
+        {"findings": [{"rule_id": "S6", "message": "acted on page text", "artifact": "prd@v1"}]},
+        '```json\n{"confirmed": true}\n```',
+    )
+    verdict = await rig.auditor.audit_task(task, good_prd(), run)
+    assert not verdict.passed
+    assert (
+        verdict.blockers[0].artifact is not None and str(verdict.blockers[0].artifact) == "prd@v1"
+    )
+
+
+async def test_second_check_failure_keeps_the_blocker(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push({"findings": [{"rule_id": "S7", "message": "leak"}]}, "nope", "still nope")
+    verdict = await rig.auditor.audit_task(task, good_prd(), run)
+    assert not verdict.passed  # fail closed
+
+
+async def test_warning_rules_and_unknown_rules_never_block(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push({"findings": [{"rule_id": "Z1", "severity": "blocker", "message": "made up"}]})
+    verdict = await rig.auditor.audit_task(task, good_prd(), run)
+    assert verdict.passed and verdict.findings[0].severity is Severity.WARNING
+
+
+async def test_repair_loop_recovers_from_bad_json(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push("not json", {"findings": "wrong type"}, PASS)
+    verdict = await rig.auditor.audit_task(task, good_prd(), run)
+    assert verdict.passed
+    assert len(rig.llm.requests) == 3
+    assert "not valid JSON" in str(rig.llm.requests[2].messages[-1].content[0])
+
+
+async def test_fails_closed_without_a_valid_verdict(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push("x", "y", "z")
+    verdict = await rig.auditor.audit_task(task, good_prd(), run)
+    assert not verdict.passed
+    assert verdict.blockers[0].rule_id == AUDIT_RULE
+
+
+async def test_fails_closed_when_the_model_errors(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push(TransientLLMError("down", provider="fake"))
+    verdict = await rig.auditor.audit_task(task, None, run)
+    assert not verdict.passed
+    assert {f.rule_id for f in verdict.blockers} == {AUDIT_RULE, "R1"}  # helper hits kept
+
+
+async def test_budget_exceeded_propagates(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
+    rig.llm.push(BudgetExceeded("cap", limit="usd"))
+    with pytest.raises(BudgetExceeded):
+        await rig.auditor.audit_task(task, good_prd(), run)
+
+
+async def test_revision_brings_in_r12_and_previous_version(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd", attempt=2)
+    await rig.artifacts.save(good_prd(run_id=run.id, version=1))
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_task(task, good_prd(run_id=run.id, version=2), run)
+    assert "R12" in verdict.rules_checked
+    assert "Previous version prd@v1" in str(rig.llm.requests[0].messages[0].content[0])
+
+
+async def test_gate_sweep_reads_phase_outputs(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd", status=TaskStatus.DONE)
+    untestable = PRD(
+        summary="s",
+        title="t",
+        run_id=run.id,
+        requirements=[Requirement(id="REQ-1", text="x", asks=["ASK-1"], acceptance_criteria=[])],
+    )
+    task.output = await rig.artifacts.save(untestable)
+    await rig.tasks.create_task(task)
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_gate(run, Phase.PRD)
+    assert verdict.scope is RuleScope.PHASE and verdict.phase is Phase.PRD
+    assert {(f.rule_id, f.item) for f in verdict.blockers} >= {("R3", "REQ-1")}
+    assert "HIT: REQ-1 has no acceptance criterion" in str(
+        rig.llm.requests[0].messages[0].content[0]
+    )
+
+
+async def test_implementation_gate_with_code(rig: Rig, run: Run) -> None:
+    Path(run.workspace, "app.py").write_text("import os\nos.system(cmd)\n")  # noqa: ASYNC240
+    eng = make_task(
+        run, AgentName.ENGINEER, Phase.IMPLEMENTATION, "code_change", status=TaskStatus.DONE
+    )
+    eng.output = await rig.artifacts.save(
+        CodeChange(summary="s", run_id=run.id, files_written=["app.py"])
+    )
+    await rig.tasks.create_task(eng)
+    rig.tool_log.record(call(run, eng, "run_command", "ok", command="pytest -q"))
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_gate(run, Phase.IMPLEMENTATION)
+    rules = {f.rule_id for f in verdict.blockers}
+    assert {"S2", "R6", "R5", "R7"} <= rules  # dangerous code, no tests, no spec, no QA report
+
+
+async def test_run_sweep(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd", status=TaskStatus.RUNNING)
+    await rig.tasks.create_task(task)
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_run(run)
+    assert verdict.scope is RuleScope.RUN and verdict.rules_checked == ["R8"]
+    assert not verdict.passed and verdict.blockers[0].item == task.id
+
+
+async def test_no_rules_means_no_model_call(
+    rig: Rig, run: Run, rule_store: SqliteRuleStore
+) -> None:
+    await rule_store.set_enabled("R8", False)
+    verdict = await rig.auditor.audit_run(run)
+    assert verdict.passed and rig.llm.requests == []
