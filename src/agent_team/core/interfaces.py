@@ -225,6 +225,31 @@ class Auditor(Protocol):
         ...
 
 
+class VerdictPolicy(Protocol):
+    """Turns verdicts into Decisions (2c implements it); the orchestrator (2b) applies them.
+
+    The orchestrator, not the auditor, saves verdicts to VerdictStore and emits
+    ``audit_verdict``. Each Decision's ``inputs`` carries, by kind:
+
+    - RETRY: {"task_id"}
+    - ESCALATE: {"task_id"}
+    - NO_PROGRESS: {"task_id"}
+    - STRONGER_MODEL: {"task_id", "model"}
+    - UPSTREAM_RERUN: {"task_id", "artifact": "spec@v1"}
+    - GATE_FIX: {"task_id", "finding_ids": [...]}
+    - ASK_USER: {"task_id"?, "question"}
+    - STOP: {}
+
+    A passing verdict returns an empty list; the orchestrator marks the task done.
+    """
+
+    async def on_task_verdict(
+        self, run: Run, task: Task, verdict: Verdict, history: list[Verdict]
+    ) -> list[Decision]: ...
+
+    async def on_gate_verdict(self, run: Run, phase: Phase, verdict: Verdict) -> list[Decision]: ...
+
+
 class Dispatcher(Protocol):
     async def dispatch(self, task: Task) -> AgentResult:
         """Build the envelope, run the agent with a timeout, catch and classify errors,
