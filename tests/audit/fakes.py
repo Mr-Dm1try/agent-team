@@ -29,6 +29,7 @@ class FakeLLM:
     def __init__(self, replies: list[Any] | None = None) -> None:
         self.replies: list[Any] = list(replies or [])
         self.requests: list[LLMRequest] = []
+        self.overrides: dict[str, Any] = {}
 
     def push(self, *replies: Any) -> None:
         self.replies.extend(replies)
@@ -54,6 +55,16 @@ class FakeLLM:
 
     def context_budget(self, agent: AgentName) -> int:
         return 90_000
+
+    def use_stronger_model(self, task_id: str) -> object:
+        self.overrides[task_id] = "stronger"
+        return "stronger"
+
+    def set_override(self, task_id: str, route: Any) -> None:
+        if route is None:
+            self.overrides.pop(task_id, None)
+        else:
+            self.overrides[task_id] = route
 
 
 class FakeTaskStore:

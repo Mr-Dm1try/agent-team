@@ -254,6 +254,7 @@ class LLMAuditor:
                 if not any(_same(h, f) for f in findings):
                     findings.append(h)
         base.findings = findings
+        base.summary = reply.value.summary.strip() or None
         base.passed = not base.blockers
         return base
 

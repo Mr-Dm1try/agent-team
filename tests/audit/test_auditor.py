@@ -64,6 +64,7 @@ async def test_task_pass(rig: Rig, run: Run) -> None:
     rig.llm.push(PASS)
     verdict = await rig.auditor.audit_task(task, good_prd(), run)
     assert verdict.passed and verdict.findings == []
+    assert verdict.summary == "fine"
     assert verdict.scope is RuleScope.TASK and verdict.model == "fake-auditor"
     assert set(verdict.rules_checked) == {"R1", "S1", "S5", "S6", "S7"}  # no R12: not a revision
     assert rig.llm.requests[0].agent is AgentName.AUDITOR
