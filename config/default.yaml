@@ -1,0 +1,10 @@
+# Routing, budgets and review mode. Loaded by agent_team.llm (step 2a).
+defaults: {provider: anthropic, model: claude-haiku-5-5, context_budget: 90000}
+agents:
+  engineer: {provider: anthropic, model: claude-sonnet-5-5}
+  researcher: {provider: ollama, model: "gpt-oss:20b", context_budget: 20000}
+stronger_model: {provider: anthropic, model: claude-sonnet-5-5}
+fallbacks: [anthropic, ollama]
+budget: {max_usd_per_run: 1.00, max_minutes_per_run: 30}
+limits: {max_attempts: 3, max_upstream_reruns: 2, max_concurrent_calls: 4}
+review: auto_assumptions
