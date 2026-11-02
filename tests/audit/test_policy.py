@@ -22,7 +22,7 @@ from agent_team.core.models import (
     utcnow,
 )
 
-from .fakes import FakeArtifactStore, FakeDecisionLog, FakeTaskStore, make_task
+from .fakes import FakeArtifactStore, FakeDecisionLog, FakeTaskStore, FakeVerdictStore, make_task
 
 LIMITS = PolicyLimits(max_upstream_reruns=2, stronger_model="strong-1")
 
@@ -330,6 +330,7 @@ def test_gate_fail_closed_asks_the_user(run: Run) -> None:
 
 async def test_policy_class_reads_the_stores(run: Run) -> None:
     store, artifacts, log = FakeTaskStore(), FakeArtifactStore(), FakeDecisionLog()
+    verdicts = FakeVerdictStore()
     tasks, outputs = impl_tasks(run)
     for t in tasks:
         await store.create_task(t)
@@ -338,6 +339,7 @@ async def test_policy_class_reads_the_stores(run: Run) -> None:
         tasks=store,
         artifacts=artifacts,
         decisions=log,
+        verdicts=verdicts,
         limits=PolicyLimits.from_config(
             {"limits": {"max_upstream_reruns": 1}, "stronger_model": {"model": "strong-2"}}
         ),
@@ -345,12 +347,20 @@ async def test_policy_class_reads_the_stores(run: Run) -> None:
     assert policy.limits == PolicyLimits(max_upstream_reruns=1, stronger_model="strong-2")
 
     gate = verdict(run, blocker("S2", "app/db.py", "code_change@v1"), phase=Phase.IMPLEMENTATION)
+    await verdicts.save(gate)  # saved before the policy runs: it must not count as previous
     assert kinds(await policy.on_gate_verdict(run, Phase.IMPLEMENTATION, gate)) == [
         DecisionKind.GATE_FIX
     ]
-    # the policy remembers the last gate verdict, so the same failure again is no progress
-    again = await policy.on_gate_verdict(run, Phase.IMPLEMENTATION, gate.model_copy())
+    # a new policy instance (as after a resume) reads the gate history from the store
+    resumed = CodeVerdictPolicy(tasks=store, artifacts=artifacts, decisions=log, verdicts=verdicts)
+    same = verdict(run, blocker("S2", "app/db.py", "code_change@v3"), phase=Phase.IMPLEMENTATION)
+    again = await resumed.on_gate_verdict(run, Phase.IMPLEMENTATION, same)
     assert kinds(again) == [DecisionKind.NO_PROGRESS, DecisionKind.ASK_USER]
+    # another phase's gate history doesn't count
+    other = await resumed.on_gate_verdict(
+        run, Phase.SPEC, same.model_copy(update={"phase": Phase.SPEC})
+    )
+    assert DecisionKind.NO_PROGRESS not in kinds(other)
 
     task = tasks[1].model_copy(update={"attempt": 3})
     v = verdict(run, blocker("R1", "x", "code_change@v2"), task=task)

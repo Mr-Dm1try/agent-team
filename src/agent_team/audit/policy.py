@@ -36,7 +36,7 @@ from typing import Any
 from agent_team.audit.auditor import AUDIT_RULE
 from agent_team.audit.evidence import KIND_ORDER, KIND_PHASE
 from agent_team.core.artifacts import Artifact, ArtifactRef, CodeChange
-from agent_team.core.interfaces import ArtifactStore, DecisionLog, TaskStore
+from agent_team.core.interfaces import ArtifactStore, DecisionLog, TaskStore, VerdictStore
 from agent_team.core.models import (
     AgentName,
     Decision,
@@ -564,13 +564,14 @@ class CodeVerdictPolicy:
         tasks: TaskStore,
         artifacts: ArtifactStore,
         decisions: DecisionLog,
+        verdicts: VerdictStore,
         limits: PolicyLimits | None = None,
     ) -> None:
         self.tasks = tasks
         self.artifacts = artifacts
         self.decisions = decisions
+        self.verdicts = verdicts
         self.limits = limits or PolicyLimits()
-        self._gates: dict[tuple[str, Phase], list[Verdict]] = {}
 
     async def on_task_verdict(
         self, run: Run, task: Task, verdict: Verdict, history: list[Verdict]
@@ -581,15 +582,15 @@ class CodeVerdictPolicy:
         return decide_task(run, task, verdict, history, past, self.limits, tasks)
 
     async def on_gate_verdict(self, run: Run, phase: Phase, verdict: Verdict) -> list[Decision]:
-        """Decisions for a gate verdict; see ``decide_gate``. Remembers each gate's last
-        verdict in memory, for the no-progress check."""
+        """Decisions for a gate verdict; see ``decide_gate``. The gate's previous verdict
+        comes from ``VerdictStore.for_gate``, so the no-progress check survives a resume;
+        ``verdict`` itself is skipped whether or not it was saved before this call."""
         tasks = await self.tasks.list_tasks(run.id)
         outputs: dict[str, Artifact] = {}
         for t in tasks:
             if t.phase is phase and t.output is not None and t.status is not TaskStatus.SUPERSEDED:
                 outputs[t.id] = await self.artifacts.load(run.id, t.output)
         past = await self.decisions.list(run.id)
-        seen = self._gates.setdefault((run.id, phase), [])
-        previous = seen[-1] if seen else None
-        seen.append(verdict)
+        earlier = [v for v in await self.verdicts.for_gate(run.id, phase) if v.id != verdict.id]
+        previous = earlier[-1] if earlier else None
         return decide_gate(run, phase, verdict, previous, tasks, outputs, past, self.limits)

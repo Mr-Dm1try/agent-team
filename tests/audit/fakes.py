@@ -150,6 +150,11 @@ class FakeVerdictStore:
     async def for_task(self, task_id: str) -> list[Verdict]:
         return [v for v in self.items if v.task_id == task_id]
 
+    async def for_gate(self, run_id: str, phase: Phase) -> list[Verdict]:
+        return [
+            v for v in self.items if v.run_id == run_id and v.task_id is None and v.phase is phase
+        ]
+
 
 class FakeDecisionLog:
     def __init__(self) -> None:
