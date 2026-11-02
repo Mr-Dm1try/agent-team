@@ -10,69 +10,17 @@ from agent_team.llm.types import ContentBlock, LLMRequest, ToolResultBlock
 from agents.fakes import reply, tool_call
 
 PLAN_BUILD: dict[str, Any] = {
-    "summary": "Research the database, then PRD, spec, code and QA.",
+    "summary": "One ask; the database choice needs research.",
     "request_kind": "build",
     "asks": [{"id": "ASK-1", "text": "A REST API that lists books"}],
-    "research_questions": ["Which database?"],
-    "tasks": [
-        {
-            "key": "research-1",
-            "agent": "researcher",
-            "phase": "planning",
-            "objective": "Find which database to use",
-            "output_kind": "research_brief",
-            "covers_asks": ["ASK-1"],
-        },
-        {
-            "key": "prd",
-            "agent": "product",
-            "phase": "prd",
-            "objective": "Write the PRD",
-            "output_kind": "prd",
-            "covers_asks": ["ASK-1"],
-            "depends_on": ["research-1"],
-        },
-        {
-            "key": "spec",
-            "agent": "architect",
-            "phase": "spec",
-            "objective": "Write the spec",
-            "output_kind": "spec",
-            "covers_asks": ["ASK-1"],
-        },
-        {
-            "key": "code",
-            "agent": "engineer",
-            "phase": "implementation",
-            "objective": "Implement the API",
-            "output_kind": "code_change",
-            "covers_asks": ["ASK-1"],
-        },
-        {
-            "key": "qa",
-            "agent": "qa",
-            "phase": "implementation",
-            "objective": "Review and run it",
-            "output_kind": "qa_report",
-            "covers_asks": ["ASK-1"],
-        },
-    ],
+    "research_questions": [{"question": "Which database?", "ask": "ASK-1"}],
 }
 
 PLAN_RESEARCH: dict[str, Any] = {
-    "summary": "One researcher task answers the question.",
+    "summary": "One question with one sub-question.",
     "request_kind": "research_question",
     "asks": [{"id": "ASK-1", "text": "Which Python web framework is fastest?"}],
-    "tasks": [
-        {
-            "key": "answer",
-            "agent": "researcher",
-            "phase": "planning",
-            "objective": "Answer the question with sources",
-            "output_kind": "research_answer",
-            "covers_asks": ["ASK-1"],
-        }
-    ],
+    "research_questions": [{"question": "Which benchmarks are current?", "ask": "ASK-1"}],
 }
 
 BRIEF = {

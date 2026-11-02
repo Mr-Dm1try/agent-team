@@ -42,11 +42,9 @@ class Researcher(BaseAgent):
     async def check(self, artifact: ArtifactBase, envelope: TaskEnvelope) -> list[str]:
         errors = await super().check(artifact, envelope)
         if isinstance(artifact, ResearchBrief):
-            asked = [q for plan in _input(envelope, Plan) for q in plan.research_questions]
-            answered = {a.question.strip().lower() for a in artifact.answers}
-            for q in asked:
-                if q.strip().lower() not in answered:
-                    errors.append(f"answers: no entry for research question {q!r}")
+            # The question is the task's objective, so there is always one to answer.
+            if not artifact.answers:
+                errors.append(f"answers: answer the research question: {envelope.task.objective}")
             for a in artifact.answers:
                 if a.answer is None and not a.gap:
                     errors.append(f"answers: {a.question!r} has no answer; say why in `gap`")
@@ -110,6 +108,8 @@ class Architect(BaseAgent):
 
 
 class Engineer(BaseAgent):
+    """One Engineer task per spec work package (or one for the whole spec)."""
+
     name: AgentName = AgentName.ENGINEER
     output_kind = "code_change"
     role_prompt: ClassVar[str] = prompts.ENGINEER

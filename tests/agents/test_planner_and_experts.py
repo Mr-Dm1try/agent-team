@@ -36,23 +36,14 @@ def _mutate(fn: Any) -> list[str]:
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
-        (lambda d: d["tasks"][1].update(agent="wizard"), "unknown agent"),
-        (lambda d: d["tasks"][1].update(agent="auditor"), "can't be planned"),
-        (lambda d: d["tasks"][1].update(phase="spec"), "belong to phase 'prd'"),
-        (lambda d: d["tasks"][1].update(output_kind="spec"), "produces one of"),
-        (lambda d: d["tasks"][1].update(depends_on=["ghost"]), "unknown task key"),
-        (lambda d: d["tasks"][1].update(depends_on=["spec"]), "later phase"),
-        (
-            lambda d: (
-                d["tasks"][3].update(depends_on=["qa"]) or d["tasks"][4].update(depends_on=["code"])
-            ),
-            "cycle",
-        ),
-        (lambda d: d["asks"].append({"id": "ASK-2", "text": "auth"}), "ASK-2 is not covered"),
-        (lambda d: d["asks"].append({"id": "two", "text": "x"}), "must look like ASK-1"),
-        (lambda d: d["tasks"].pop(4), "needs a qa_report task"),
-        (lambda d: d.update(research_questions=[]), "research_questions"),
+        (lambda d: d.update(request_kind="change"), "either 'build' or 'research_question'"),
+        (lambda d: d.update(request_kind="nonsense"), "must be 'build'"),
         (lambda d: d.update(request_kind="research_question"), "classified as 'build'"),
+        (lambda d: d["asks"].append({"id": "two", "text": "x"}), "must look like ASK-1"),
+        (lambda d: d["asks"].append({"id": "ASK-1", "text": "again"}), "unique"),
+        (lambda d: d["asks"].append({"id": "ASK-2", "text": " "}), "say what the user asked"),
+        (lambda d: d["research_questions"][0].update(ask="ASK-9"), "unknown ask 'ASK-9'"),
+        (lambda d: d["research_questions"].append(dict(d["research_questions"][0])), "duplicate"),
     ],
 )
 def test_invalid_plans_are_explained(mutation: Any, expected: str) -> None:
@@ -60,11 +51,11 @@ def test_invalid_plans_are_explained(mutation: Any, expected: str) -> None:
     assert any(expected in e for e in errors), errors
 
 
-def test_research_plan_gets_no_code() -> None:
-    data = copy.deepcopy(PLAN_RESEARCH)
-    data["tasks"].append(copy.deepcopy(PLAN_BUILD["tasks"][1]))
-    errors = validate_plan(plan(data), RequestKind.RESEARCH_QUESTION)
-    assert any("gets no ['prd']" in e for e in errors)
+def test_plan_needs_an_ask() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        plan(dict(PLAN_BUILD, asks=[]))
 
 
 def test_kind_marker_round_trips() -> None:
@@ -77,11 +68,11 @@ async def test_planner_repairs_an_invalid_plan(tmp_path: Path) -> None:
     env = envelope(tmp_path, AgentName.ORCHESTRATOR, "plan")
     env.task.objective = planning_objective(RequestKind.BUILD)
     bad = copy.deepcopy(PLAN_BUILD)
-    bad["tasks"].pop(4)
+    bad["research_questions"][0]["ask"] = "ASK-7"
     llm = FakeLLM({AgentName.ORCHESTRATOR: [json.dumps(bad), json.dumps(PLAN_BUILD)]})
     result = await PlannerAgent().run(env, ctx(llm))
     assert result.status is ResultStatus.OK
-    assert "qa_report" in llm.requests[1].messages[-1].content[0].text  # type: ignore[union-attr]
+    assert "unknown ask 'ASK-7'" in llm.requests[1].messages[-1].content[0].text  # type: ignore[union-attr]
 
 
 async def test_product_rejects_unknown_asks(tmp_path: Path) -> None:

@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent_team.agents.loop import ToolLoop
 from agent_team.agents.planner import kind_from_objective, planning_objective
 from agent_team.agents.prompts import RUN_QA
-from agent_team.core.artifacts import Artifact, ArtifactRef, Plan
+from agent_team.core.artifacts import Artifact, ArtifactRef, Plan, Spec
 from agent_team.core.interfaces import (
     ArtifactStore,
     Auditor,
@@ -61,7 +61,8 @@ from agent_team.orchestrator.classify import classify
 from agent_team.orchestrator.control import create_user_task, read_tools
 from agent_team.orchestrator.dispatcher import INTERRUPTED
 from agent_team.orchestrator.phases import PhaseMachine, live
-from agent_team.orchestrator.planning import expand_plan
+from agent_team.orchestrator.planning import RULE as PIPELINE
+from agent_team.orchestrator.planning import expand_plan, implementation_tasks
 from agent_team.orchestrator.policy import SimplePolicy
 from agent_team.tools.base import RunToolContext
 
@@ -536,16 +537,77 @@ class Orchestrator:
         new_tasks = expand_plan(plan, task.output, run, task, max_attempts=self.config.max_attempts)
         for t in new_tasks:
             await self.tasks.create_task(t)
+        await self._record_pipeline(
+            run,
+            task,
+            new_tasks,
+            inputs={
+                "plan": str(task.output),
+                "asks": [a.id for a in plan.asks],
+                "research_questions": [rq.question for rq in plan.research_questions],
+            },
+            reason=f"{plan.request_kind} pipeline with one Researcher task per research question",
+        )
+
+    async def _start_implementation(self, run: Run, tasks: list[Task]) -> None:
+        """When the Spec gate passes: one Engineer task per work package, then QA."""
+        live_tasks = live(tasks)
+        if any(
+            t.phase is Phase.IMPLEMENTATION and t.agent is not AgentName.USER for t in live_tasks
+        ):
+            return
+        spec_tasks = [
+            t
+            for t in live_tasks
+            if t.agent is AgentName.ARCHITECT and t.status is TaskStatus.DONE and t.output
+        ]
+        if not spec_tasks:
+            return
+        spec_task = spec_tasks[-1]
+        assert spec_task.output is not None
+        spec = await self.artifacts.load(run.id, spec_task.output)
+        assert isinstance(spec, Spec)
+        previous = [
+            t
+            for t in tasks
+            if t.phase is Phase.IMPLEMENTATION
+            and t.status is TaskStatus.SUPERSEDED
+            and t.agent is not AgentName.USER
+        ]
+        new_tasks = implementation_tasks(
+            spec, spec_task, run, previous=previous, max_attempts=self.config.max_attempts
+        )
+        for t in new_tasks:
+            await self.tasks.create_task(t)
+        packages = [p.name for p in spec.work_packages] or ["all"]
+        await self._record_pipeline(
+            run,
+            spec_task,
+            new_tasks,
+            inputs={"spec": str(spec_task.output), "work_packages": packages},
+            reason=f"spec gate passed; {len(packages)} work package(s), run one at a time",
+        )
+
+    async def _record_pipeline(
+        self,
+        run: Run,
+        task: Task,
+        new_tasks: list[Task],
+        *,
+        inputs: dict[str, object],
+        reason: str,
+    ) -> None:
         await self._record(
             Decision(
                 run_id=run.id,
                 task_id=task.id,
                 kind=DecisionKind.PLAN,
-                inputs={"plan": str(task.output), "asks": [a.id for a in plan.asks]},
+                inputs=dict(inputs),
                 choice=f"{len(new_tasks)} tasks: "
                 + ", ".join(f"{t.agent.value}->{t.output_kind}" for t in new_tasks),
-                reason=plan.summary,
-                made_by="model",
+                reason=reason,
+                made_by="code",
+                rule=PIPELINE,
             )
         )
 
@@ -726,7 +788,15 @@ class Orchestrator:
             and t.parent_task_id in affected_ids
             and t.status is TaskStatus.WAITING
         ]
-        new_ids = {t.id: new_id("task") for t in affected if t.agent is not AgentName.USER}
+        # Implementation tasks downstream of an earlier phase aren't copied: the Spec
+        # gate rebuilds them from the new spec's work packages.
+        rebuilt_later = current.phase is not Phase.IMPLEMENTATION
+        new_ids = {
+            t.id: new_id("task")
+            for t in affected
+            if t.agent is not AgentName.USER
+            and not (rebuilt_later and t.phase is Phase.IMPLEMENTATION)
+        }
         for t in affected:
             if t.status in (TaskStatus.AUDITING, TaskStatus.RUNNING):
                 await self.tasks.transition(t.id, TaskStatus.ESCALATED, reason="reopened")
@@ -735,7 +805,7 @@ class Orchestrator:
             )
         root: Task | None = None
         for t in affected:
-            if t.agent is AgentName.USER:
+            if t.id not in new_ids:
                 continue
             copy = await self.tasks.create_task(
                 Task(
@@ -797,6 +867,8 @@ class Orchestrator:
         await self.bus.emit(
             Event(name=EventName.PHASE_FINISHED, run_id=run.id, data={"phase": phase.value})
         )
+        if phase is Phase.SPEC:
+            await self._start_implementation(run, tasks)
         if (
             run.review_mode is ReviewMode.EVERY_PHASE
             and machine.next(phase) is not None

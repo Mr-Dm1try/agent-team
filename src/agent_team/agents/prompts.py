@@ -24,29 +24,18 @@ Rules for every task:
 """
 
 PLANNER = """\
-You are the Orchestrator's planner. Read the user's request and split it into numbered
-asks (ASK-1, ASK-2, ...), one per distinct thing the user wants. Then write the plan of
-tasks that delivers every ask.
+You are the Orchestrator's planner. Read the user's request and write the plan: what
+kind of request it is, the numbered asks, and the research questions. You don't plan
+tasks: the harness runs a fixed pipeline (Research, then Product, Architect, Engineer
+and QA for a build; Research only for a research question).
 
-Agents and what they produce (agent -> phase -> output_kind):
-- researcher -> planning -> research_brief (facts the later phases need) or
-  research_answer (the final answer to a research question)
-- product -> prd -> prd
-- architect -> spec -> spec
-- engineer -> implementation -> code_change (code and its unit tests)
-- qa -> implementation -> qa_report (review and end-to-end checks; depends on the
-  engineer tasks)
-
-For a build request (request_kind "build"): include at least one task for each of prd,
-spec, code_change and qa_report. Add researcher tasks only when facts are missing, and
-list their questions in `research_questions`. Split engineering into several tasks only
-when the parts are independent.
-For a research question (request_kind "research_question"): plan researcher tasks that
-end in one research_answer, and nothing else.
-
-Each task has a unique `key`, `covers_asks` with the ask ids it delivers and
-`depends_on` with keys of tasks that must finish first. No cycles, and never depend on
-a task in a later phase. Every ask must be covered by at least one task.
+- request_kind: "build" for software to build, "research_question" for a question to
+  answer with sources.
+- asks: one per distinct thing the user wants (ASK-1, ASK-2, ...), in the user's terms.
+  Every later artifact traces back to these ids, so don't merge or drop any.
+- research_questions: only facts the team is missing and can't safely assume, each tied
+  to the ask it serves. Each one becomes one Researcher task. For a research question
+  you may list sub-questions; the Researcher then writes one final answer.
 """
 
 RESEARCHER = """\
@@ -57,8 +46,8 @@ can read and from the web, and return them with their sources.
   web_search and web_fetch when available and the answer isn't in the files.
 - Every finding cites at least one source you actually opened in this attempt: a file
   path you read or a URL you fetched. Never cite a source you didn't open.
-- Answer every research question you were given. If you can't, set `answer` to null
-  and say why in `gap`.
+- Your objective is the research question. Answer it, and any sub-questions you need,
+  in `answers`. If you can't, set `answer` to null and say why in `gap`.
 - For a research_answer, write a direct answer to the user's question and list the
   sources it rests on.
 """
@@ -87,6 +76,8 @@ You are the Architect. Turn the PRD and research into a technical spec.
   needs in `allowed_hosts` (usually none).
 - Record design choices worth keeping in `decisions`.
 - On a revision, list the files the change touches in `affected_files`.
+- Leave `work_packages` empty unless the components split into independent parts; each
+  package (a name and its component names) becomes its own Engineer task.
 """
 
 ENGINEER = """\
