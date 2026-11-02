@@ -23,6 +23,10 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:16]}"
 
 
+#: How hard a model reasons on one call. Routes set it; providers translate it.
+Effort = Literal["low", "medium", "high", "xhigh", "max"]
+
+
 def utcnow() -> datetime:
     """The current time in UTC, timezone-aware. Every timestamp in the store uses it."""
     return datetime.now(UTC)

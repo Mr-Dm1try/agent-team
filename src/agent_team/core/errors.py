@@ -26,6 +26,16 @@ class TransientLLMError(AgentTeamError):
         self.status = status
 
 
+class ContextTooLong(AgentTeamError):
+    """The prompt plus room for the reply doesn't fit the model's context window.
+    Raised instead of sending, since a local model would silently cut the start of
+    the prompt. Not retried on the same provider; the gateway moves to the next one."""
+
+    def __init__(self, message: str, *, provider: str) -> None:
+        super().__init__(message)
+        self.provider = provider
+
+
 class OutputValidationError(AgentTeamError):
     """A model response didn't parse into the agent's output schema."""
 

@@ -4,11 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_team.core.config import Effort
 from agent_team.core.control import KillSwitch
 from agent_team.core.errors import BudgetExceeded, RunStopped, TransientLLMError
 from agent_team.core.events import InMemoryEventBus
-from agent_team.core.models import AgentName, Event, EventName
+from agent_team.core.models import AgentName, Effort, Event, EventName
 from agent_team.core.tracing import JsonlTracer, Tracer, load_spans
 from agent_team.llm.chaos import BAD_JSON_TEXT, Chaos, parse_chaos
 from agent_team.llm.fake import FakeProvider, FakeTurn
@@ -217,7 +216,7 @@ async def test_stronger_model_override(sleeps: Sleeps) -> None:
 
 
 async def test_unknown_providers_are_skipped(sleeps: Sleeps) -> None:
-    config = make_config(defaults={"provider": "ollama", "model": "x"})
+    config = make_config(defaults={"provider": "ollama", "model": "x", "context_budget": 20_000})
     fake = FakeProvider(["ok"])
     gw = gateway(fake, sleeps=sleeps, config=config)
     assert gw.routes(request()) == [("fake", "fake-small")]
@@ -333,7 +332,7 @@ async def test_stream_without_final_chunk_is_retried(sleeps: Sleeps) -> None:
 async def test_missing_primary_provider_counts_as_fallback(
     sleeps: Sleeps, events: list[Event], bus: InMemoryEventBus
 ) -> None:
-    config = make_config(defaults={"provider": "ollama", "model": "x"})
+    config = make_config(defaults={"provider": "ollama", "model": "x", "context_budget": 20_000})
     gw = gateway(FakeProvider(["ok"]), sleeps=sleeps, bus=bus, config=config)
     await gw.complete(request())
     assert gw.status("run_1").fallbacks == 1

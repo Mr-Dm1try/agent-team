@@ -15,9 +15,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent_team.core.config import Effort
 from agent_team.core.errors import TransientLLMError
-from agent_team.core.models import AgentName, Usage
+from agent_team.core.models import AgentName, Effort, Usage
 from agent_team.llm.chaos import BAD_JSON_TEXT, Fault
 from agent_team.llm.types import (
     ContentBlock,

@@ -60,6 +60,33 @@ def test_bad_effort_is_rejected(tmp_path: Path) -> None:
         load_config(path)
 
 
+def test_ollama_route_must_leave_room_for_the_reply(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "defaults: {provider: fake, model: m}\n"
+        "agents: {researcher: {provider: ollama, model: o, context_budget: 32000}}\n"
+        "providers: {ollama: {num_ctx: 32768}}\n"
+    )
+    with pytest.raises(ValueError, match=r"researcher: context_budget 32000"):
+        load_config(path)
+    # 24000 fits as tokens but not as Ollama's cautious estimate of them.
+    path.write_text(path.read_text().replace("32000", "24000"))
+    with pytest.raises(ValueError, match="about 32000 tokens"):
+        load_config(path)
+    path.write_text(path.read_text().replace("24000", "20000"))
+    assert load_config(path).context_budget(AgentName.RESEARCHER) == 20_000
+
+
+def test_ollama_stronger_model_is_checked_against_every_agents_budget(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "defaults: {provider: fake, model: m, context_budget: 90000}\n"
+        "stronger_model: {provider: ollama, model: o, context_budget: 20000}\n"
+    )
+    with pytest.raises(ValueError, match="context_budget 90000"):
+        load_config(path)
+
+
 def test_env_var_and_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "c.yaml"
     path.write_text("defaults: {provider: fake, model: m}\nbudget: {max_usd_per_run: 2}\n")

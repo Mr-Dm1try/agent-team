@@ -9,8 +9,8 @@ import httpx2
 import openai
 import pytest
 
-from agent_team.core.config import AnthropicConfig
-from agent_team.core.errors import TransientLLMError
+from agent_team.core.config import AnthropicConfig, OllamaConfig
+from agent_team.core.errors import ContextTooLong, TransientLLMError
 from agent_team.llm import anthropic_provider as ap
 from agent_team.llm import ollama_provider as op
 from agent_team.llm.types import (
@@ -426,6 +426,45 @@ async def test_ollama_translates_request_and_response() -> None:
     assert resp.tool_calls[0].arguments == {"p": "x"}
     assert resp.tool_calls[1].arguments == {"_invalid_json": "{broken"}
     assert (resp.usage.input_tokens, resp.usage.output_tokens) == (3, 4)
+
+
+async def test_ollama_fits_prompt_and_reply_into_num_ctx() -> None:
+    comps = StubCompletions(chat_completion())
+    provider = op.OllamaProvider(
+        OllamaConfig(num_ctx=4000, min_output_tokens=500),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=comps)),
+    )
+    await provider.complete(request(max_tokens=16_000), model="gpt-oss:20b")
+    sent = comps.calls[0]
+    prompt = op.prompt_tokens(sent)
+    assert sent["max_tokens"] == 4000 - prompt
+    # Non-ASCII text counts once per character, not as \\u escapes.
+    assert op.prompt_tokens({"messages": [{"content": "привет" * 100}]}) < 250
+    await provider.complete(request(max_tokens=200), model="gpt-oss:20b")
+    assert comps.calls[1]["max_tokens"] == 200
+
+    # A prompt that leaves less than the minimum reply is refused, not truncated.
+    long = request(messages=[Message.user("x" * 11_000)])
+    with pytest.raises(ContextTooLong):
+        await provider.complete(long, model="gpt-oss:20b")
+    with pytest.raises(ContextTooLong):
+        [c async for c in provider.stream(long, model="gpt-oss:20b")]
+    assert len(comps.calls) == 2
+
+
+async def test_gateway_moves_on_when_ollama_cannot_fit_the_prompt(sleeps: Sleeps) -> None:
+    from agent_team.llm.fake import FakeProvider
+    from agent_team.llm.gateway import Gateway
+
+    provider, comps = ollama(chat_completion())
+    config = make_config(
+        defaults={"provider": "ollama", "model": "gpt-oss:20b", "context_budget": 20_000},
+        fallbacks=["ollama", "fake"],
+        fallback_models={"fake": "fake-small"},
+    )
+    gw = Gateway(config, {"ollama": provider, "fake": FakeProvider(["ok"])}, sleep=sleeps)
+    resp = await gw.complete(request(messages=[Message.user("x" * 120_000)]))
+    assert resp.provider == "fake" and comps.calls == [] and sleeps.calls == []
 
 
 async def test_ollama_stream_accumulates_tool_calls() -> None:

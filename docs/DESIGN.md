@@ -193,6 +193,7 @@ Every agent action leaves a structured log line tied to a trace, and every error
 | Error | Example | Handling |
 | --- | --- | --- |
 | TransientLLMError | Rate limit, timeout, server error | Retry after 1, 2 and 4 seconds, then fall back to the next provider |
+| ContextTooLong | A prompt too big for a local model's window, found before sending | Fall back to the next provider at once; if none is left, compact and retry the attempt |
 | OutputValidationError | JSON that doesn't match the schema | Send the validation errors back to the model, up to 2 times |
 | ToolError | File not found, command exits non-zero | Returned to the agent as a tool result so it can adapt |
 | SandboxError | Docker missing, container timeout | Task is escalated with the cause, and the orchestrator tells you |
@@ -332,7 +333,7 @@ All model calls go through one small interface with three providers, and a confi
 **Providers:**
 
 - **Anthropic:** the official anthropic SDK, with claude-haiku-5-5 by default and claude-sonnet-5-5 where an agent needs more. We don't send temperature, since newer API versions reject it. Thinking is adaptive, and each agent's effort (low to max) comes from the routing file. Thinking blocks are kept in the history and sent back unchanged, which a tool loop needs; the API drops any block the current model can't read.
-- **Ollama:** its OpenAI-compatible endpoint on localhost:11434, with the context window raised to 16k to 32k tokens. The agent's effort goes out as reasoning\_effort (low, medium or high), which gpt-oss uses. Claude's thinking blocks are left out, since Ollama can't read them and thinks afresh on each call.
+- **Ollama:** its OpenAI-compatible endpoint on localhost:11434, with the context window raised to 16k to 32k tokens. Ollama silently cuts the start of a prompt that overflows the window, so the reply's max\_tokens is cut to what's left, a prompt that leaves less than a minimum reply is refused and the call falls back, and the config is checked at load so an agent routed to Ollama has a prompt budget that leaves that room. As a fallback for an agent with a bigger budget, Ollama takes only the prompts that fit. The agent's effort goes out as reasoning\_effort (low, medium or high), which gpt-oss uses. Claude's thinking blocks are left out, since Ollama can't read them and thinks afresh on each call.
 - **Fake:** scripted responses for tests, with fault injection for bad JSON, timeouts and rate limits.
 
 **Structured output.** Each agent declares a Pydantic output model. We validate every response ourselves, whatever the provider promises, and run the repair loop when it fails.
