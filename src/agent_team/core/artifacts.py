@@ -29,6 +29,7 @@ class ArtifactRef(Contract):
 
     @classmethod
     def parse(cls, text: str) -> ArtifactRef:
+        """Parse ``prd@v2``. Raises ValueError on anything else."""
         m = _REF.fullmatch(text)
         if not m:
             raise ValueError(f"not an artifact ref: {text!r}")
@@ -36,6 +37,9 @@ class ArtifactRef(Contract):
 
 
 class Question(Contract):
+    """Something an agent can't decide without the user. In auto_assumptions mode
+    the agent records an assumption instead."""
+
     id: str  # e.g. "Q-1"
     text: str
     why: str  # what the agent can't decide without it
@@ -44,17 +48,25 @@ class Question(Contract):
 
 
 class MemoryProposal(Contract):
+    """A fact an agent suggests keeping for future runs. The auditor decides
+    whether it is saved."""
+
     kind: Literal["decision", "lesson", "preference", "research_fact"]
     text: str
     source: str | None = None  # URL or file for research facts
 
 
 class ResearchRequest(Contract):
+    """An agent's request for facts it lacks. Becomes a Researcher task, and the
+    asking task waits for it."""
+
     question: str
     why: str
 
 
 class Source(Contract):
+    """A file or URL the Researcher actually opened in this attempt."""
+
     ref: str  # URL or path the Researcher actually opened
     title: str | None = None
 
@@ -76,11 +88,16 @@ class ArtifactBase(Contract):
 
 
 class Ask(Contract):
+    """One numbered thing the user asked for. The root of the id chain."""
+
     id: str  # "ASK-1"
     text: str
 
 
 class ResearchQuestion(Contract):
+    """A fact needed before the PRD, tied to the ask it serves. Becomes one
+    Researcher task."""
+
     question: str
     ask: str  # the ASK id this question serves
 
@@ -100,11 +117,16 @@ class Plan(ArtifactBase):
 
 
 class ResearchFinding(Contract):
+    """A claim the Researcher found, with at least one source."""
+
     claim: str
     sources: list[Source] = Field(min_length=1)
 
 
 class AnsweredQuestion(Contract):
+    """The Researcher's answer to one question, or the gap that kept it from
+    answering."""
+
     question: str
     answer: str | None  # None means it couldn't be answered; say why in `gap`
     gap: str | None = None
@@ -112,6 +134,9 @@ class AnsweredQuestion(Contract):
 
 
 class ResearchBrief(ArtifactBase):
+    """The Researcher's notes for later agents: answers, findings, file excerpts
+    and constraints. A run can have several."""
+
     kind: Literal["research_brief"] = "research_brief"
     answers: list[AnsweredQuestion]
     findings: list[ResearchFinding] = Field(default_factory=list)
@@ -123,11 +148,15 @@ class ResearchBrief(ArtifactBase):
 
 
 class AcceptanceCriterion(Contract):
+    """One testable condition a requirement must meet."""
+
     id: str  # "AC-1.1"
     text: str
 
 
 class Requirement(Contract):
+    """One numbered requirement, the asks it covers, and its acceptance criteria."""
+
     id: str  # "REQ-1"
     text: str
     asks: list[str] = Field(min_length=1)  # ASK ids this requirement covers
@@ -135,6 +164,8 @@ class Requirement(Contract):
 
 
 class PRD(ArtifactBase):
+    """Product's requirements document: what to build, and what is out of scope."""
+
     kind: Literal["prd"] = "prd"
     title: str
     requirements: list[Requirement]
@@ -142,6 +173,8 @@ class PRD(ArtifactBase):
 
 
 class Component(Contract):
+    """One part of the design, the requirements it covers and the files it owns."""
+
     name: str
     responsibility: str
     requirements: list[str]  # REQ ids
@@ -149,12 +182,16 @@ class Component(Contract):
 
 
 class Interface(Contract):
+    """A function, route or tool a component exposes, with its signature."""
+
     name: str  # function, route or tool name
     signature: str
     component: str
 
 
 class PlannedCheck(Contract):
+    """A test the Architect plans, and the acceptance criteria it proves."""
+
     id: str  # "CHK-1"
     criteria: list[str]  # AC ids
     kind: Literal["unit_test", "e2e"]
@@ -162,11 +199,16 @@ class PlannedCheck(Contract):
 
 
 class WorkPackage(Contract):
+    """A group of components one Engineer task builds."""
+
     name: str
     components: list[str]  # Component names
 
 
 class Spec(ArtifactBase):
+    """The Architect's design: components, interfaces, planned checks, pinned
+    dependencies, allowed hosts and decisions."""
+
     kind: Literal["spec"] = "spec"
     components: list[Component]
     interfaces: list[Interface] = Field(default_factory=list)
@@ -184,6 +226,8 @@ class Spec(ArtifactBase):
 
 
 class TestRun(Contract):
+    """The result of one test command in the sandbox."""
+
     command: str
     passed: int
     failed: int
@@ -192,6 +236,8 @@ class TestRun(Contract):
 
 
 class CodeChange(ArtifactBase):
+    """What one Engineer attempt wrote: files, the commit, and its test run."""
+
     kind: Literal["code_change"] = "code_change"
     files_written: list[str]
     commit: str | None = None  # git sha in the run workspace
@@ -199,18 +245,25 @@ class CodeChange(ArtifactBase):
 
 
 class CriterionResult(Contract):
+    """QA's result for one acceptance criterion, with evidence."""
+
     criterion: str  # AC id
     result: Literal["pass", "fail", "not_checked"]
     evidence: str
 
 
 class QAIssue(Contract):
+    """A problem QA found that isn't tied to a single criterion."""
+
     severity: Literal["blocker", "warning"]
     text: str
     files: list[str] = Field(default_factory=list)
 
 
 class QAReport(ArtifactBase):
+    """QA's review of the whole solution: a result per criterion, issues, and
+    whether it ran end to end."""
+
     kind: Literal["qa_report"] = "qa_report"
     results: list[CriterionResult]
     issues: list[QAIssue] = Field(default_factory=list)
