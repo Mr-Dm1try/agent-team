@@ -95,7 +95,6 @@ async def classify(llm: LLMClient, text: str, run: Run | None) -> tuple[Classifi
                 agent=AgentName.ORCHESTRATOR,
                 system=SYSTEM,
                 messages=messages,
-                max_tokens=300,
                 run_id=run.id if run else "session",
             )
         )

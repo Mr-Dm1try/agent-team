@@ -28,6 +28,7 @@ from agent_team.llm.types import (
     Message,
     TextBlock,
     ToolResultBlock,
+    ToolSpec,
     ToolUseBlock,
 )
 from agent_team.tools.base import MAX_INLINE_CHARS, store_large
@@ -45,11 +46,13 @@ INTERRUPTED_NOTE = (
 
 @dataclass
 class LoopSettings:
-    """Limits for one tool loop: steps, repair rounds and tokens per model call."""
+    """Limits for one tool loop: steps, repair rounds and, optionally, output tokens
+    per model call. Leave ``max_tokens`` unset to keep the request's default, which
+    leaves room for thinking."""
 
     max_steps: int = 80  # checkpointed steps: one per model call and one per tool round
     max_repairs: int = 2
-    max_tokens: int = 4096
+    max_tokens: int | None = None
 
 
 @dataclass
@@ -202,11 +205,12 @@ class ToolLoop[M: BaseModel]:
             agent=self.agent,
             system=self.system,
             messages=messages,
-            tools=[t.spec for t in self.tools.values()],
-            max_tokens=self.settings.max_tokens,
+            tools=self._specs(),
             run_id=self.run.id,
             task_id=self.task_id,
         )
+        if self.settings.max_tokens is not None:
+            request = request.model_copy(update={"max_tokens": self.settings.max_tokens})
         response = await self.llm.complete(request)
         self._usage = self._usage + response.usage
         self._model = response.model
@@ -220,9 +224,13 @@ class ToolLoop[M: BaseModel]:
                 value = None
         return value, errors
 
+    def _specs(self) -> list[ToolSpec]:
+        return [t.spec for t in self.tools.values()]
+
     async def _maybe_compact(self, messages: list[Message]) -> list[Message]:
         budget = self.llm.context_budget(self.agent)
-        if not self.compactor.needs_compaction(self.system, messages, budget):
+        specs = self._specs()
+        if not self.compactor.needs_compaction(self.system, messages, budget, specs):
             return messages
         result = await self.compactor.compact(
             system=self.system,
@@ -234,6 +242,7 @@ class ToolLoop[M: BaseModel]:
             agent=self.agent,
             task_id=self.task_id,
             attempt=self.attempt,
+            tools=specs,
         )
         self._usage = self._usage + result.usage
         if result.steps:

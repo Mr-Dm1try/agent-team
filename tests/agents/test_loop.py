@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -205,7 +206,7 @@ async def test_compaction_runs_inside_the_loop(tmp_path: Path) -> None:
                 else script.pop(0)
             )
         },
-        budget=3000,
+        budget=5000,
     )
     bus = FakeBus()
     agent = Engineer(settings=LoopSettings(max_steps=60), compactor=Compactor(keep_last=2))
@@ -294,3 +295,103 @@ async def test_os_error_in_a_tool_goes_back_to_the_model(tmp_path: Path) -> None
     assert isinstance(failed, ToolResultBlock) and failed.is_error
     assert "write_file failed" in failed.content
     assert result.status is ResultStatus.OK
+
+
+async def test_compaction_keeps_thinking_and_assistant_turns_intact(tmp_path: Path) -> None:
+    from agent_team.agents.compaction import estimate_tokens
+    from agent_team.llm.types import ThinkingBlock
+
+    env = envelope(tmp_path, AgentName.ENGINEER, "code_change")
+
+    def thought(i: int) -> ThinkingBlock:
+        raw = {"type": "thinking", "thinking": f"SECRET-{i} " * 50, "signature": "sig" * 40}
+        return ThinkingBlock(provider="anthropic", model="m", raw=raw)
+
+    msgs = [Message.user("ENVELOPE")]
+    for i in range(12):
+        msgs.append(
+            Message(
+                role="assistant",
+                content=[
+                    thought(i),
+                    ToolUseBlock(id=f"c{i}", name="read_file", arguments={"path": f"f{i}.py"}),
+                ],
+            )
+        )
+        msgs.append(
+            Message(role="user", content=[ToolResultBlock(tool_use_id=f"c{i}", content="x" * 3000)])
+        )
+    plain = [
+        m.model_copy(update={"content": m.content[1:]}) if m.role == "assistant" else m
+        for m in msgs
+    ]
+    assert estimate_tokens("", msgs) > estimate_tokens("", plain)  # thinking counts at raw size
+
+    llm = FakeLLM({AgentName.ENGINEER: ['{"done": ["read 12 files"], "remaining": ["write"]}']})
+    out = await Compactor(keep_last=3).compact(
+        system="sys",
+        messages=msgs,
+        budget=800,
+        llm=llm,
+        bus=FakeBus(),
+        run=env.run,
+        agent=AgentName.ENGINEER,
+        task_id=env.task.id,
+        attempt=1,
+    )
+    assert out.steps == ["trim", "stub", "summarize"]
+    # Assistant turns are never edited: the kept ones are the original objects. (The
+    # API may still drop their thinking, because earlier history changed.)
+    kept = [m for m in out.messages if m.role == "assistant"]
+    assert kept and all(any(m is k for m in msgs) for k in kept)
+    summary = llm.requests[0]
+    assert "SECRET" not in summary.messages[0].content[0].text  # type: ignore[union-attr]
+    assert summary.max_tokens == 16_000  # room for thinking on the agent's route
+
+
+async def test_repeated_summaries_replace_the_progress_note(tmp_path: Path) -> None:
+    env = envelope(tmp_path, AgentName.ENGINEER, "code_change")
+
+    def history(n: int) -> list[Message]:
+        out: list[Message] = []
+        for i in range(n):
+            out.append(
+                Message(
+                    role="assistant",
+                    content=[ToolUseBlock(id=f"c{i}", name="read_file", arguments={"path": "f"})],
+                )
+            )
+            out.append(
+                Message(
+                    role="user", content=[ToolResultBlock(tool_use_id=f"c{i}", content="y" * 500)]
+                )
+            )
+        return out
+
+    llm = FakeLLM({AgentName.ENGINEER: lambda r: '{"done": ["NOTE"], "remaining": []}'})
+    compactor = Compactor(keep_last=2)
+    kwargs: dict[str, Any] = {
+        "system": "sys",
+        "budget": 300,
+        "llm": llm,
+        "bus": FakeBus(),
+        "run": env.run,
+        "agent": AgentName.ENGINEER,
+        "task_id": env.task.id,
+        "attempt": 1,
+    }
+    first = await compactor.compact(messages=[Message.user("ENVELOPE"), *history(6)], **kwargs)
+    second = await compactor.compact(messages=[*first.messages, *history(6)], **kwargs)
+    assert "summarize" in second.steps
+    head = second.messages[0].content
+    assert len(head) == 2 and head[0] == TextBlock(text="ENVELOPE")
+    # The first note went into the second summary rather than piling up.
+    assert "NOTE" in llm.requests[-1].messages[0].content[0].text  # type: ignore[union-attr]
+
+
+def test_tool_specs_count_toward_the_estimate() -> None:
+    from agent_team.agents.compaction import estimate_tokens
+
+    msgs = [Message.user("hi")]
+    specs = [t.spec for t in file_tools().values()]
+    assert estimate_tokens("s", msgs, specs) > estimate_tokens("s", msgs) + 100

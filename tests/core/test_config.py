@@ -69,12 +69,15 @@ def test_ollama_route_must_leave_room_for_the_reply(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match=r"researcher: context_budget 32000"):
         load_config(path)
-    # 24000 fits as tokens but not as Ollama's cautious estimate of them.
+    # Compaction and Ollama share one estimate, so 24000 leaves room for the reply...
     path.write_text(path.read_text().replace("32000", "24000"))
-    with pytest.raises(ValueError, match="about 32000 tokens"):
+    assert load_config(path).context_budget(AgentName.RESEARCHER) == 24_000
+    # ...unless Ollama is set to count more cautiously than compaction does.
+    path.write_text(
+        path.read_text().replace("{num_ctx: 32768}", "{num_ctx: 32768, chars_per_token: 2}")
+    )
+    with pytest.raises(ValueError, match="about 36000 tokens"):
         load_config(path)
-    path.write_text(path.read_text().replace("24000", "20000"))
-    assert load_config(path).context_budget(AgentName.RESEARCHER) == 20_000
 
 
 def test_ollama_stronger_model_is_checked_against_every_agents_budget(tmp_path: Path) -> None:

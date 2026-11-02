@@ -19,6 +19,7 @@ import openai
 from agent_team.core.config import OllamaConfig
 from agent_team.core.errors import ContextTooLong, TransientLLMError
 from agent_team.core.models import Effort, Usage
+from agent_team.llm.tokens import CHARS_PER_TOKEN, estimate_json_tokens
 from agent_team.llm.types import (
     ContentBlock,
     LLMRequest,
@@ -70,13 +71,12 @@ def to_chat_messages(system: str, messages: list[Message]) -> list[dict[str, Any
     return out
 
 
-def prompt_tokens(params: dict[str, Any], chars_per_token: int = 3) -> int:
+def prompt_tokens(params: dict[str, Any], chars_per_token: int = CHARS_PER_TOKEN) -> int:
     """A high estimate of the prompt's tokens over the JSON that is sent, with
     non-ASCII text kept as is. High on purpose: running over is silent truncation."""
-    sent = json.dumps(params["messages"], ensure_ascii=False) + json.dumps(
-        params.get("tools", []), ensure_ascii=False
+    return estimate_json_tokens(
+        params["messages"], params.get("tools", []), chars_per_token=chars_per_token
     )
-    return -(-len(sent) // chars_per_token)
 
 
 def parse_arguments(raw: str | None) -> dict[str, Any]:

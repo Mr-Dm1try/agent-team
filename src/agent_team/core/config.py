@@ -12,6 +12,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agent_team.core.models import AgentName, Effort, ReviewMode
+from agent_team.llm.tokens import CHARS_PER_TOKEN
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[3] / "config" / "default.yaml"
 ENV_VAR = "AGENT_TEAM_CONFIG"
@@ -163,8 +164,8 @@ class Config(_Cfg):
     @model_validator(mode="after")
     def _ollama_routes_fit(self) -> Config:
         """Check agents routed to Ollama (or its stronger model) leave reply room in num_ctx."""
-        # Budgets are counted at four characters per token (as compaction does); the
-        # Ollama provider estimates more cautiously, so scale before comparing.
+        # Compaction keeps a budget in the shared estimate (llm.tokens); Ollama may be
+        # set to count more cautiously, so scale to its count before comparing.
         ollama = self.providers.ollama
         for agent in AgentName:
             route = self.route_for(agent)
@@ -174,7 +175,7 @@ class Config(_Cfg):
             if not on_ollama:
                 continue
             budget = self.context_budget(agent)
-            estimated = -(-budget * 4 // ollama.chars_per_token)
+            estimated = -(-budget * CHARS_PER_TOKEN // ollama.chars_per_token)
             if estimated + ollama.min_output_tokens > ollama.num_ctx:
                 raise ValueError(
                     f"{agent.value}: context_budget {budget} (about {estimated} tokens as "
