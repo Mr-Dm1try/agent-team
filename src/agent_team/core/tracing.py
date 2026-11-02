@@ -1,10 +1,12 @@
 """JSON Lines logs and spans.
 
-- ``JsonlTracer`` is an after hook on every event. It writes each event to
-  ``runs/<run>/logs/<agent>.jsonl`` and to the combined ``runs/<run>/logs/events.jsonl``.
+- ``JsonlTracer`` is an after hook on every event. It writes each event to one file,
+  ``runs/<run>/logs/events.jsonl``. Every line carries its agent and task, so one
+  agent's trail is a filter (``read_events``) rather than a separate file.
 - ``Tracer.span`` opens a span (run, phase, task, attempt, llm or tool call). Spans nest
   through a context variable and are written to ``runs/<run>/logs/spans.jsonl`` when
   they close, with status, duration, attributes and the traceback on error.
+- ``read_events`` reads the event log back, optionally filtered by agent or task.
 - ``load_spans`` and ``span_tree`` rebuild the tree for ``agent-team trace``.
 """
 
@@ -25,7 +27,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_team.core.interfaces import EventBus
-from agent_team.core.models import Event, utcnow
+from agent_team.core.models import AgentName, Event, utcnow
 
 SpanKind = Literal["run", "phase", "task", "attempt", "llm", "tool", "other"]
 
@@ -55,15 +57,11 @@ class _Appender:
 
 
 class JsonlTracer:
-    """After hook that writes every event to per-agent and combined JSON Lines logs."""
+    """After hook that writes every event to the run's ``events.jsonl``."""
 
     def __init__(self, runs_dir: str | Path) -> None:
         self.runs_dir = Path(runs_dir)
         self._out = _Appender()
-
-    def logs_dir(self, run_id: str) -> Path:
-        """``runs/<run>/logs``."""
-        return self.runs_dir / run_id / "logs"
 
     def attach(self, bus: EventBus) -> None:
         """Subscribe to every event on the bus."""
@@ -74,12 +72,42 @@ class JsonlTracer:
         self.write(event)
 
     def write(self, event: Event) -> None:
-        """Write one event to its agent's log and to ``events.jsonl``."""
-        line = event.model_dump_json(exclude_none=True)
-        logs = self.logs_dir(event.run_id)
-        agent = event.agent.value if event.agent else "system"
-        self._out.append(logs / f"{agent}.jsonl", line)
-        self._out.append(logs / "events.jsonl", line)
+        """Append one event to ``runs/<run>/logs/events.jsonl``."""
+        path = events_path(self.runs_dir, event.run_id)
+        self._out.append(path, event.model_dump_json(exclude_none=True))
+
+
+def events_path(runs_dir: str | Path, run_id: str) -> Path:
+    """``runs/<run>/logs/events.jsonl``."""
+    return Path(runs_dir) / run_id / "logs" / "events.jsonl"
+
+
+def read_events(
+    runs_dir: str | Path,
+    run_id: str,
+    *,
+    agent: AgentName | str | None = None,
+    task_id: str | None = None,
+) -> list[Event]:
+    """A run's events in write order, optionally only one agent's or one task's.
+    Unreadable lines (e.g. one cut off by a crash) are skipped."""
+    path = events_path(runs_dir, run_id)
+    if not path.exists():
+        return []
+    events: list[Event] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = Event.model_validate_json(line)
+        except ValueError:
+            continue
+        if agent is not None and event.agent != agent:
+            continue
+        if task_id is not None and event.task_id != task_id:
+            continue
+        events.append(event)
+    return events
 
 
 # --- spans -------------------------------------------------------------------------

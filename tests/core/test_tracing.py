@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 import pytest
@@ -9,31 +8,48 @@ from agent_team.core.tracing import (
     JsonlTracer,
     Tracer,
     current_span,
+    events_path,
     load_spans,
+    read_events,
     render_tree,
     span_tree,
 )
 
 
-async def test_jsonl_tracer_writes_agent_and_combined_logs(tmp_path: Path) -> None:
+async def test_jsonl_tracer_writes_one_file_filterable_by_agent_and_task(
+    tmp_path: Path,
+) -> None:
     bus = InMemoryEventBus()
     JsonlTracer(tmp_path).attach(bus)
+    for agent, task in ((AgentName.PRODUCT, "t1"), (AgentName.ENGINEER, "t2"), (None, None)):
+        await bus.emit(Event(name=EventName.TASK_STARTED, run_id="r1", agent=agent, task_id=task))
     await bus.emit(
-        Event(
-            name=EventName.TASK_STARTED,
-            run_id="r1",
-            agent=AgentName.PRODUCT,
-            task_id="t1",
-            data={"tokens": 3},
-        )
+        Event(name=EventName.TASK_FINISHED, run_id="r1", agent=AgentName.PRODUCT, task_id="t1")
     )
-    await bus.emit(Event(name=EventName.RUN_STARTED, run_id="r1"))
     logs = tmp_path / "r1" / "logs"
-    product = [json.loads(x) for x in (logs / "product.jsonl").read_text().splitlines()]
-    combined = (logs / "events.jsonl").read_text().splitlines()
-    assert product[0]["task_id"] == "t1" and product[0]["data"] == {"tokens": 3}
-    assert len(combined) == 2
-    assert (logs / "system.jsonl").exists()
+    assert [p.name for p in logs.iterdir()] == ["events.jsonl"]
+
+    everything = read_events(tmp_path, "r1")
+    assert [e.agent for e in everything] == [
+        AgentName.PRODUCT,
+        AgentName.ENGINEER,
+        None,
+        AgentName.PRODUCT,
+    ]
+    product = read_events(tmp_path, "r1", agent="product")
+    assert [e.name for e in product] == [EventName.TASK_STARTED, EventName.TASK_FINISHED]
+    assert [e.agent for e in read_events(tmp_path, "r1", task_id="t2")] == [AgentName.ENGINEER]
+    assert read_events(tmp_path, "r1", agent=AgentName.QA) == []
+    assert read_events(tmp_path, "missing") == []
+
+
+async def test_read_events_skips_a_line_cut_off_by_a_crash(tmp_path: Path) -> None:
+    bus = InMemoryEventBus()
+    JsonlTracer(tmp_path).attach(bus)
+    await bus.emit(Event(name=EventName.RUN_STARTED, run_id="r1"))
+    with events_path(tmp_path, "r1").open("a") as fh:
+        fh.write('{"name": "run_fin')
+    assert [e.name for e in read_events(tmp_path, "r1")] == [EventName.RUN_STARTED]
 
 
 async def test_spans_nest_and_record_errors(tmp_path: Path) -> None:

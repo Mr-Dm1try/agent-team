@@ -184,7 +184,7 @@ This also makes a resilience demo: kill the process mid-task, resume it and watc
 
 Every agent action leaves a structured log line tied to a trace, and every error is caught, classified, stored with its traceback and handled by a fixed policy.
 
-**Log trail.** Each agent writes JSON Lines to runs/\<run\_id>/logs/\<agent>.jsonl, and all events also go to one combined events.jsonl. A line carries the timestamp, run, trace, span and parent span ids, agent, task, attempt, event name, level, and data such as tokens, cost, tool arguments and duration.
+**Log trail.** Every event goes to one JSON Lines file, runs/\<run\_id>/logs/events.jsonl. A line carries the timestamp, run, trace, span and parent span ids, agent, task, attempt, event name, level, and data such as tokens, cost, tool arguments and duration. Because each line is tagged with its agent, `agent-team logs <run_id> --agent researcher` (or a plain grep) shows one agent's own trail, and the unfiltered file keeps the whole run in time order.
 
 **Tracing.** Spans nest in this order: run, phase, task, attempt, then each model call or tool call. `agent-team trace <run_id>` prints that tree with status, duration, tokens and cost. Adding `--task <id>` shows one task's whole story, including any tracebacks.
 
