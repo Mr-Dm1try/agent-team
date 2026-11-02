@@ -1,4 +1,4 @@
-"""Command-line entry point. The streaming session lands in step 3b."""
+"""Command-line entry point."""
 
 from __future__ import annotations
 

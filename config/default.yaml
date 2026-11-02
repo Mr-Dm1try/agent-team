@@ -1,4 +1,4 @@
-# Routing, budgets and review mode. Loaded by agent_team.llm (step 2a).
+# Routing, budgets and review mode. Loaded by agent_team.core.config.
 defaults: {provider: anthropic, model: claude-haiku-5-5, context_budget: 90000}
 agents:
   researcher: {provider: ollama, model: "gpt-oss:20b", context_budget: 20000}

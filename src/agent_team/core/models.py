@@ -1,8 +1,7 @@
 """Shared data contracts: tasks, runs, envelopes, results, findings, decisions, events.
 
-These types are the seams between the parallel build steps (2a, 2b, 2c). Change them
-only through the orchestrating thread so all three stay in sync. Additive changes
-(new optional fields) are safe; renames and removals are not.
+These types are the seams between the packages. Additive changes (new optional
+fields) are safe; renames and removals touch every package that uses them.
 """
 
 from __future__ import annotations

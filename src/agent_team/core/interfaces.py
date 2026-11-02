@@ -1,13 +1,12 @@
-"""Interfaces between the build steps. Implementations live in their own packages:
+"""Interfaces between the packages. Implementations live in:
 
-- 2a: EventBus, TaskStore, ArtifactStore, CheckpointStore, DecisionLog, FeedbackStore
-  (agent_team.core) and the LLMClient gateway (agent_team.llm).
-- 2b: Agent implementations (agent_team.agents), Dispatcher and Orchestrator
-  (agent_team.orchestrator), file tools (agent_team.tools).
-- 2c: Auditor, rule store and evidence helpers (agent_team.audit).
+- agent_team.core: EventBus, TaskStore, ArtifactStore, CheckpointStore, DecisionLog,
+  FeedbackStore, VerdictStore; agent_team.llm: the LLMClient gateway.
+- agent_team.agents: Agent implementations; agent_team.orchestrator: Dispatcher and
+  Orchestrator; agent_team.tools: tools.
+- agent_team.audit: Auditor, VerdictPolicy, rule store and evidence helpers.
 
-Each step codes against these Protocols and tests with its own fakes, so the three
-can be built in parallel. Change a Protocol only through the orchestrating thread.
+Each package codes against these Protocols and tests with its own fakes.
 """
 
 from __future__ import annotations
@@ -226,7 +225,7 @@ class Auditor(Protocol):
 
 
 class VerdictPolicy(Protocol):
-    """Turns verdicts into Decisions (2c implements it); the orchestrator (2b) applies them.
+    """Turns verdicts into Decisions (agent_team.audit); the orchestrator applies them.
 
     The orchestrator, not the auditor, saves verdicts to VerdictStore and emits
     ``audit_verdict``. Each Decision's ``inputs`` carries, by kind:
