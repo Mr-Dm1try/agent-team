@@ -18,7 +18,6 @@ from agent_team.core.interfaces import (
     TaskStore,
     Tool,
     ToolContext,
-    ToolResult,
     VerdictStore,
 )
 from agent_team.core.models import (
@@ -28,6 +27,7 @@ from agent_team.core.models import (
     Task,
     TaskOrigin,
     TaskStatus,
+    ToolResult,
 )
 from agent_team.llm.types import ToolSpec
 

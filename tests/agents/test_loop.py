@@ -9,10 +9,10 @@ from agent_team.agents import Engineer, Product
 from agent_team.agents.compaction import Compactor
 from agent_team.agents.loop import INTERRUPTED_NOTE, LoopSettings
 from agent_team.core.artifacts import CodeChange
-from agent_team.core.interfaces import HookOutcome
 from agent_team.core.models import (
     AgentName,
     EventName,
+    HookOutcome,
     Phase,
     ResultStatus,
     ReviewMode,

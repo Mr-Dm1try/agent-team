@@ -10,13 +10,14 @@ from typing import Any
 
 from agent_team.core.artifacts import Artifact, ArtifactRef
 from agent_team.core.errors import InvalidTransition
-from agent_team.core.interfaces import AfterHook, BeforeHook, HookOutcome
+from agent_team.core.interfaces import AfterHook, BeforeHook
 from agent_team.core.models import (
     AgentName,
     Decision,
     Event,
     EventName,
     Feedback,
+    HookOutcome,
     Phase,
     PrecheckDecision,
     PrecheckResult,

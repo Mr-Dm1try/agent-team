@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from agent_team.core.errors import ToolError
-from agent_team.core.interfaces import Tool, ToolContext, ToolResult
+from agent_team.core.interfaces import Tool, ToolContext
+from agent_team.core.models import ToolResult
 from agent_team.llm.types import ToolSpec
 from agent_team.tools.base import display_path, resolve_path
 
