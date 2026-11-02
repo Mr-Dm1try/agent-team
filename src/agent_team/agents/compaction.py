@@ -29,7 +29,7 @@ from agent_team.tools.base import store_large
 
 #: Compaction starts when the prompt passes this share of the budget.
 TRIGGER_RATIO = 0.85
-#: Tool results longer than this are trimmed to a preview in step 1.
+#: Tool results longer than this are trimmed to a preview in the trim stage.
 TRIM_CHARS = 2_000
 PREVIEW_CHARS = 400
 

@@ -1,4 +1,4 @@
-"""Done condition for 2b: with fake stores, a fake LLM and an always-pass auditor, a run
+"""With fake stores, a fake LLM and an always-pass auditor, a run
 goes through all four phases and produces every artifact; a research question returns a
 research_answer without PRD or code."""
 

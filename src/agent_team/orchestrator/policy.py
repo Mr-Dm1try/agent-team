@@ -1,5 +1,5 @@
-"""A minimal verdict policy, so the orchestrator works before the auditor step's full
-policy (2c) is wired in. It implements the VerdictPolicy Protocol:
+"""A minimal verdict policy, the fallback when no full policy from agent_team.audit is
+passed in. It implements the VerdictPolicy Protocol:
 
 - pass -> no decisions (the orchestrator marks the task done)
 - fail with attempts left -> RETRY

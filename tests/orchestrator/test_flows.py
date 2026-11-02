@@ -324,8 +324,8 @@ def test_plan_mutation_helper_is_isolated() -> None:
     assert copy.deepcopy(PRD) == PRD
 
 
-class TwoCPolicyShape(UpstreamPolicy):
-    """Mimics 2c's policy: ESCALATE first, then one last try on the stronger model."""
+class EscalateThenStrongerPolicy(UpstreamPolicy):
+    """Mimics the audit policy's shape: ESCALATE first, then one last try on the stronger model."""
 
     async def on_task_verdict(
         self, run: Run, task: Task, verdict: Verdict, history: list[Verdict]
@@ -357,7 +357,7 @@ class TwoCPolicyShape(UpstreamPolicy):
 
 
 async def test_escalate_then_stronger_model(tmp_path: Path) -> None:
-    team = make_team(tmp_path, policy=TwoCPolicyShape())
+    team = make_team(tmp_path, policy=EscalateThenStrongerPolicy())
     team.auditor.fail_next["prd"].append(failing())
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "done", reply.text

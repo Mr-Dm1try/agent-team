@@ -1,4 +1,5 @@
-"""In-memory fakes for everything steps 2a and 2c provide, so 2b tests run alone."""
+"""In-memory fakes for the stores, event bus, LLM gateway and auditor, so the agents and
+orchestrator tests run without them."""
 
 from __future__ import annotations
 
