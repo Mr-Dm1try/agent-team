@@ -11,6 +11,7 @@ from agent_team.audit.toollog import InMemoryToolCallLog
 from agent_team.core.artifacts import PRD, AcceptanceCriterion, CodeChange, Requirement
 from agent_team.core.errors import BudgetExceeded, TransientLLMError
 from agent_team.core.models import AgentName, Phase, RuleScope, Run, Severity, TaskStatus
+from agent_team.llm.types import TextBlock
 
 from .fakes import (
     FakeArtifactStore,
@@ -229,7 +230,9 @@ async def test_planning_gate_shows_the_full_request_and_the_plan(rig: Rig, run: 
     )
     rig.llm.push(PASS)
     verdict = await rig.auditor.audit_gate(run, Phase.PLANNING)
-    prompt = str(rig.llm.requests[0].messages[0].content[0])
+    block = rig.llm.requests[0].messages[0].content[0]
+    assert isinstance(block, TextBlock)
+    prompt = block.text
     assert "P1" in verdict.rules_checked
     assert "User's original request:\nBuild a books API" in prompt
     assert "plan@v1" in prompt
