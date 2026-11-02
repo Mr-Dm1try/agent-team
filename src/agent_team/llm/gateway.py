@@ -13,7 +13,9 @@ Per call, in order:
    configured delays (1, 2, 4 s), then move to the next route. Other provider errors
    move to the next route at once.
 5. Cost from the price table (by the requested model, then the model the provider
-   reports), usage recorded, ``llm_call_after`` emitted.
+   reports), usage recorded in memory and, when a task store is given, added to
+   ``Run.usage``. ``llm_call_after`` is emitted. A run's first call in a process
+   seeds its budget from ``Run.usage``, so resuming doesn't reset spend.
 
 Implements ``agent_team.llm.types.LLMClient``.
 """
@@ -24,15 +26,14 @@ import asyncio
 import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, nullcontext
-from pathlib import Path
 from typing import Any
 
 from agent_team.core.config import Config, Route
 from agent_team.core.control import KillSwitch
 from agent_team.core.errors import BudgetExceeded, RunStopped, TransientLLMError
 from agent_team.core.events import InMemoryEventBus
-from agent_team.core.interfaces import EventBus
-from agent_team.core.models import AgentName, Event, EventName
+from agent_team.core.interfaces import EventBus, TaskStore
+from agent_team.core.models import AgentName, Event, EventName, Usage
 from agent_team.core.tracing import Tracer, current_span
 from agent_team.llm.budget import (
     BudgetGuard,
@@ -41,7 +42,6 @@ from agent_team.llm.budget import (
     RateLimiter,
     RunUsage,
     Sleep,
-    usage_from_events,
 )
 from agent_team.llm.budget import cost_of as _cost_of
 from agent_team.llm.chaos import TRANSIENT_FAULTS, Chaos, Fault
@@ -61,6 +61,7 @@ class Gateway:
         bus: EventBus | None = None,
         tracer: Tracer | None = None,
         kill_switch: KillSwitch | None = None,
+        runs: TaskStore | None = None,
         chaos: Chaos | None = None,
         sleep: Sleep = asyncio.sleep,
         clock: Clock = time.monotonic,
@@ -70,6 +71,9 @@ class Gateway:
         self.bus: EventBus = bus or InMemoryEventBus()
         self.tracer = tracer
         self.kill_switch = kill_switch
+        self.runs = runs
+        self._seeded: set[str] = set()
+        self._run_locks: dict[str, asyncio.Lock] = {}
         self.chaos = chaos or Chaos(config.chaos)
         self.sleep = sleep
         self.budget = BudgetTracker(config.budget, clock=clock)
@@ -130,11 +134,30 @@ class Gateway:
         """Calls, tokens, cost, retries, fallbacks and blocked calls for one run."""
         return self.budget.usage(run_id)
 
-    def restore_run(self, run_id: str, events_path: str | Path) -> RunUsage:
-        """Seed a resumed run's budget from its ``events.jsonl``, so a restart doesn't
-        reset spend and elapsed time to zero."""
-        total, elapsed_s = usage_from_events(events_path)
-        return self.budget.restore(run_id, total, elapsed_s)
+    async def _seed(self, run_id: str) -> None:
+        """On a run's first call in this process, start its budget from ``Run.usage``
+        so a resumed run doesn't start again from $0."""
+        if self.runs is None or run_id in self._seeded:
+            return
+        self._seeded.add(run_id)
+        try:
+            run = await self.runs.get_run(run_id)
+        except KeyError:
+            return
+        self.budget.restore(run_id, run.usage)
+
+    async def _persist(self, run_id: str, usage: Usage) -> None:
+        """Add one call's usage to ``Run.usage``. Serialised per run, so parallel
+        calls don't lose each other's updates."""
+        if self.runs is None:
+            return
+        lock = self._run_locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            try:
+                run = await self.runs.get_run(run_id)
+            except KeyError:
+                return
+            await self.runs.update_run(run.model_copy(update={"usage": run.usage + usage}))
 
     # --- helpers -----------------------------------------------------------------------
 
@@ -158,6 +181,7 @@ class Gateway:
     async def _preflight(self, request: LLMRequest) -> list[tuple[str, str]]:
         if self.kill_switch is not None:
             self.kill_switch.check(request.run_id)
+        await self._seed(request.run_id)
         routes = self.routes(request)
         if not routes:
             raise ValueError(f"no configured provider can serve agent {request.agent.value!r}")
@@ -258,6 +282,7 @@ class Gateway:
     ) -> None:
         if fallback:
             self.budget.usage(request.run_id).fallbacks += 1
+        await self._persist(request.run_id, response.usage)
         await self.bus.emit(
             self._event(
                 EventName.LLM_CALL_AFTER,
