@@ -22,10 +22,11 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import anthropic
+from anthropic.types.beta import BetaMessage, BetaThinkingDroppedInputTransformation
 
-from agent_team.core.config import AnthropicConfig, Effort
+from agent_team.core.config import AnthropicConfig
 from agent_team.core.errors import TransientLLMError
-from agent_team.core.models import Usage
+from agent_team.core.models import Effort, Usage
 from agent_team.llm.types import (
     ContentBlock,
     LLMRequest,
@@ -79,10 +80,13 @@ def to_wire_messages(messages: list[Message], *, provider: str) -> list[dict[str
     return out
 
 
-def from_wire_message(msg: Any, *, provider: str) -> LLMResponse:
-    """Translate an SDK ``Message``. Thinking and redacted_thinking blocks are kept
-    whole, even when their text is empty (the default display), since the signature
-    is what the API checks. Other block types are dropped."""
+def from_wire_message(
+    msg: anthropic.types.Message | anthropic.types.beta.BetaMessage, *, provider: str
+) -> LLMResponse:
+    """Translate an SDK message (plain or beta). Thinking and redacted_thinking blocks
+    are kept whole, even when their text is empty (the default display), since the
+    signature is what the API checks. Other block types are dropped. Only the beta
+    message carries ``input_transformations``, the blocks the API dropped."""
     content: list[ContentBlock] = []
     for block in msg.content:
         if block.type in ("thinking", "redacted_thinking"):
@@ -93,11 +97,13 @@ def from_wire_message(msg: Any, *, provider: str) -> LLMResponse:
             content.append(TextBlock(text=block.text))
         elif block.type == "tool_use":
             content.append(ToolUseBlock(id=block.id, name=block.name, arguments=dict(block.input)))
-    dropped = [
-        t
-        for t in getattr(msg, "input_transformations", None) or []
-        if getattr(t, "type", None) == "thinking_dropped"
-    ]
+    dropped: list[BetaThinkingDroppedInputTransformation] = []
+    if isinstance(msg, BetaMessage):
+        dropped = [
+            t
+            for t in msg.input_transformations or []
+            if isinstance(t, BetaThinkingDroppedInputTransformation)
+        ]
     return LLMResponse(
         content=content,
         stop_reason=_STOP.get(msg.stop_reason or "", "other"),

@@ -16,9 +16,9 @@ from typing import Any
 
 import openai
 
-from agent_team.core.config import Effort, OllamaConfig
-from agent_team.core.errors import TransientLLMError
-from agent_team.core.models import Usage
+from agent_team.core.config import OllamaConfig
+from agent_team.core.errors import ContextTooLong, TransientLLMError
+from agent_team.core.models import Effort, Usage
 from agent_team.llm.types import (
     ContentBlock,
     LLMRequest,
@@ -70,6 +70,15 @@ def to_chat_messages(system: str, messages: list[Message]) -> list[dict[str, Any
     return out
 
 
+def prompt_tokens(params: dict[str, Any], chars_per_token: int = 3) -> int:
+    """A high estimate of the prompt's tokens over the JSON that is sent, with
+    non-ASCII text kept as is. High on purpose: running over is silent truncation."""
+    sent = json.dumps(params["messages"], ensure_ascii=False) + json.dumps(
+        params.get("tools", []), ensure_ascii=False
+    )
+    return -(-len(sent) // chars_per_token)
+
+
 def parse_arguments(raw: str | None) -> dict[str, Any]:
     """Tool arguments as a dict. Unparseable JSON is kept under ``_invalid_json`` so
     the agent's repair loop can see it instead of crashing here."""
@@ -119,7 +128,6 @@ class OllamaProvider:
     def _params(self, request: LLMRequest, model: str, effort: Effort | None) -> dict[str, Any]:
         params: dict[str, Any] = {
             "model": model,
-            "max_tokens": request.max_tokens,
             "messages": to_chat_messages(request.system, request.messages),
             "extra_body": {"options": {"num_ctx": self.config.num_ctx}},
         }
@@ -137,7 +145,22 @@ class OllamaProvider:
                 }
                 for t in request.tools
             ]
+        params["max_tokens"] = self._max_tokens(params, request.max_tokens)
         return params
+
+    def _max_tokens(self, params: dict[str, Any], wanted: int) -> int:
+        """``wanted`` cut down so prompt plus reply fit ``num_ctx``. Ollama would
+        otherwise drop the start of the prompt (the system prompt and the task)
+        without an error. Raises ContextTooLong when even the minimum reply won't fit."""
+        prompt = prompt_tokens(params, self.config.chars_per_token)
+        room = self.config.num_ctx - prompt
+        if room < self.config.min_output_tokens:
+            raise ContextTooLong(
+                f"prompt of about {prompt} tokens leaves {room} of num_ctx "
+                f"{self.config.num_ctx}; at least {self.config.min_output_tokens} needed",
+                provider=self.name,
+            )
+        return min(wanted, room)
 
     async def complete(
         self, request: LLMRequest, *, model: str, effort: Effort | None = None

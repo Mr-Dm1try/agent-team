@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from agent_team.core.models import AgentName, ReviewMode
+from agent_team.core.models import AgentName, Effort, ReviewMode
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[3] / "config" / "default.yaml"
 ENV_VAR = "AGENT_TEAM_CONFIG"
@@ -19,9 +19,6 @@ ENV_VAR = "AGENT_TEAM_CONFIG"
 
 class _Cfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-
-Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
 
 class Route(_Cfg):
@@ -109,6 +106,13 @@ class OllamaConfig(_Cfg):
     #: Models (by name before the ":" tag) that take ``reasoning_effort``. Ollama
     #: rejects it for models that can't think, so others get no effort at all.
     reasoning_models: list[str] = Field(default_factory=lambda: ["gpt-oss"])
+    #: Least room left for the reply. A route's prompt budget plus this must fit
+    #: ``num_ctx``, and a call whose prompt leaves less is refused, because Ollama
+    #: would otherwise drop the start of the prompt without saying so.
+    min_output_tokens: int = 1024
+    #: Characters per token when estimating a prompt. Low on purpose: running over
+    #: the window is silent truncation, while a high estimate only costs a fallback.
+    chars_per_token: int = 3
 
 
 class ProvidersConfig(_Cfg):
@@ -153,6 +157,28 @@ class Config(_Cfg):
     review: ReviewMode = ReviewMode.AUTO_ASSUMPTIONS
     hooks: list[str] = Field(default_factory=list)
     paths: PathsConfig = Field(default_factory=PathsConfig)
+
+    @model_validator(mode="after")
+    def _ollama_routes_fit(self) -> Config:
+        # Budgets are counted at four characters per token (as compaction does); the
+        # Ollama provider estimates more cautiously, so scale before comparing.
+        ollama = self.providers.ollama
+        for agent in AgentName:
+            route = self.route_for(agent)
+            on_ollama = route.provider == "ollama" or (
+                self.stronger_model is not None and self.stronger_model.provider == "ollama"
+            )
+            if not on_ollama:
+                continue
+            budget = self.context_budget(agent)
+            estimated = -(-budget * 4 // ollama.chars_per_token)
+            if estimated + ollama.min_output_tokens > ollama.num_ctx:
+                raise ValueError(
+                    f"{agent.value}: context_budget {budget} (about {estimated} tokens as "
+                    f"Ollama counts them) plus min_output_tokens {ollama.min_output_tokens} "
+                    f"exceeds ollama num_ctx {ollama.num_ctx}"
+                )
+        return self
 
     def route_for(self, agent: AgentName) -> Route:
         """The agent's route, or the default, with the context budget and effort

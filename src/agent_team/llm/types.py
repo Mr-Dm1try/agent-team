@@ -9,8 +9,7 @@ from typing import Any, Literal, Protocol
 from pydantic import Field
 
 from agent_team.core.base import Contract
-from agent_team.core.config import Effort
-from agent_team.core.models import AgentName, Usage
+from agent_team.core.models import AgentName, Effort, Usage
 
 
 class TextBlock(Contract):
