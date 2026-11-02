@@ -5,13 +5,14 @@ from pathlib import Path
 import pytest
 
 from agent_team.core.errors import ToolError
+from agent_team.core.interfaces import ToolContext
 from agent_team.core.models import AgentName, Phase, Run, Task
-from agent_team.tools import RunToolContext, file_tools
+from agent_team.tools import file_tools
 from agents.fakes import FakeBus
 
 
 @pytest.fixture
-def ctx(tmp_path: Path) -> RunToolContext:
+def ctx(tmp_path: Path) -> ToolContext:
     ws = tmp_path / "run" / "workspace"
     ws.mkdir(parents=True)
     ref = tmp_path / "ref"
@@ -25,10 +26,10 @@ def ctx(tmp_path: Path) -> RunToolContext:
         objective="o",
         output_kind="code_change",
     )
-    return RunToolContext(run=run, task=task, bus=FakeBus())
+    return ToolContext(run=run, task=task, bus=FakeBus())
 
 
-async def test_write_then_read_list_grep(ctx: RunToolContext) -> None:
+async def test_write_then_read_list_grep(ctx: ToolContext) -> None:
     tools = file_tools()
     out = await tools["write_file"]({"path": "src/app.py", "content": "a = 1\nb = 2\n"}, ctx)
     assert "created src/app.py (2 lines)" in out.content
@@ -40,7 +41,7 @@ async def test_write_then_read_list_grep(ctx: RunToolContext) -> None:
     assert found.content == "src/app.py:2: b = 2"
 
 
-async def test_context_folder_is_read_only(ctx: RunToolContext) -> None:
+async def test_context_folder_is_read_only(ctx: ToolContext) -> None:
     tools = file_tools()
     notes = str(Path(ctx.run.context_dirs[0]) / "notes.md")
     read = await tools["read_file"]({"path": notes}, ctx)
@@ -50,12 +51,12 @@ async def test_context_folder_is_read_only(ctx: RunToolContext) -> None:
 
 
 @pytest.mark.parametrize("path", ["../escape.txt", "/etc/passwd", "a/../../x"])
-async def test_paths_outside_workspace_are_rejected(ctx: RunToolContext, path: str) -> None:
+async def test_paths_outside_workspace_are_rejected(ctx: ToolContext, path: str) -> None:
     with pytest.raises(ToolError, match="outside the workspace"):
         await file_tools()["read_file"]({"path": path}, ctx)
 
 
-async def test_symlink_escape_is_rejected(ctx: RunToolContext, tmp_path: Path) -> None:
+async def test_symlink_escape_is_rejected(ctx: ToolContext, tmp_path: Path) -> None:
     secret = tmp_path / "secret.txt"
     secret.write_text("key")
     (Path(ctx.run.workspace) / "link").symlink_to(secret)
@@ -63,12 +64,12 @@ async def test_symlink_escape_is_rejected(ctx: RunToolContext, tmp_path: Path) -
         await file_tools()["read_file"]({"path": "link"}, ctx)
 
 
-async def test_git_folder_is_not_writable(ctx: RunToolContext) -> None:
+async def test_git_folder_is_not_writable(ctx: ToolContext) -> None:
     with pytest.raises(ToolError, match=r"\.git"):
         await file_tools()["write_file"]({"path": ".git/config", "content": "x"}, ctx)
 
 
-async def test_missing_file_and_bad_args(ctx: RunToolContext) -> None:
+async def test_missing_file_and_bad_args(ctx: ToolContext) -> None:
     tools = file_tools()
     with pytest.raises(ToolError, match="no such file"):
         await tools["read_file"]({"path": "nope.py"}, ctx)

@@ -1,4 +1,4 @@
-"""Shared pieces for tools: the tool context, workspace path rules and large-result
+"""Shared pieces for tools: workspace path rules and large-result
 storage.
 
 Path rules (docs/DESIGN.md, "Sandbox"): every path resolves inside the run's
@@ -8,24 +8,13 @@ write. Symlinks and ``..`` are resolved before the check, so neither can escape.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
 from agent_team.core.errors import ToolError
-from agent_team.core.interfaces import EventBus
-from agent_team.core.models import Run, Task, new_id
+from agent_team.core.models import Run, new_id
 
 #: Tool output longer than this is saved to a file and only a preview is inlined.
 MAX_INLINE_CHARS = 12_000
-
-
-@dataclass
-class RunToolContext:
-    """Concrete ToolContext: what a tool may know about the call it serves."""
-
-    run: Run
-    task: Task
-    bus: EventBus
 
 
 def _inside(path: Path, root: Path) -> bool:

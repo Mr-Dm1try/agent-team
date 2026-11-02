@@ -13,7 +13,7 @@ from agent_team.agents.loop import LoopSettings, ToolLoop
 from agent_team.agents.prompts import COMMON
 from agent_team.core.artifacts import ARTIFACT_TYPES, Artifact, ArtifactBase
 from agent_team.core.errors import AgentTeamError, OutputValidationError
-from agent_team.core.interfaces import AgentContext, Tool
+from agent_team.core.interfaces import AgentContext, Tool, ToolContext
 from agent_team.core.models import (
     AgentName,
     AgentResult,
@@ -22,7 +22,6 @@ from agent_team.core.models import (
     TaskEnvelope,
 )
 from agent_team.llm.types import Message
-from agent_team.tools.base import RunToolContext
 
 _ARTIFACT_ADAPTER: TypeAdapter[Artifact] = TypeAdapter(Artifact)
 #: Fields the dispatcher fills; the model is told to leave them out.
@@ -159,7 +158,7 @@ class BaseAgent:
             bus=ctx.bus,
             checkpoints=ctx.checkpoints,
             tools=tools,
-            tool_ctx=RunToolContext(run=envelope.run, task=task, bus=ctx.bus),
+            tool_ctx=ToolContext(run=envelope.run, task=task, bus=ctx.bus),
             run=envelope.run,
             task_id=task.id,
             attempt=task.attempt,
@@ -169,10 +168,9 @@ class BaseAgent:
             trace_id=envelope.trace_id,
             span_id=envelope.span_id,
         )
-        resume = bool(getattr(ctx, "resume", False))
         try:
             outcome = await loop.run_loop(
-                Message.user(render_envelope(envelope, tools)), resume=resume
+                Message.user(render_envelope(envelope, tools)), resume=ctx.resume
             )
         except AgentTeamError as exc:
             return AgentResult(

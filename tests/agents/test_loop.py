@@ -9,6 +9,7 @@ from agent_team.agents import Engineer, Product
 from agent_team.agents.compaction import Compactor
 from agent_team.agents.loop import INTERRUPTED_NOTE, LoopSettings
 from agent_team.core.artifacts import CodeChange
+from agent_team.core.interfaces import AgentContext
 from agent_team.core.models import (
     AgentName,
     EventName,
@@ -21,7 +22,6 @@ from agent_team.core.models import (
     TaskEnvelope,
 )
 from agent_team.llm.types import Message, TextBlock, ToolResultBlock, ToolUseBlock
-from agent_team.orchestrator.dispatcher import DispatchContext
 from agent_team.tools import file_tools
 from agents.fakes import FakeBus, FakeCheckpoints, FakeLLM, tool_call
 from agents.scenario import CODE, PRD
@@ -43,8 +43,8 @@ def ctx(
     bus: FakeBus | None = None,
     cps: FakeCheckpoints | None = None,
     resume: bool = False,
-) -> DispatchContext:
-    return DispatchContext(
+) -> AgentContext:
+    return AgentContext(
         llm=llm,
         bus=bus or FakeBus(),
         checkpoints=cps or FakeCheckpoints(),

@@ -6,11 +6,11 @@ import pytest
 from agents.fakes import FakeBus, FakeLLM
 
 from agent_team.core.errors import ToolError
+from agent_team.core.interfaces import ToolContext
 from agent_team.core.models import AgentName, Phase, RequestKind, Run, TaskStatus
 from agent_team.orchestrator.classify import classify, heuristic
 from agent_team.orchestrator.control import control_tools
 from agent_team.orchestrator.phases import PhaseMachine
-from agent_team.tools import RunToolContext
 from orchestrator.harness import make_team
 
 
@@ -21,7 +21,7 @@ async def _ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
     run = await team.tasks.get_run(reply.run_id)
     task = (await team.tasks.list_tasks(run.id))[0]
     tools = control_tools(team.tasks, team.artifacts, team.decisions, team.verdicts)
-    return team, tools, RunToolContext(run=run, task=task, bus=FakeBus())
+    return team, tools, ToolContext(run=run, task=task, bus=FakeBus())
 
 
 async def test_read_tools_show_run_state(tmp_path: Path) -> None:

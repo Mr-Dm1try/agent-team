@@ -30,6 +30,7 @@ from agent_team.core.interfaces import (
     EventBus,
     FeedbackStore,
     TaskStore,
+    ToolContext,
     VerdictPolicy,
     VerdictStore,
 )
@@ -64,7 +65,6 @@ from agent_team.orchestrator.phases import PhaseMachine, live
 from agent_team.orchestrator.planning import RULE as PIPELINE
 from agent_team.orchestrator.planning import expand_plan, implementation_tasks
 from agent_team.orchestrator.policy import SimplePolicy
-from agent_team.tools.base import RunToolContext
 
 _APPROVE = re.compile(
     r"^\s*(approve[ds]?|ok(ay)?|yes|lgtm|looks good|accept(ed)?|ship it)[\s.!]*$", re.I
@@ -1054,7 +1054,7 @@ class Orchestrator:
             bus=self.bus,
             checkpoints=self.checkpoints,
             tools=tools,
-            tool_ctx=RunToolContext(run=run, task=pseudo, bus=self.bus),
+            tool_ctx=ToolContext(run=run, task=pseudo, bus=self.bus),
             run=run,
             task_id=pseudo.id,
             attempt=1,

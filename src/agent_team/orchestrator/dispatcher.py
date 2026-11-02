@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from agent_team.core.artifacts import Artifact, ArtifactRef
 from agent_team.core.interfaces import (
     Agent,
+    AgentContext,
     ArtifactStore,
     CheckpointStore,
     EventBus,
@@ -60,17 +61,6 @@ _PAUSING = frozenset({"BudgetExceeded", "RunStopped"})
 
 MemoryFetcher = Callable[[Task, Run], Awaitable[list[str]]]
 ConstraintSource = Callable[[Task, Run], list[str]]
-
-
-@dataclass
-class DispatchContext:
-    """Concrete AgentContext handed to an agent for one attempt."""
-
-    llm: LLMClient
-    bus: EventBus
-    checkpoints: CheckpointStore
-    tools: dict[str, Tool]
-    resume: bool = False
 
 
 @dataclass
@@ -119,7 +109,7 @@ class Dispatcher:
 
         try:
             envelope = await self.build_envelope(task, run)
-            ctx = DispatchContext(
+            ctx = AgentContext(
                 llm=self.llm,
                 bus=self.bus,
                 checkpoints=self.checkpoints,
