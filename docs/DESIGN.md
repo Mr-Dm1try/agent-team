@@ -47,10 +47,10 @@ The auditor's verdict goes back to the orchestrator, which moves the work on, re
 
 The four phases run in order, and each ends at a gate where the auditor checks that phase's rules:
 
-1. **Planning:** the Orchestrator reads the request, splits it into numbered asks, sends the Researcher out if it needs facts, and writes a plan of tasks.
+1. **Planning:** the Orchestrator reads the request, decides whether it is a build or a research question, splits it into numbered asks and lists the research questions. These go into a small plan, which is audited, reviewed and versioned like any other artifact, and each research question becomes a Researcher task. The order of the phases is fixed in code, so the model never writes a task graph.
 2. **PRD:** Product writes numbered requirements and acceptance criteria.
 3. **Spec:** the Architect writes the design, the file plan and the test plan.
-4. **Implementation:** the Engineer writes the code and its unit tests, then QA reviews the whole solution and runs it end to end in the sandbox.
+4. **Implementation:** the Engineer writes the code and its unit tests, as one task unless the Architect splits the spec into independent work packages. Then QA reviews the whole solution and runs it end to end in the sandbox.
 
 The phase order and the gates are fixed in code. The model makes the judgment calls inside them, such as how to split the work, which phase a change request reopens, and how to answer you.
 
@@ -214,7 +214,7 @@ Each rule has an id, a scope (task, phase or run), a severity (blocker or warnin
 
 | Rule | Scope | Checks that | Evidence from helpers | Severity |
 | --- | --- | --- | --- | --- |
-| P1 Valid plan | Planning gate | Every task has a known agent, an objective and inputs that exist, the dependencies have no cycles, and every ask is covered by a task | Dependency graph and ask ids | Blocker |
+| P1 Valid plan | Planning gate | The asks cover everything the request says and invent nothing, they have unique ids, the request type is right, and every research question names the ask it serves | Ask ids and research questions | Blocker |
 | R1 Schema | Every task | The artifact parses into its schema | Schema validation | Blocker |
 | R2 Real sources | Research tasks | Every finding cites a file or URL the Researcher actually opened | Cited sources against the tool-call log | Blocker |
 | P2 Brief complete | Research tasks | The brief answers each research question it was given, or says why it couldn't | Questions without an answer | Blocker |
