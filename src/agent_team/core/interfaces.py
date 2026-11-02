@@ -6,12 +6,14 @@
   Orchestrator; agent_team.tools: tools.
 - agent_team.audit: Auditor, VerdictPolicy, rule store and evidence helpers.
 
-Each package codes against these Protocols and tests with its own fakes.
+Each package codes against these Protocols and tests with its own fakes. The two
+context classes are plain dataclasses: they only bundle the services passed in.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from agent_team.core.artifacts import Artifact, ArtifactRef
@@ -203,8 +205,10 @@ class VerdictStore(Protocol):
 # --- tools and agents --------------------------------------------------------------
 
 
-class ToolContext(Protocol):
-    """The run and task a tool call belongs to, and the bus to emit events on."""
+@dataclass
+class ToolContext:
+    """The run and task a tool call belongs to, and the bus to emit events on. Built
+    by the agent loop for each attempt."""
 
     run: Run
     task: Task
@@ -224,13 +228,16 @@ class Tool(Protocol):
         ...
 
 
-class AgentContext(Protocol):
+@dataclass
+class AgentContext:
     """Services an agent may use during one attempt. Built by the dispatcher."""
 
     llm: LLMClient
     bus: EventBus
     checkpoints: CheckpointStore
     tools: dict[str, Tool]
+    #: Continue from the attempt's last checkpoint instead of starting fresh.
+    resume: bool = False
 
 
 class Agent(Protocol):
