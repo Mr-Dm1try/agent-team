@@ -1,4 +1,4 @@
-# Rule catalog for the auditor (step 2c). Seeded into the SQLite rules table on start,
+# Rule catalog for the auditor. Seeded into the SQLite rules table on start,
 # so the defaults stay versioned here. See docs/DESIGN.md, "Validation rules and the
 # auditor". `helper` names an evidence helper in agent_team.audit.evidence; `precheck`
 # means the rule is also enforced before tool calls.

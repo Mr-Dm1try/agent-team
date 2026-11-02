@@ -1,4 +1,4 @@
-"""Step 2c: rule catalog and store, evidence helpers, the auditor, the tool pre-check
+"""The auditor package: rule catalog and store, evidence helpers, the auditor, the tool pre-check
 and the verdict policy."""
 
 from agent_team.audit.auditor import AUDIT_RULE, LLMAuditor
