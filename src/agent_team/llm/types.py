@@ -6,28 +6,25 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
+from agent_team.core.base import Contract
 from agent_team.core.models import AgentName, Usage
 
 
-class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class TextBlock(_Strict):
+class TextBlock(Contract):
     type: Literal["text"] = "text"
     text: str
 
 
-class ToolUseBlock(_Strict):
+class ToolUseBlock(Contract):
     type: Literal["tool_use"] = "tool_use"
     id: str
     name: str
     arguments: dict[str, Any]
 
 
-class ToolResultBlock(_Strict):
+class ToolResultBlock(Contract):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
     content: str
@@ -38,7 +35,7 @@ class ToolResultBlock(_Strict):
 ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock
 
 
-class Message(_Strict):
+class Message(Contract):
     role: Literal["user", "assistant"]
     content: list[ContentBlock]
 
@@ -47,13 +44,13 @@ class Message(_Strict):
         return cls(role="user", content=[TextBlock(text=text)])
 
 
-class ToolSpec(_Strict):
+class ToolSpec(Contract):
     name: str
     description: str
     input_schema: dict[str, Any]
 
 
-class LLMRequest(_Strict):
+class LLMRequest(Contract):
     agent: AgentName
     system: str
     messages: list[Message]
@@ -63,7 +60,7 @@ class LLMRequest(_Strict):
     task_id: str | None = None
 
 
-class LLMResponse(_Strict):
+class LLMResponse(Contract):
     content: list[ContentBlock]
     stop_reason: Literal["end_turn", "tool_use", "max_tokens", "other"]
     usage: Usage
@@ -79,7 +76,7 @@ class LLMResponse(_Strict):
         return [b for b in self.content if isinstance(b, ToolUseBlock)]
 
 
-class StreamChunk(_Strict):
+class StreamChunk(Contract):
     text: str = ""
     done: bool = False
     response: LLMResponse | None = None  # set on the final chunk

@@ -11,24 +11,20 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field, model_validator
 
 from agent_team.core.artifacts import Artifact, ArtifactRef
+from agent_team.core.base import Contract
 
 
 def new_id(prefix: str) -> str:
-    """Short, sortable-enough ids such as ``task_3f9a1c2e``."""
-    return f"{prefix}_{uuid4().hex[:8]}"
+    """Random ids such as ``task_3f9a1c2e4b5d6a7f``: 64 random bits, so collisions are
+    negligible across every run in one database. Not sortable; order by ``created_at``."""
+    return f"{prefix}_{uuid4().hex[:16]}"
 
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-class Contract(BaseModel):
-    """Base for every contract model: strict about unknown fields."""
-
-    model_config = ConfigDict(extra="forbid")
 
 
 # --- enums -------------------------------------------------------------------------
@@ -77,10 +73,17 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.ESCALATED,
             TaskStatus.WAITING,
             TaskStatus.READY,  # resumed after a crash or a pause
+            TaskStatus.SUPERSEDED,  # a change made its inputs stale mid-attempt
         }
     ),
     TaskStatus.AUDITING: frozenset(
-        {TaskStatus.DONE, TaskStatus.RETRY, TaskStatus.ESCALATED, TaskStatus.WAITING}
+        {
+            TaskStatus.DONE,
+            TaskStatus.RETRY,
+            TaskStatus.ESCALATED,
+            TaskStatus.WAITING,
+            TaskStatus.SUPERSEDED,
+        }
     ),
     TaskStatus.RETRY: frozenset({TaskStatus.READY, TaskStatus.SUPERSEDED}),
     TaskStatus.WAITING: frozenset({TaskStatus.READY, TaskStatus.DONE, TaskStatus.SUPERSEDED}),
@@ -165,6 +168,9 @@ class Run(Contract):
     workspace: str  # absolute path to runs/<run_id>/workspace
     context_dirs: list[str] = Field(default_factory=list)  # read-only folders from --context
     upstream_reruns: int = 0
+    # Tokens and cost spent so far, saved with the run so a resumed run keeps counting
+    # against its budget instead of starting from zero.
+    usage: Usage = Field(default_factory=Usage)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -293,6 +299,13 @@ class Verdict(Contract):
     @property
     def blockers(self) -> list[Finding]:
         return [f for f in self.findings if f.severity is Severity.BLOCKER]
+
+    @model_validator(mode="after")
+    def _no_pass_with_blockers(self) -> Verdict:
+        """Fail closed: a verdict that holds a blocker can't be a pass, whoever built it."""
+        if self.passed and self.blockers:
+            raise ValueError("a verdict with blocker findings cannot pass")
+        return self
 
 
 class PrecheckDecision(StrEnum):

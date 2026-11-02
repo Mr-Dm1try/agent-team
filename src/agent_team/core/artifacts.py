@@ -9,21 +9,19 @@ and R9 check these links with code, so field names here are part of the contract
 from __future__ import annotations
 
 import re
-from typing import Annotated, Literal
+from typing import Annotated, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
+
+from agent_team.core.base import Contract
 
 _REF = re.compile(r"^(?P<kind>[a-z_]+)@v(?P<version>\d+)$")
 
 
-class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class ArtifactRef(_Strict):
+class ArtifactRef(Contract):
     """Points at one version of one artifact kind within a run, e.g. ``prd@v2``."""
 
-    kind: str
+    kind: str = Field(pattern=r"^[a-z_]+$")
     version: int = Field(ge=1)
 
     def __str__(self) -> str:
@@ -31,13 +29,13 @@ class ArtifactRef(_Strict):
 
     @classmethod
     def parse(cls, text: str) -> ArtifactRef:
-        m = _REF.match(text)
+        m = _REF.fullmatch(text)
         if not m:
             raise ValueError(f"not an artifact ref: {text!r}")
         return cls(kind=m["kind"], version=int(m["version"]))
 
 
-class Question(_Strict):
+class Question(Contract):
     id: str  # e.g. "Q-1"
     text: str
     why: str  # what the agent can't decide without it
@@ -45,23 +43,23 @@ class Question(_Strict):
     assumption: str | None = None  # recorded instead of asking in auto_assumptions mode
 
 
-class MemoryProposal(_Strict):
+class MemoryProposal(Contract):
     kind: Literal["decision", "lesson", "preference", "research_fact"]
     text: str
     source: str | None = None  # URL or file for research facts
 
 
-class ResearchRequest(_Strict):
+class ResearchRequest(Contract):
     question: str
     why: str
 
 
-class Source(_Strict):
+class Source(Contract):
     ref: str  # URL or path the Researcher actually opened
     title: str | None = None
 
 
-class ArtifactBase(_Strict):
+class ArtifactBase(Contract):
     """Fields every artifact carries. The dispatcher fills run_id/task_id/version."""
 
     run_id: str = ""
@@ -77,12 +75,12 @@ class ArtifactBase(_Strict):
 # --- planning ----------------------------------------------------------------------
 
 
-class Ask(_Strict):
+class Ask(Contract):
     id: str  # "ASK-1"
     text: str
 
 
-class ResearchQuestion(_Strict):
+class ResearchQuestion(Contract):
     question: str
     ask: str  # the ASK id this question serves
 
@@ -92,7 +90,8 @@ class Plan(ArtifactBase):
     the plan holds no tasks: each research question becomes one Researcher task."""
 
     kind: Literal["plan"] = "plan"
-    request_kind: str  # a RequestKind value
+    # Only these two RequestKind values start a plan; changes and run questions don't.
+    request_kind: Literal["build", "research_question"]
     asks: list[Ask] = Field(min_length=1)
     research_questions: list[ResearchQuestion] = Field(default_factory=list)
 
@@ -100,12 +99,12 @@ class Plan(ArtifactBase):
 # --- research ----------------------------------------------------------------------
 
 
-class ResearchFinding(_Strict):
+class ResearchFinding(Contract):
     claim: str
     sources: list[Source] = Field(min_length=1)
 
 
-class AnsweredQuestion(_Strict):
+class AnsweredQuestion(Contract):
     question: str
     answer: str | None  # None means it couldn't be answered; say why in `gap`
     gap: str | None = None
@@ -123,12 +122,12 @@ class ResearchBrief(ArtifactBase):
 # --- PRD and spec ------------------------------------------------------------------
 
 
-class AcceptanceCriterion(_Strict):
+class AcceptanceCriterion(Contract):
     id: str  # "AC-1.1"
     text: str
 
 
-class Requirement(_Strict):
+class Requirement(Contract):
     id: str  # "REQ-1"
     text: str
     asks: list[str] = Field(min_length=1)  # ASK ids this requirement covers
@@ -142,27 +141,27 @@ class PRD(ArtifactBase):
     out_of_scope: list[str] = Field(default_factory=list)
 
 
-class Component(_Strict):
+class Component(Contract):
     name: str
     responsibility: str
     requirements: list[str]  # REQ ids
     files: list[str]  # workspace-relative paths
 
 
-class Interface(_Strict):
+class Interface(Contract):
     name: str  # function, route or tool name
     signature: str
     component: str
 
 
-class PlannedCheck(_Strict):
+class PlannedCheck(Contract):
     id: str  # "CHK-1"
     criteria: list[str]  # AC ids
     kind: Literal["unit_test", "e2e"]
     description: str
 
 
-class WorkPackage(_Strict):
+class WorkPackage(Contract):
     name: str
     components: list[str]  # Component names
 
@@ -184,7 +183,7 @@ class Spec(ArtifactBase):
 # --- implementation ----------------------------------------------------------------
 
 
-class TestRun(_Strict):
+class TestRun(Contract):
     command: str
     passed: int
     failed: int
@@ -199,13 +198,13 @@ class CodeChange(ArtifactBase):
     tests: TestRun | None = None
 
 
-class CriterionResult(_Strict):
+class CriterionResult(Contract):
     criterion: str  # AC id
     result: Literal["pass", "fail", "not_checked"]
     evidence: str
 
 
-class QAIssue(_Strict):
+class QAIssue(Contract):
     severity: Literal["blocker", "warning"]
     text: str
     files: list[str] = Field(default_factory=list)
@@ -235,12 +234,7 @@ Artifact = Annotated[
     Field(discriminator="kind"),
 ]
 
+#: Artifact class by kind, derived from the union so the two can't drift apart.
 ARTIFACT_TYPES: dict[str, type[ArtifactBase]] = {
-    "plan": Plan,
-    "research_brief": ResearchBrief,
-    "prd": PRD,
-    "spec": Spec,
-    "code_change": CodeChange,
-    "qa_report": QAReport,
-    "research_answer": ResearchAnswer,
+    cls.model_fields["kind"].default: cls for cls in get_args(get_args(Artifact)[0])
 }

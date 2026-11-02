@@ -89,3 +89,24 @@ def test_plan_holds_asks_and_questions_but_no_tasks() -> None:
         TypeAdapter(Artifact).validate_python({**data, "tasks": []})
     with pytest.raises(ValidationError):
         TypeAdapter(Artifact).validate_python({**data, "asks": []})
+
+
+def test_contract_guards() -> None:
+    from agent_team.core.artifacts import ARTIFACT_TYPES, Plan
+    from agent_team.core.models import Finding, RuleScope, Severity, Verdict
+
+    assert set(ARTIFACT_TYPES) == {
+        "plan", "research_brief", "prd", "spec", "code_change", "qa_report", "research_answer"
+    }  # fmt: skip
+    with pytest.raises(ValidationError):
+        Plan(summary="s", request_kind="banana", asks=[{"id": "ASK-1", "text": "x"}])  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        ArtifactRef.parse("prd@v2\n")
+    with pytest.raises(ValidationError):
+        ArtifactRef(kind="PRD", version=1)
+    blocker = Finding(rule_id="R1", severity=Severity.BLOCKER, message="bad")
+    with pytest.raises(ValidationError):
+        Verdict(run_id="r", scope=RuleScope.TASK, passed=True, findings=[blocker])
+    assert not Verdict(run_id="r", scope=RuleScope.TASK, passed=False, findings=[blocker]).passed
+    assert can_transition(TaskStatus.RUNNING, TaskStatus.SUPERSEDED)
+    assert can_transition(TaskStatus.AUDITING, TaskStatus.SUPERSEDED)
