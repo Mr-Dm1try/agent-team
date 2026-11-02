@@ -141,7 +141,6 @@ class ToolPrecheck:
                 run_id=run.id,
                 task_id=task.id,
                 repairs=1,
-                max_tokens=256,
             )
         except (BudgetExceeded, RunStopped):
             raise

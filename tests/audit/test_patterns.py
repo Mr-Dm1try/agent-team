@@ -69,3 +69,31 @@ def test_fenced_json_with_backticks_inside_strings() -> None:
     )
     verdict = parse_reply(text, _ModelVerdict)
     assert verdict.findings[0].evidence == "```eval(x)```"
+
+
+async def test_thinking_blocks_are_ignored_and_max_tokens_stays_at_default() -> None:
+    from agent_team.audit.llmjson import ask_json
+    from agent_team.core.models import Usage
+    from agent_team.llm.types import LLMRequest, LLMResponse, TextBlock, ThinkingBlock
+
+    seen: list[LLMRequest] = []
+
+    class ThinkingLLM:
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            seen.append(request)
+            thinking = ThinkingBlock(provider="anthropic", model="m", raw={"thinking": "{x"})
+            return LLMResponse(
+                content=[thinking, TextBlock(text='{"summary": "ok", "findings": []}')],
+                stop_reason="end_turn", usage=Usage(), provider="anthropic", model="m",
+            )  # fmt: skip
+
+    reply = await ask_json(
+        ThinkingLLM(),  # type: ignore[arg-type]
+        _ModelVerdict,
+        system="s",
+        prompt="p",
+        run_id="r",
+        task_id=None,
+    )
+    assert reply.value is not None and reply.value.summary == "ok"
+    assert seen[0].max_tokens == LLMRequest.model_fields["max_tokens"].default

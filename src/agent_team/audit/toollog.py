@@ -8,7 +8,9 @@ from ``tool_call_after`` events. The event's ``data`` is read leniently: ``tool`
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import Field
@@ -16,6 +18,7 @@ from pydantic import Field
 from agent_team.core.base import Contract
 from agent_team.core.interfaces import EventBus
 from agent_team.core.models import Event, EventName, utcnow
+from agent_team.core.tracing import read_events
 
 
 class ToolCall(Contract):
@@ -35,7 +38,7 @@ class ToolCall(Contract):
 class ToolCallLog(Protocol):
     """Where the auditor reads tool calls from."""
 
-    async def for_task(self, task_id: str) -> list[ToolCall]:
+    async def for_task(self, run_id: str, task_id: str) -> list[ToolCall]:
         """The task's calls, oldest first."""
         ...
 
@@ -45,7 +48,8 @@ class ToolCallLog(Protocol):
 
 
 class InMemoryToolCallLog:
-    """Implements ``ToolCallLog``. ``attach(bus)`` records every finished tool call."""
+    """Implements ``ToolCallLog`` in memory, for tests and short runs.
+    ``attach(bus)`` records every finished tool call."""
 
     def __init__(self) -> None:
         self._calls: list[ToolCall] = []
@@ -63,13 +67,31 @@ class InMemoryToolCallLog:
         if call is not None:
             self.record(call)
 
-    async def for_task(self, task_id: str) -> list[ToolCall]:
+    async def for_task(self, run_id: str, task_id: str) -> list[ToolCall]:
         """The task's calls, oldest first."""
-        return [c for c in self._calls if c.task_id == task_id]
+        return [c for c in self._calls if c.run_id == run_id and c.task_id == task_id]
 
     async def for_run(self, run_id: str) -> list[ToolCall]:
         """The run's calls, oldest first."""
         return [c for c in self._calls if c.run_id == run_id]
+
+
+class EventFileToolCallLog:
+    """Implements ``ToolCallLog`` over the run's ``events.jsonl``, so the audit still
+    sees every tool call after a crash and resume."""
+
+    def __init__(self, runs_dir: str | Path) -> None:
+        self.runs_dir = runs_dir
+
+    async def for_run(self, run_id: str) -> list[ToolCall]:
+        """The run's calls, oldest first."""
+        events = await asyncio.to_thread(read_events, self.runs_dir, run_id)
+        calls = (tool_call_from_event(e) for e in events if e.name is EventName.TOOL_CALL_AFTER)
+        return [c for c in calls if c is not None]
+
+    async def for_task(self, run_id: str, task_id: str) -> list[ToolCall]:
+        """The task's calls, oldest first."""
+        return [c for c in await self.for_run(run_id) if c.task_id == task_id]
 
 
 def tool_call_from_event(event: Event) -> ToolCall | None:

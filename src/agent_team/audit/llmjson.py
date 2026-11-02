@@ -64,10 +64,11 @@ async def ask_json[T: BaseModel](
     run_id: str,
     task_id: str | None,
     repairs: int = 2,
-    max_tokens: int = 4096,
 ) -> Reply[T]:
     """Ask for one JSON object matching ``schema``, sending parse errors back up to
-    ``repairs`` times. Model errors propagate; the caller decides how to fail closed."""
+    ``repairs`` times. Model errors propagate; the caller decides how to fail closed.
+    ``max_tokens`` stays at the request default, since it also covers thinking; only
+    text blocks of the reply are parsed, so thinking blocks are ignored."""
     messages = [Message.user(prompt)]
     usage = Usage()
     model: str | None = None
@@ -78,7 +79,6 @@ async def ask_json[T: BaseModel](
                 agent=AgentName.AUDITOR,
                 system=system,
                 messages=messages,
-                max_tokens=max_tokens,
                 run_id=run_id,
                 task_id=task_id,
             )

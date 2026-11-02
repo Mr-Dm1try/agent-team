@@ -153,7 +153,7 @@ class LLMAuditor:
                 ctx.previous = await self._previous(run.id, artifact)
             ctx.tasks = await self.tasks.list_tasks(run.id)
             ctx.latest = await self._latest(run.id)
-            ctx.tool_calls = await self.tool_log.for_task(task.id)
+            ctx.tool_calls = await self.tool_log.for_task(run.id, task.id)
             rules = await self.rules.for_scope("task", phase=task.phase, agent=task.agent)
             if ctx.previous is None:  # R12 and any other revision-only rule
                 rules = [r for r in rules if r.helper != "minimal_revision"]
@@ -175,7 +175,7 @@ class LLMAuditor:
                     continue
                 if t.output is not None:
                     ctx.outputs.append((t, await self.artifacts.load(run.id, t.output)))
-                ctx.tool_calls += await self.tool_log.for_task(t.id)
+                ctx.tool_calls += await self.tool_log.for_task(run.id, t.id)
             rules = await self.rules.for_scope("phase", phase=phase, agent=None)
             return ctx, rules
 
@@ -288,7 +288,6 @@ class LLMAuditor:
                 run_id=ctx.run.id,
                 task_id=ctx.task.id if ctx.task else None,
                 repairs=1,
-                max_tokens=512,
             )
         except (BudgetExceeded, RunStopped):
             raise
