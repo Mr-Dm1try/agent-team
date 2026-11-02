@@ -6,7 +6,7 @@ from collections.abc import Iterable
 
 from agent_team.core.config import Config
 from agent_team.core.control import KillSwitch
-from agent_team.core.interfaces import EventBus
+from agent_team.core.interfaces import EventBus, TaskStore
 from agent_team.core.tracing import Tracer
 from agent_team.llm.chaos import Chaos
 from agent_team.llm.gateway import Gateway
@@ -47,6 +47,7 @@ def build_gateway(
     tracer: Tracer | None = None,
     kill_switch: KillSwitch | None = None,
     chaos: Chaos | None = None,
+    runs: TaskStore | None = None,
 ) -> Gateway:
     """A Gateway over the given or configured providers."""
     return Gateway(
@@ -56,4 +57,5 @@ def build_gateway(
         tracer=tracer,
         kill_switch=kill_switch,
         chaos=chaos,
+        runs=runs,
     )

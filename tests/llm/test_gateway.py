@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -333,28 +334,41 @@ async def test_missing_primary_provider_counts_as_fallback(
     assert after.data["fallback"] is True
 
 
-async def test_restore_run_carries_spend_across_a_restart(sleeps: Sleeps, tmp_path: Path) -> None:
-    from agent_team.core.tracing import JsonlTracer
+async def test_resumed_run_over_budget_is_blocked(sleeps: Sleeps, tmp_path: Path) -> None:
+    from agent_team.core.db import Database
+    from agent_team.core.models import Run
+    from agent_team.core.stores import SqliteTaskStore
 
     config = make_config(budget={"max_usd_per_run": 1.0})
-    bus = InMemoryEventBus()
-    JsonlTracer(tmp_path).attach(bus)
-    first = gateway(
-        FakeProvider([FakeTurn(text="x", input_tokens=600_000, output_tokens=0)]),
-        sleeps=sleeps,
-        bus=bus,
-        config=config,
-    )
-    await first.complete(request())
+    path = tmp_path / "db.sqlite"
+    runs = SqliteTaskStore(Database(path))
+    run = await runs.create_run(Run(id="run_1", title="t", request="r", workspace="/w"))
 
-    events_path = tmp_path / "run_1" / "logs" / "events.jsonl"
-    second = gateway(
-        FakeProvider([FakeTurn(text="y", input_tokens=600_000, output_tokens=0), "z"]),
+    # First process: two parallel calls, each $0.6 of input. Both are recorded.
+    first = gateway(
+        FakeProvider([FakeTurn(text="x", input_tokens=600_000, output_tokens=1)] * 2),
         sleeps=sleeps,
         config=config,
+        runs=runs,
     )
-    restored = second.restore_run("run_1", events_path)
-    assert restored.total.cost_usd == pytest.approx(0.6, abs=1e-3)
-    await second.complete(request())
-    with pytest.raises(BudgetExceeded):
+    await asyncio.gather(first.complete(request()), first.complete(request()))
+    stored = await runs.get_run(run.id)
+    assert stored.usage.input_tokens == 1_200_000
+    assert stored.usage.cost_usd == pytest.approx(1.2, abs=1e-3)
+
+    # Second process resumes the run: it starts at $1.2, so the cap blocks at once.
+    resumed = SqliteTaskStore(Database(path))
+    fake = FakeProvider(["never"])
+    second = gateway(fake, sleeps=sleeps, config=config, runs=resumed)
+    with pytest.raises(BudgetExceeded) as info:
         await second.complete(request())
+    assert info.value.limit == "max_usd_per_run" and fake.remaining == 1
+
+
+async def test_run_missing_from_store_still_works(sleeps: Sleeps, tmp_path: Path) -> None:
+    from agent_team.core.db import Database
+    from agent_team.core.stores import SqliteTaskStore
+
+    runs = SqliteTaskStore(Database(tmp_path / "db.sqlite"))
+    gw = gateway(FakeProvider(["ok"]), sleeps=sleeps, runs=runs)
+    assert (await gw.complete(request())).text == "ok"

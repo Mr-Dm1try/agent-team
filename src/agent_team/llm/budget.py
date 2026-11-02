@@ -7,13 +7,11 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from datetime import datetime
-from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_team.core.config import BudgetConfig, Price
-from agent_team.core.models import Event, EventName, HookOutcome, Usage
+from agent_team.core.models import Event, HookOutcome, Usage
 
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
@@ -59,11 +57,11 @@ class BudgetTracker:
             self._runs[run_id] = RunUsage(run_id=run_id, started_at=self.clock())
         return self._runs[run_id]
 
-    def restore(self, run_id: str, total: Usage, elapsed_s: float) -> RunUsage:
-        """Seed a run resumed in a new process with what it already spent."""
+    def restore(self, run_id: str, spent: Usage) -> RunUsage:
+        """Seed a run loaded in a new process with what it already spent
+        (``Run.usage``). The time cap still counts from this process's first call."""
         u = self.usage(run_id)
-        u.total = u.total + total
-        u.started_at -= elapsed_s
+        u.total = u.total + spent
         return u
 
     def record(self, run_id: str, agent: str, provider: str, usage: Usage) -> None:
@@ -151,31 +149,3 @@ class RateLimiter:
         async with self._sem:
             await self._wait_rpm()
             yield
-
-
-def usage_from_events(path: str | Path) -> tuple[Usage, float]:
-    """Total usage and elapsed seconds recorded in a run's ``events.jsonl``: the sum
-    of ``llm_call_after`` usage and the time between the first and last event.
-    Unreadable lines (e.g. one cut off by a crash) are skipped."""
-    p = Path(path)
-    if not p.exists():
-        return Usage(), 0.0
-    total = Usage()
-    first: datetime | None = None
-    last: datetime | None = None
-    for line in p.read_text(encoding="utf-8").splitlines():
-        try:
-            event = Event.model_validate_json(line)
-        except ValueError:
-            continue
-        first = first or event.ts
-        last = event.ts
-        if event.name is EventName.LLM_CALL_AFTER:
-            d = event.data
-            total = total + Usage(
-                input_tokens=int(d.get("input_tokens", 0)),
-                output_tokens=int(d.get("output_tokens", 0)),
-                cost_usd=float(d.get("cost_usd", 0.0)),
-            )
-    elapsed = (last - first).total_seconds() if first and last else 0.0
-    return total, elapsed
