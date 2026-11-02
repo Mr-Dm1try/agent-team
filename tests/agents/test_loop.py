@@ -274,3 +274,23 @@ async def test_compactor_summarizes_when_stubs_are_not_enough(tmp_path: Path) ->
     assert list((Path(env.run.workspace).parent / "tool_results").iterdir())
     event = bus.events[-1]
     assert event.name is EventName.CONTEXT_COMPACTED and event.data["tokens_before"] == out.before
+
+
+async def test_os_error_in_a_tool_goes_back_to_the_model(tmp_path: Path) -> None:
+    env = envelope(tmp_path, AgentName.ENGINEER, "code_change")
+    (Path(env.run.workspace) / "afile").write_text("")
+    llm = FakeLLM(
+        {
+            AgentName.ENGINEER: [
+                # The parent is a file, so creating the folder raises an OSError.
+                tool_call("write_file", {"path": "afile/x.py", "content": "x"}),
+                tool_call("write_file", {"path": "app.py", "content": "x = 1\n"}),
+                json.dumps(CODE),
+            ]
+        }
+    )
+    result = await Engineer().run(env, ctx(llm))
+    failed = llm.requests[1].messages[-1].content[0]
+    assert isinstance(failed, ToolResultBlock) and failed.is_error
+    assert "write_file failed" in failed.content
+    assert result.status is ResultStatus.OK

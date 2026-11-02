@@ -57,6 +57,8 @@ class ProgressNote(BaseModel):
     remaining: list[str] = Field(default_factory=list)
 
     def render(self) -> str:
+        """The note as the plain-text message that replaces summarized turns."""
+
         def section(title: str, items: list[str]) -> str:
             body = "\n".join(f"- {i}" for i in items) or "- (none)"
             return f"{title}:\n{body}"
@@ -80,6 +82,8 @@ SUMMARY_SYSTEM = (
 
 @dataclass
 class CompactionResult:
+    """The compacted messages, token estimates before and after, and the stages used."""
+
     messages: list[Message]
     before: int
     after: int
@@ -104,11 +108,14 @@ def _stub_line(result: ToolResultBlock, call: ToolUseBlock | None) -> str:
 
 
 class Compactor:
+    """Keeps a tool loop's context under budget: trim, then stub, then summarize."""
+
     def __init__(self, *, keep_last: int = 4, trigger_ratio: float = TRIGGER_RATIO) -> None:
         self.keep_last = keep_last
         self.trigger_ratio = trigger_ratio
 
     def needs_compaction(self, system: str, messages: list[Message], budget: int) -> bool:
+        """True when the estimated context is over the trigger share of ``budget``."""
         return estimate_tokens(system, messages) > int(budget * self.trigger_ratio)
 
     def _protected_tail_start(self, messages: list[Message]) -> int:
@@ -132,6 +139,7 @@ class Compactor:
         task_id: str,
         attempt: int,
     ) -> CompactionResult:
+        """Shrink ``messages`` stage by stage until they fit; emits a compaction event."""
         limit = int(budget * self.trigger_ratio)
         before = estimate_tokens(system, messages)
         result = CompactionResult(messages=list(messages), before=before, after=before)

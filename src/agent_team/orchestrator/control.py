@@ -86,6 +86,8 @@ def _task_line(t: Task) -> str:
 
 
 class ListTasks:
+    """Tool: the run's tasks, one line each."""
+
     def __init__(self, tasks: TaskStore) -> None:
         self.tasks = tasks
         self.safe_to_repeat = True
@@ -113,6 +115,8 @@ class ListTasks:
 
 
 class GetTask:
+    """Tool: one task in full."""
+
     def __init__(self, tasks: TaskStore) -> None:
         self.tasks = tasks
         self.safe_to_repeat = True
@@ -138,6 +142,8 @@ class GetTask:
 
 
 class GetArtifact:
+    """Tool: one artifact version as JSON."""
+
     def __init__(self, artifacts: ArtifactStore) -> None:
         self.artifacts = artifacts
         self.safe_to_repeat = True
@@ -169,6 +175,8 @@ class GetArtifact:
 
 
 class GetVerdicts:
+    """Tool: the audit verdicts on a task."""
+
     def __init__(self, verdicts: VerdictStore) -> None:
         self.verdicts = verdicts
         self.safe_to_repeat = True
@@ -191,6 +199,8 @@ class GetVerdicts:
 
 
 class ListDecisions:
+    """Tool: the run's decision log."""
+
     def __init__(self, decisions: DecisionLog) -> None:
         self.decisions = decisions
         self.safe_to_repeat = True
@@ -254,6 +264,8 @@ class ReadTrace:
 
 
 class CreateTask:
+    """Tool: add a task, checked against the agent's phase and output kinds."""
+
     def __init__(self, tasks: TaskStore, max_attempts: int = 3) -> None:
         self.tasks = tasks
         self.max_attempts = max_attempts
@@ -328,6 +340,8 @@ class CreateTask:
 
 
 class AskUser:
+    """Tool: put a question to the user as a waiting user task."""
+
     def __init__(self, tasks: TaskStore) -> None:
         self.tasks = tasks
         self.safe_to_repeat = False
@@ -367,6 +381,7 @@ def read_tools(
     decisions: DecisionLog,
     verdicts: VerdictStore | None = None,
 ) -> dict[str, Tool]:
+    """The read-only tools for answering questions about a run."""
     tools: list[Tool] = [
         ListTasks(tasks),
         GetTask(tasks),
@@ -387,6 +402,7 @@ def control_tools(
     *,
     max_attempts: int = 3,
 ) -> dict[str, Tool]:
+    """The read tools plus the tools that create tasks and ask the user."""
     tools = read_tools(tasks, artifacts, decisions, verdicts)
     tools["create_task"] = CreateTask(tasks, max_attempts)
     tools["ask_user"] = AskUser(tasks)

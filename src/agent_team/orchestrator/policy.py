@@ -13,9 +13,12 @@ from agent_team.core.models import Decision, DecisionKind, Phase, Run, Task, Ver
 
 
 class SimplePolicy:
+    """Fallback verdict policy: retry until attempts run out, then escalate or ask the user."""
+
     async def on_task_verdict(
         self, run: Run, task: Task, verdict: Verdict, history: list[Verdict]
     ) -> list[Decision]:
+        """Retry a failed task while attempts remain, then escalate it."""
         if verdict.passed:
             return []
         rules = sorted({f.rule_id for f in verdict.blockers}) or ["(none)"]
@@ -46,6 +49,7 @@ class SimplePolicy:
         ]
 
     async def on_gate_verdict(self, run: Run, phase: Phase, verdict: Verdict) -> list[Decision]:
+        """Ask the user about a failed gate."""
         if verdict.passed:
             return []
         lines = "; ".join(f"{f.rule_id} {f.item or ''}: {f.message}" for f in verdict.blockers)

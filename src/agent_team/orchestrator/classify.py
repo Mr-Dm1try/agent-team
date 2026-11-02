@@ -42,6 +42,8 @@ _RUN_WORDS = re.compile(
 
 
 class Classification(BaseModel):
+    """The kind of a user message and why."""
+
     model_config = ConfigDict(extra="forbid")
     kind: RequestKind
     reason: str
@@ -50,6 +52,7 @@ class Classification(BaseModel):
 
 
 def heuristic(text: str, has_run: bool) -> Classification:
+    """Keyword fallback for when the model can't classify the message."""
     is_question = text.strip().endswith("?") or bool(_QUESTION_START.match(text))
     if has_run and is_question and _RUN_WORDS.search(text):
         return Classification(kind=RequestKind.RUN_QUESTION, reason="question about the run")

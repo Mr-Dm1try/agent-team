@@ -45,6 +45,8 @@ INTERRUPTED_NOTE = (
 
 @dataclass
 class LoopSettings:
+    """Limits for one tool loop: steps, repair rounds and tokens per model call."""
+
     max_steps: int = 80  # checkpointed steps: one per model call and one per tool round
     max_repairs: int = 2
     max_tokens: int = 4096
@@ -52,6 +54,8 @@ class LoopSettings:
 
 @dataclass
 class LoopOutcome[M: BaseModel]:
+    """What a tool loop produced: the parsed output or the error, usage and the transcript."""
+
     output: M | None
     usage: Usage = field(default_factory=Usage)
     model: str | None = None
@@ -153,6 +157,9 @@ class ToolLoop[M: BaseModel]:
             result = await tool(args, self.tool_ctx)
         except ToolError as exc:
             result = ToolResult(content=f"{call.name} failed: {exc}", is_error=True)
+        except OSError as exc:
+            # A filesystem error is the tool failing, not a bug: the model can adapt.
+            result = ToolResult(content=f"{call.name} failed: {exc}", is_error=True)
         duration = round(time.monotonic() - started, 3)
 
         content = result.content
@@ -235,6 +242,7 @@ class ToolLoop[M: BaseModel]:
         return result.messages
 
     async def run_loop(self, first_message: Message, *, resume: bool = False) -> LoopOutcome[M]:
+        """Call the model and its tools until it returns a valid output, checkpointing each step."""
         messages: list[Message] = [first_message]
         repairs = 0
         pending_calls: list[ToolUseBlock] = []

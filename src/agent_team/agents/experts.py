@@ -27,6 +27,8 @@ def _input[T](envelope: TaskEnvelope, kind: type[T]) -> list[T]:
 
 
 class Researcher(BaseAgent):
+    """Writes research briefs for the pipeline and the final research answer for a question."""
+
     name: AgentName = AgentName.RESEARCHER
     output_kind = "research_brief"
     output_kinds: ClassVar[tuple[str, ...]] = ("research_brief", "research_answer")
@@ -40,6 +42,7 @@ class Researcher(BaseAgent):
     )
 
     async def check(self, artifact: ArtifactBase, envelope: TaskEnvelope) -> list[str]:
+        """Every brief answers its question or names the gap."""
         errors = await super().check(artifact, envelope)
         if isinstance(artifact, ResearchBrief):
             # The question is the task's objective, so there is always one to answer.
@@ -54,12 +57,15 @@ class Researcher(BaseAgent):
 
 
 class Product(BaseAgent):
+    """Writes the PRD from the plan's asks and the research briefs."""
+
     name: AgentName = AgentName.PRODUCT
     output_kind = "prd"
     role_prompt: ClassVar[str] = prompts.PRODUCT
     tool_names: ClassVar[tuple[str, ...]] = ("memory_search",)
 
     async def check(self, artifact: ArtifactBase, envelope: TaskEnvelope) -> list[str]:
+        """Requirement ids are unique, each has acceptance criteria and known asks."""
         errors = await super().check(artifact, envelope)
         if not isinstance(artifact, PRD):
             return errors
@@ -78,12 +84,15 @@ class Product(BaseAgent):
 
 
 class Architect(BaseAgent):
+    """Writes the Spec, including the work packages the Engineer tasks follow."""
+
     name: AgentName = AgentName.ARCHITECT
     output_kind = "spec"
     role_prompt: ClassVar[str] = prompts.ARCHITECT
     tool_names: ClassVar[tuple[str, ...]] = ("memory_search", "read_file", "list_dir")
 
     async def check(self, artifact: ArtifactBase, envelope: TaskEnvelope) -> list[str]:
+        """Components cite known requirements and relative paths; checks cite known criteria."""
         errors = await super().check(artifact, envelope)
         if not isinstance(artifact, Spec):
             return errors
@@ -122,6 +131,7 @@ class Engineer(BaseAgent):
     )
 
     async def check(self, artifact: ArtifactBase, envelope: TaskEnvelope) -> list[str]:
+        """The change lists the files it wrote, and each exists in the workspace."""
         errors = await super().check(artifact, envelope)
         if not isinstance(artifact, CodeChange):
             return errors
@@ -139,12 +149,15 @@ class Engineer(BaseAgent):
 
 
 class QA(BaseAgent):
+    """Runs the checks and reports a result for every acceptance criterion."""
+
     name: AgentName = AgentName.QA
     output_kind = "qa_report"
     role_prompt: ClassVar[str] = prompts.QA
     tool_names: ClassVar[tuple[str, ...]] = ("read_file", "list_dir", "grep", "run_command")
 
     async def check(self, artifact: ArtifactBase, envelope: TaskEnvelope) -> list[str]:
+        """Every PRD acceptance criterion has a result, and no result names an unknown one."""
         errors = await super().check(artifact, envelope)
         if not isinstance(artifact, QAReport):
             return errors
@@ -163,6 +176,7 @@ class QA(BaseAgent):
 
 
 def default_agents() -> dict[AgentName, Agent]:
+    """One instance of each agent, keyed by name."""
     from agent_team.agents.planner import PlannerAgent
 
     agents: list[Agent] = [PlannerAgent(), Researcher(), Product(), Architect(), Engineer(), QA()]

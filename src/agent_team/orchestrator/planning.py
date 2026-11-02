@@ -54,7 +54,8 @@ def expand_plan(
             objective=objective,
             inputs=[plan_ref],
             output_kind=kind,
-            depends_on=deps,
+            # Everything depends on the planner, so re-opening the plan supersedes it.
+            depends_on=[planning_task.id, *deps],
             max_attempts=max_attempts,
             origin=TaskOrigin.PLAN,
             parent_task_id=planning_task.id,

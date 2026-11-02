@@ -7,7 +7,7 @@ from agents.fakes import FakeBus, FakeLLM
 
 from agent_team.core.errors import ToolError
 from agent_team.core.interfaces import ToolContext
-from agent_team.core.models import AgentName, Phase, RequestKind, Run, TaskStatus
+from agent_team.core.models import AgentName, Phase, RequestKind, Run, Task, TaskStatus
 from agent_team.orchestrator.classify import classify, heuristic
 from agent_team.orchestrator.control import control_tools
 from agent_team.orchestrator.phases import PhaseMachine
@@ -133,7 +133,10 @@ def test_phase_machine() -> None:
     )
     gates = {Phase.PLANNING, Phase.PRD}
     assert build.current([], gates) is Phase.SPEC
-    assert build.can_enter(Phase.SPEC, gates) and not build.can_enter(Phase.IMPLEMENTATION, gates)
-    build.reopen(Phase.PRD, gates)
-    assert gates == {Phase.PLANNING}
+    assert build.current([], set(Phase)) is None
+    open_prd = Task(
+        run_id="r", phase=Phase.PRD, agent=AgentName.PRODUCT, objective="o", output_kind="prd"
+    )
+    # Open work in an earlier phase wins over a later unpassed gate.
+    assert build.current([open_prd], set(Phase)) is Phase.PRD
     assert PhaseMachine(RequestKind.RESEARCH_QUESTION).phases == (Phase.PLANNING,)

@@ -57,7 +57,7 @@ INPUT_KINDS: dict[AgentName, tuple[str, ...]] = {
 }
 
 #: Errors that pause the run rather than fail the attempt.
-_PAUSING = frozenset({"BudgetExceeded", "RunStopped"})
+PAUSING_ERRORS = frozenset({"BudgetExceeded", "RunStopped"})
 
 MemoryFetcher = Callable[[Task, Run], Awaitable[list[str]]]
 ConstraintSource = Callable[[Task, Run], list[str]]
@@ -65,6 +65,8 @@ ConstraintSource = Callable[[Task, Run], list[str]]
 
 @dataclass
 class Dispatcher:
+    """Runs tasks on their agents and records each outcome in the stores."""
+
     tasks: TaskStore
     artifacts: ArtifactStore
     checkpoints: CheckpointStore
@@ -80,6 +82,7 @@ class Dispatcher:
     timeouts: dict[AgentName, float] = field(default_factory=dict)
 
     async def dispatch(self, task: Task) -> AgentResult:
+        """Run one attempt of ``task`` and move it on; never raises for agent errors."""
         task = await self.tasks.get_task(task.id)
         run = await self.tasks.get_run(task.run_id)
         agent = self.agents.get(task.agent)
@@ -107,6 +110,8 @@ class Dispatcher:
             )
             return await self._finish(task, result, None)
 
+        timeout = self.timeouts.get(task.agent, self.timeout_s)
+        envelope: TaskEnvelope | None = None
         try:
             envelope = await self.build_envelope(task, run)
             ctx = AgentContext(
@@ -116,17 +121,18 @@ class Dispatcher:
                 tools=self.tools,
                 resume=resume,
             )
-            timeout = self.timeouts.get(task.agent, self.timeout_s)
-            result = await asyncio.wait_for(agent.run(envelope, ctx), timeout=timeout)
-        except TimeoutError:
-            result = AgentResult(
-                task_id=task.id,
-                status=ResultStatus.ERROR,
-                error_type="TimeoutError",
-                error=f"{task.agent.value} took longer than {timeout:.0f}s",
-            )
-            envelope = None
+            try:
+                result = await asyncio.wait_for(agent.run(envelope, ctx), timeout=timeout)
+            except TimeoutError:
+                result = AgentResult(
+                    task_id=task.id,
+                    status=ResultStatus.ERROR,
+                    error_type="TimeoutError",
+                    error=f"{task.agent.value} took longer than {timeout:.0f}s",
+                )
         except Exception as exc:
+            # Anything else, from building the envelope or from the agent, is a failed
+            # attempt with its traceback; it never escapes into the run.
             result = AgentResult(
                 task_id=task.id,
                 status=ResultStatus.ERROR,
@@ -134,7 +140,6 @@ class Dispatcher:
                 error=str(exc) or type(exc).__name__,
                 traceback=traceback.format_exc(),
             )
-            envelope = None
         return await self._finish(task, result, envelope)
 
     # --- envelope ----------------------------------------------------------------
@@ -168,6 +173,7 @@ class Dispatcher:
         return [r for r in unique.values() if r.kind in multi or r.version == latest[r.kind]]
 
     async def build_envelope(self, task: Task, run: Run) -> TaskEnvelope:
+        """Everything the agent sees: inputs, previous output, feedback, findings and diffs."""
         refs = await self._resolve_inputs(task)
         if refs != task.inputs:
             task.inputs = refs
@@ -238,6 +244,14 @@ class Dispatcher:
         self, task: Task, result: AgentResult, envelope: TaskEnvelope | None
     ) -> AgentResult:
         task = await self.tasks.get_task(task.id)
+        if task.status is TaskStatus.SUPERSEDED:
+            # Reopened while it ran: its inputs are stale, so the result is dropped.
+            await self._emit(
+                EventName.TASK_FINISHED,
+                task,
+                {"status": "discarded", "reason": "superseded during the attempt"},
+            )
+            return result
         task.model = result.model or task.model
         if result.artifact is not None and result.status is not ResultStatus.ERROR:
             built_from = (
@@ -254,7 +268,7 @@ class Dispatcher:
             task.output = ref
 
         if result.status is ResultStatus.ERROR:
-            paused = result.error_type in _PAUSING
+            paused = result.error_type in PAUSING_ERRORS
             task.last_error = INTERRUPTED if paused else f"{result.error_type}: {result.error}"
             task.last_traceback = result.traceback
             await self.tasks.update_task(task)

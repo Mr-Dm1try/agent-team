@@ -36,8 +36,6 @@ def _mutate(fn: Any) -> list[str]:
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
-        (lambda d: d.update(request_kind="change"), "either 'build' or 'research_question'"),
-        (lambda d: d.update(request_kind="nonsense"), "must be 'build'"),
         (lambda d: d.update(request_kind="research_question"), "classified as 'build'"),
         (lambda d: d["asks"].append({"id": "two", "text": "x"}), "must look like ASK-1"),
         (lambda d: d["asks"].append({"id": "ASK-1", "text": "again"}), "unique"),

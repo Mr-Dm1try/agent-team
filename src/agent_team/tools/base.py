@@ -3,7 +3,8 @@ storage.
 
 Path rules (docs/DESIGN.md, "Sandbox"): every path resolves inside the run's
 workspace, except folders passed with ``--context``, which tools may read but never
-write. Symlinks and ``..`` are resolved before the check, so neither can escape.
+write, and large tool results saved under ``runs/<id>/tool_results``, which are
+read-only too. Symlinks and ``..`` are resolved before the check, so neither can escape.
 """
 
 from __future__ import annotations
@@ -34,6 +35,11 @@ def resolve_path(raw: str, run: Run, *, write: bool, tool: str) -> Path:
     if _inside(resolved, workspace):
         if write and ".git" in resolved.relative_to(workspace).parts:
             raise ToolError("writing inside .git is not allowed", tool=tool)
+        return resolved
+    # Large tool results saved by the agent loop can be read back, never written.
+    if _inside(resolved, results_dir(run).resolve()):
+        if write:
+            raise ToolError(f"{raw} is a saved tool result and is read-only", tool=tool)
         return resolved
     for ctx_dir in run.context_dirs:
         if _inside(resolved, Path(ctx_dir).resolve()):

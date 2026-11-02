@@ -83,3 +83,28 @@ def test_safe_to_repeat_flags() -> None:
     tools = file_tools()
     assert tools["read_file"].safe_to_repeat and tools["grep"].safe_to_repeat
     assert not tools["write_file"].safe_to_repeat
+
+
+async def test_stored_tool_results_are_readable_not_writable(ctx: ToolContext) -> None:
+    from agent_team.tools.base import store_large
+
+    path = store_large("x" * 20, ctx.run, label="grep")
+    tools = file_tools()
+    assert "xxxx" in (await tools["read_file"]({"path": path}, ctx)).content
+    with pytest.raises(ToolError, match="read-only"):
+        await tools["write_file"]({"path": path, "content": "y"}, ctx)
+
+
+async def test_walks_skip_symlinks_that_escape(ctx: ToolContext, tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("token = 1\n")
+    ws = Path(ctx.run.workspace)
+    (ws / "ok.py").write_text("token = 2\n")
+    (ws / "linked").symlink_to(outside)
+    tools = file_tools()
+    found = await tools["grep"]({"pattern": "token"}, ctx)
+    assert found.content == "ok.py:1: token = 2"
+    for recursive in (True, False):
+        listing = await tools["list_dir"]({"recursive": recursive}, ctx)
+        assert "secret.py" not in listing.content and "linked" not in listing.content

@@ -225,6 +225,13 @@ class FakeVerdicts:
     async def for_task(self, task_id: str) -> list[Verdict]:
         return [v for v in self.items if v.task_id == task_id]
 
+    async def for_gate(self, run_id: str, phase: Phase) -> list[Verdict]:
+        return [
+            v
+            for v in self.items
+            if v.run_id == run_id and v.scope is RuleScope.PHASE and v.phase is phase
+        ]
+
 
 class PassAuditor:
     """Always passes, unless a test sets ``fail_tasks`` to fail some task sweeps."""

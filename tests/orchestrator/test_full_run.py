@@ -68,8 +68,9 @@ async def test_research_question_gets_an_answer_and_no_code(tmp_path: Path) -> N
     tasks = await team.tasks.list_tasks(reply.run_id)
     brief = next(t for t in tasks if t.output_kind == "research_brief")
     answer = next(t for t in tasks if t.output_kind == "research_answer")
+    planner = next(t for t in tasks if t.output_kind == "plan")
     assert brief.objective == "Which benchmarks are current?"
-    assert answer.depends_on == [brief.id]
+    assert answer.depends_on == [planner.id, brief.id]
     assert reply.artifact is not None and reply.artifact.kind == "research_answer"
     assert "Starlette" in reply.text
     assert team.auditor.gates == [Phase.PLANNING]

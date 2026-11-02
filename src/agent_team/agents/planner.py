@@ -29,11 +29,13 @@ _KIND_MARKER = re.compile(r"\[request_kind=([a-z_]+)\]")
 
 
 def planning_objective(kind: RequestKind) -> str:
+    """The planning task's objective, with the request kind marker the code reads back."""
     what = "answer this research question" if kind is RequestKind.RESEARCH_QUESTION else "build"
     return f"Plan the asks and research questions to {what} [request_kind={kind.value}]"
 
 
 def kind_from_objective(objective: str) -> RequestKind | None:
+    """The request kind recorded in a planning objective, or None."""
     m = _KIND_MARKER.search(objective)
     if not m:
         return None
@@ -44,14 +46,10 @@ def kind_from_objective(objective: str) -> RequestKind | None:
 
 
 def validate_plan(plan: Plan, expected: RequestKind | None = None) -> list[str]:
+    """Code checks on a plan beyond its schema; each error goes back to the model."""
     errors: list[str] = []
-    try:
-        kind = RequestKind(plan.request_kind)
-    except ValueError:
-        return [f"request_kind: {plan.request_kind!r} must be 'build' or 'research_question'"]
-    if kind not in (RequestKind.BUILD, RequestKind.RESEARCH_QUESTION):
-        errors.append("request_kind: a plan is either 'build' or 'research_question'")
-    if expected is not None and kind is not expected:
+    # request_kind's values are enforced by the schema; only the classification can clash.
+    if expected is not None and plan.request_kind != expected.value:
         errors.append(f"request_kind: this request was classified as {expected.value!r}")
 
     ask_ids = [a.id for a in plan.asks]
@@ -78,12 +76,15 @@ def validate_plan(plan: Plan, expected: RequestKind | None = None) -> list[str]:
 
 
 class PlannerAgent(BaseAgent):
+    """The orchestrator's planning call: turns the request into asks and research questions."""
+
     name: AgentName = AgentName.ORCHESTRATOR
     output_kind = "plan"
     role_prompt: ClassVar[str] = prompts.PLANNER
     tool_names: ClassVar[tuple[str, ...]] = ("list_dir", "read_file", "grep")
 
     async def check(self, artifact: ArtifactBase, envelope: TaskEnvelope) -> list[str]:
+        """The plan matches the request kind and its ids are consistent."""
         errors = await super().check(artifact, envelope)
         if isinstance(artifact, Plan):
             errors += validate_plan(artifact, kind_from_objective(envelope.task.objective))

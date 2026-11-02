@@ -121,3 +121,45 @@ async def test_orchestrator_pauses_run_on_budget(tmp_path: Path) -> None:
     assert reply.kind == "stopped"
     assert reply.run_id is not None
     assert (await team.tasks.get_run(reply.run_id)).status is RunStatus.PAUSED
+
+
+async def test_envelope_errors_are_a_failed_attempt(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    task = await _prd_task(team, tmp_path)
+    task.inputs = [ArtifactRef(kind="research_brief", version=7)]  # never saved
+    await team.tasks.update_task(task)
+    result = await team.dispatcher.dispatch(task)
+    assert result.status is ResultStatus.ERROR and result.traceback
+    assert (await team.tasks.get_task(task.id)).status is TaskStatus.RETRY
+
+
+async def test_timeout_is_reported_not_raised(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    team.dispatcher.agents = {AgentName.PRODUCT: Boom(sleep=1)}  # type: ignore[dict-item]
+    team.dispatcher.timeouts = {AgentName.PRODUCT: 0.01}
+    task = await _prd_task(team, tmp_path)
+    result = await team.dispatcher.dispatch(task)
+    assert result.error_type == "TimeoutError" and "0s" in (result.error or "")
+    assert (await team.tasks.get_task(task.id)).status is TaskStatus.RETRY
+
+
+async def test_result_of_a_task_superseded_mid_attempt_is_dropped(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    task = await _prd_task(team, tmp_path)
+    agent = default_agents()[AgentName.PRODUCT]
+
+    class Reopened:
+        name = AgentName.PRODUCT
+        output_kind = "prd"
+
+        async def run(self, envelope: TaskEnvelope, ctx: Any) -> AgentResult:
+            await team.tasks.transition(task.id, TaskStatus.SUPERSEDED, reason="reopened")
+            return await agent.run(envelope, ctx)
+
+    team.dispatcher.agents = {AgentName.PRODUCT: Reopened()}  # type: ignore[dict-item]
+    await team.dispatcher.dispatch(task)
+    stored = await team.tasks.get_task(task.id)
+    assert stored.status is TaskStatus.SUPERSEDED and stored.output is None
+    assert team.artifacts.kinds(task.run_id) == []
+    finished = [e for e in team.bus.events if e.name is EventName.TASK_FINISHED]
+    assert finished[-1].data["status"] == "discarded"

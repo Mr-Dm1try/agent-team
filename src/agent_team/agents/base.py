@@ -29,6 +29,7 @@ _HARNESS_FIELDS = {"run_id", "task_id", "version", "built_from"}
 
 
 def output_schema(model: type[ArtifactBase]) -> dict[str, Any]:
+    """The JSON schema the model must fill for ``model``, without the fields the harness sets."""
     schema = model.model_json_schema()
     props = schema.get("properties", {})
     for name in _HARNESS_FIELDS:
@@ -37,6 +38,7 @@ def output_schema(model: type[ArtifactBase]) -> dict[str, Any]:
 
 
 def render_envelope(envelope: TaskEnvelope, tools: dict[str, Tool]) -> str:
+    """The task envelope as the first user message: task, inputs, feedback, findings and tools."""
     task, run = envelope.task, envelope.run
     parts = [
         f"# Task {task.id} (attempt {task.attempt}, origin {task.origin.value})",
@@ -118,9 +120,11 @@ class BaseAgent:
         self.compactor = compactor or Compactor()
 
     def kinds(self) -> tuple[str, ...]:
+        """Every output kind this agent can produce."""
         return self.output_kinds or (self.output_kind,)
 
     def system_prompt(self, kind: str, mode: ReviewMode) -> str:
+        """The common rules, the role prompt, the review-mode rule and the output schema."""
         schema = json.dumps(output_schema(ARTIFACT_TYPES[kind]), separators=(",", ":"))
         return (
             f"{COMMON}\n{self.role_prompt}\n{_review_rule(mode)}\n\n"
@@ -142,6 +146,7 @@ class BaseAgent:
         return errors
 
     async def run(self, envelope: TaskEnvelope, ctx: AgentContext) -> AgentResult:
+        """Run the tool loop until a valid artifact comes back, then classify the result."""
         task = envelope.task
         kind = task.output_kind if task.output_kind in self.kinds() else self.output_kind
         model = ARTIFACT_TYPES[kind]
@@ -203,6 +208,7 @@ class BaseAgent:
 
 
 def result_status(artifact: ArtifactBase) -> ResultStatus:
+    """QUESTIONS or RESEARCH when the artifact still needs input, otherwise OK."""
     if any(q.answer is None and q.assumption is None for q in artifact.questions):
         return ResultStatus.QUESTIONS
     if artifact.research_requests:

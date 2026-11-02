@@ -71,6 +71,7 @@ def extract_json(text: str) -> Any:
 
 
 def format_validation_errors(exc: ValidationError) -> list[str]:
+    """Pydantic errors as short ``field: message`` lines for a repair prompt."""
     errors = []
     for err in exc.errors():
         loc = ".".join(str(p) for p in err["loc"]) or "(root)"

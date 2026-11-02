@@ -13,7 +13,7 @@ from typing import Any, ClassVar
 
 from agent_team.core.errors import ToolError
 from agent_team.core.interfaces import Tool, ToolContext
-from agent_team.core.models import ToolResult
+from agent_team.core.models import Run, ToolResult
 from agent_team.llm.types import ToolSpec
 from agent_team.tools.base import display_path, resolve_path
 
@@ -34,16 +34,29 @@ def _int_arg(args: dict[str, Any], key: str, tool: str, default: int) -> int:
     return value
 
 
-def _walk(root: Path) -> list[Path]:
+def _allowed(path: Path, run: Run) -> bool:
+    """A walked entry is listed or searched only if read_file could read it, so a
+    symlink pointing outside the workspace is skipped, not followed."""
+    try:
+        resolve_path(str(path), run, write=False, tool="walk")
+    except ToolError:
+        return False
+    return True
+
+
+def _walk(root: Path, run: Run) -> list[Path]:
     out: list[Path] = []
     for path in sorted(root.rglob("*")):
         if any(part in _SKIP_DIRS for part in path.relative_to(root).parts):
             continue
-        out.append(path)
+        if _allowed(path, run):
+            out.append(path)
     return out
 
 
 class ReadFileTool:
+    """Read a text file, or a range of its lines."""
+
     spec: ToolSpec = ToolSpec(
         name="read_file",
         description=(
@@ -85,6 +98,8 @@ class ReadFileTool:
 
 
 class ListDirTool:
+    """List files under a folder, skipping anything outside the allowed folders."""
+
     spec: ToolSpec = ToolSpec(
         name="list_dir",
         description="List files under a folder in the workspace or a --context folder.",
@@ -105,7 +120,11 @@ class ListDirTool:
         if not root.is_dir():
             raise ToolError(f"no such folder: {args.get('path', '.')}", tool=name)
         recursive = args.get("recursive", True) is not False
-        entries = _walk(root) if recursive else sorted(root.iterdir())
+        entries = (
+            _walk(root, ctx.run)
+            if recursive
+            else [p for p in sorted(root.iterdir()) if _allowed(p, ctx.run)]
+        )
         names = [
             p.relative_to(root).as_posix() + ("/" if p.is_dir() else "")
             for p in entries
@@ -122,6 +141,8 @@ class ListDirTool:
 
 
 class GrepTool:
+    """Search files for a regular expression."""
+
     spec: ToolSpec = ToolSpec(
         name="grep",
         description=(
@@ -148,7 +169,7 @@ class GrepTool:
             raise ToolError(f"bad pattern: {exc}", tool=name) from exc
         root = resolve_path(_str_arg(args, "path", name, "."), ctx.run, write=False, tool=name)
         glob = args.get("glob")
-        files = [root] if root.is_file() else [p for p in _walk(root) if p.is_file()]
+        files = [root] if root.is_file() else [p for p in _walk(root, ctx.run) if p.is_file()]
         matches: list[str] = []
         for file in files:
             if isinstance(glob, str) and not fnmatch.fnmatch(file.name, glob):
@@ -170,6 +191,8 @@ class GrepTool:
 
 
 class WriteFileTool:
+    """Create or replace a file in the workspace."""
+
     spec: ToolSpec = ToolSpec(
         name="write_file",
         description=(
@@ -203,5 +226,6 @@ class WriteFileTool:
 
 
 def file_tools() -> dict[str, Tool]:
+    """The four file tools, keyed by name."""
     tools: list[Tool] = [ReadFileTool(), ListDirTool(), GrepTool(), WriteFileTool()]
     return {t.spec.name: t for t in tools}
