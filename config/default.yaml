@@ -4,6 +4,31 @@ agents:
   researcher: {provider: ollama, model: "gpt-oss:20b", context_budget: 20000}
 stronger_model: {provider: anthropic, model: claude-sonnet-5-5}
 fallbacks: [anthropic, ollama]
+# Model each provider uses when it stands in for another one.
+fallback_models: {anthropic: claude-haiku-5-5, ollama: "gpt-oss:20b"}
 budget: {max_usd_per_run: 1.00, max_minutes_per_run: 30}
 limits: {max_attempts: 3, max_upstream_reruns: 2, max_concurrent_calls: 4}
 review: auto_assumptions
+
+# Gateway details.
+retry: {delays_s: [1, 2, 4]}
+rate_limits:
+  anthropic: {max_concurrent: 4, requests_per_minute: 50}
+  ollama: {max_concurrent: 1}
+# USD per million tokens, from Anthropic's model table as of 2026-10-06.
+prices:
+  claude-haiku-5-5: {input_per_mtok: 0.10, output_per_mtok: 0.50}
+  claude-sonnet-5-5: {input_per_mtok: 2.00, output_per_mtok: 10.00}
+providers:
+  anthropic:
+    timeout_s: 120
+    # Our message format keeps no thinking blocks, so thinking stays off.
+    thinking:
+      claude-haiku-5-5: {type: disabled}
+      claude-sonnet-5-5: {type: between_tools}
+  ollama: {base_url: "http://localhost:11434/v1", num_ctx: 32768}
+# Fault injection; the --chaos flag overrides this.
+chaos: {rate: 0.0, faults: []}
+# Custom hooks as "module:function"; each function receives the event bus.
+hooks: []
+paths: {runs_dir: runs, db: runs/agent_team.db}
