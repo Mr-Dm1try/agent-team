@@ -307,6 +307,27 @@ class PrecheckResult(Contract):
     reason: str | None = None
 
 
+# --- hooks and tools -----------------------------------------------------------------
+
+
+class HookOutcome(Contract):
+    """What a before hook returns. ``allow=False`` blocks the action."""
+
+    allow: bool = True
+    reason: str | None = None
+    rule_id: str | None = None
+    replacement: dict[str, Any] | None = None  # modified payload, if the hook rewrote it
+
+
+class ToolResult(Contract):
+    """What a tool returns. ``content`` goes back to the model; ``data`` is structured
+    detail for the trace and the auditor's evidence helpers."""
+
+    content: str
+    is_error: bool = False
+    data: dict[str, Any] | None = None
+
+
 # --- decisions and events ------------------------------------------------------------
 
 

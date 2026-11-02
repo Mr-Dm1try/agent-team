@@ -14,8 +14,6 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict
-
 from agent_team.core.artifacts import Artifact, ArtifactRef
 from agent_team.core.models import (
     AgentName,
@@ -24,6 +22,7 @@ from agent_team.core.models import (
     Event,
     EventName,
     Feedback,
+    HookOutcome,
     Phase,
     PrecheckResult,
     Rule,
@@ -31,21 +30,12 @@ from agent_team.core.models import (
     Task,
     TaskEnvelope,
     TaskStatus,
+    ToolResult,
     Verdict,
 )
 from agent_team.llm.types import LLMClient, Message, ToolSpec
 
 # --- events and hooks --------------------------------------------------------------
-
-
-class HookOutcome(BaseModel):
-    """What a before hook returns. ``allow=False`` blocks the action."""
-
-    model_config = ConfigDict(extra="forbid")
-    allow: bool = True
-    reason: str | None = None
-    rule_id: str | None = None
-    replacement: dict[str, Any] | None = None  # modified payload, if the hook rewrote it
 
 
 BeforeHook = Callable[[Event], Awaitable[HookOutcome]]
@@ -211,16 +201,6 @@ class VerdictStore(Protocol):
 
 
 # --- tools and agents --------------------------------------------------------------
-
-
-class ToolResult(BaseModel):
-    """What a tool returns. ``content`` goes back to the model; ``data`` is structured
-    detail for the trace and the auditor's evidence helpers."""
-
-    model_config = ConfigDict(extra="forbid")
-    content: str
-    is_error: bool = False
-    data: dict[str, Any] | None = None
 
 
 class ToolContext(Protocol):
