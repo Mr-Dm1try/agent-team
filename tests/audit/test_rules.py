@@ -20,15 +20,16 @@ from agent_team.core.artifacts import (
     Interface,
     Plan,
     PlannedCheck,
-    PlannedTask,
     QAIssue,
     QAReport,
     Question,
     Requirement,
     ResearchBrief,
     ResearchFinding,
+    ResearchQuestion,
     Source,
     Spec,
+    WorkPackage,
 )
 from agent_team.core.artifacts import (
     TestRun as UnitTestRun,
@@ -71,25 +72,7 @@ def plan(**kw: Any) -> Plan:
         "summary": "s",
         "request_kind": "build",
         "asks": [Ask(id="ASK-1", text="books API"), Ask(id="ASK-2", text="tests")],
-        "tasks": [
-            PlannedTask(
-                key="prd",
-                agent="product",
-                phase="prd",
-                objective="write PRD",
-                output_kind="prd",
-                covers_asks=["ASK-1", "ASK-2"],
-            ),
-            PlannedTask(
-                key="spec",
-                agent="architect",
-                phase="spec",
-                objective="write spec",
-                output_kind="spec",
-                depends_on=["prd"],
-                covers_asks=["ASK-1"],
-            ),
-        ],
+        "research_questions": [ResearchQuestion(question="which DB?", ask="ASK-1")],
     }
     data.update(kw)
     return Plan(**data)
@@ -184,34 +167,20 @@ def test_p1_valid_plan(run: Run) -> None:
     ok = AuditContext(run=run, scope=RuleScope.PHASE, phase=Phase.PLANNING, latest={"plan": plan()})
     assert blockers(run_helper("P1", ok)) == []
 
-    bad_tasks = [
-        PlannedTask(
-            key="a",
-            agent="wizard",
-            phase="prd",
-            objective="x",
-            output_kind="prd",
-            depends_on=["b"],
-            covers_asks=["ASK-1"],
-        ),
-        PlannedTask(
-            key="b",
-            agent="product",
-            phase="prd",
-            objective="",
-            output_kind="prd",
-            depends_on=["a", "ghost"],
-        ),
-    ]
+    bad_plan = plan(
+        request_kind="wish",
+        asks=[Ask(id="ASK-1", text="books"), Ask(id="ASK-1", text="tests"), Ask(id="A3", text=" ")],
+        research_questions=[ResearchQuestion(question="which host?", ask="ASK-9")],
+    )
     bad = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.PLANNING, latest={"plan": plan(tasks=bad_tasks)}
+        run=run, scope=RuleScope.PHASE, phase=Phase.PLANNING, latest={"plan": bad_plan}
     )
     messages = " | ".join(f.message for f in run_helper("P1", bad).findings)
-    assert "unknown agent" in messages
-    assert "no objective" in messages
-    assert "unknown task 'ghost'" in messages
-    assert "cycle" in messages
-    assert "ASK-2 is not covered" in messages
+    assert "unknown request kind 'wish'" in messages
+    assert "ASK-1 is used twice" in messages
+    assert "'A3' is not of the form ASK-n" in messages
+    assert "A3 has no text" in messages
+    assert "unknown ask 'ASK-9'" in messages
 
 
 def test_p1_missing_plan_is_a_hit(run: Run) -> None:
@@ -405,6 +374,38 @@ def test_r4_spec_coverage(run: Run) -> None:
         run=run, scope=RuleScope.PHASE, phase=Phase.SPEC, latest={"prd": prd(), "spec": gappy}
     )
     assert sorted(blockers(run_helper("R4", bad))) == ["AC-2.1", "REQ-2"]
+
+
+def test_r4_work_packages(run: Run) -> None:
+    two = [
+        Component(name="api", responsibility="r", requirements=["REQ-1", "REQ-2"], files=[]),
+        Component(name="db", responsibility="r", requirements=["REQ-1"], files=[]),
+    ]
+    ok_spec = spec(
+        components=two,
+        work_packages=[
+            WorkPackage(name="api", components=["api"]),
+            WorkPackage(name="db", components=["db"]),
+        ],
+    )
+    ok = AuditContext(
+        run=run, scope=RuleScope.PHASE, phase=Phase.SPEC, latest={"prd": prd(), "spec": ok_spec}
+    )
+    assert blockers(run_helper("R4", ok)) == []
+    bad_spec = spec(
+        components=two,
+        work_packages=[
+            WorkPackage(name="p1", components=["api", "cache"]),
+            WorkPackage(name="p2", components=["api"]),
+        ],
+    )
+    bad = AuditContext(
+        run=run, scope=RuleScope.PHASE, phase=Phase.SPEC, latest={"prd": prd(), "spec": bad_spec}
+    )
+    messages = " | ".join(f.message for f in run_helper("R4", bad).findings)
+    assert "unknown component cache" in messages
+    assert "component api is in 2 packages" in messages
+    assert "component db is in no work package" in messages
 
 
 def test_r9_coverage_and_scope(run: Run) -> None:

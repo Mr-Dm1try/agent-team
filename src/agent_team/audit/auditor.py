@@ -53,6 +53,7 @@ from agent_team.llm.types import LLMClient
 
 AUDIT_RULE = "AUDIT"  # rule id of the fail-closed finding
 
+_REQUEST_CHARS = 12_000  # P1 judges the asks against the full request
 _ARTIFACT_CHARS = 16_000
 _CONTEXT_CHARS = 6_000
 _FILE_CHARS = 6_000
@@ -391,7 +392,7 @@ def render_prompt(ctx: AuditContext, rules: list[Rule], helpers: dict[str, Helpe
     parts: list[str] = [
         f"# Sweep: {ctx.scope.value}" + (f", phase {ctx.phase.value}" if ctx.phase else "")
     ]
-    parts.append(f"Run request: {_clip(ctx.run.request, 2000)}")
+    parts.append(f"User's original request:\n{_clip(ctx.run.request, _REQUEST_CHARS)}")
     if ctx.task is not None:
         t = ctx.task
         parts.append(
@@ -457,7 +458,7 @@ def render_prompt(ctx: AuditContext, rules: list[Rule], helpers: dict[str, Helpe
 
 
 _UPSTREAM: dict[Phase | None, tuple[str, ...]] = {
-    Phase.PLANNING: (),
+    Phase.PLANNING: ("plan", "research_brief", "research_answer"),
     Phase.PRD: ("plan", "research_brief"),
     Phase.SPEC: ("plan", "prd", "research_brief"),
     Phase.IMPLEMENTATION: ("prd", "spec"),

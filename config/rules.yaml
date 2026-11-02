@@ -12,11 +12,11 @@ rules:
     scope: phase
     phases: [planning]
     severity: blocker
-    helper: plan_graph
+    helper: plan_check
     statement: >-
-      Every planned task has a known agent, a phase, an objective and dependencies that
-      exist in the plan; the dependencies have no cycles; and every ask in the request is
-      covered by at least one task.
+      The asks cover everything the request says and invent nothing, they have unique
+      ids, the request type is right, and every research question names the ask it
+      serves.
 
   - id: R1
     title: Schema

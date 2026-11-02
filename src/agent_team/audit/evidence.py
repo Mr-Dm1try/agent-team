@@ -37,6 +37,7 @@ from agent_team.core.models import (
     Decision,
     Finding,
     Phase,
+    RequestKind,
     Rule,
     RuleScope,
     Run,
@@ -216,85 +217,49 @@ def _missing(rule: Rule, kind: str) -> HelperResult:
 
 # --- planning ----------------------------------------------------------------------
 
-_PLANNABLE = {a.value for a in AgentName} - {AgentName.AUDITOR.value, AgentName.ORCHESTRATOR.value}
+_ASK_ID = re.compile(r"^ASK-[1-9][0-9]*$")
 
 
-@helper("plan_graph")
-def plan_graph(ctx: AuditContext, rule: Rule) -> HelperResult:
+@helper("plan_check")
+def plan_check(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """Shape checks on the plan. Whether the asks cover the request and invent nothing
+    is the model's call, against the request text in the prompt."""
     plan = ctx.find("plan")
     if not isinstance(plan, Plan):
         return _missing(rule, "plan")
     res = HelperResult()
-    keys = [t.key for t in plan.tasks]
-    phases = {p.value for p in Phase}
-    if not plan.tasks:
-        res.findings.append(hit(rule, "the plan has no tasks", artifact=plan))
-    for dup in sorted({k for k in keys if keys.count(k) > 1}):
-        res.findings.append(hit(rule, f"task key {dup} is used twice", item=dup, artifact=plan))
-    for t in plan.tasks:
-        if t.agent not in _PLANNABLE:
-            res.findings.append(hit(rule, f"unknown agent '{t.agent}'", item=t.key, artifact=plan))
-        if t.phase not in phases:
-            res.findings.append(hit(rule, f"unknown phase '{t.phase}'", item=t.key, artifact=plan))
-        if not t.objective.strip():
-            res.findings.append(hit(rule, "task has no objective", item=t.key, artifact=plan))
-        if t.output_kind not in ARTIFACT_TYPES:
-            res.findings.append(
-                hit(rule, f"unknown output kind '{t.output_kind}'", item=t.key, artifact=plan)
-            )
-        for dep in t.depends_on:
-            if dep not in keys:
-                res.findings.append(
-                    hit(rule, f"depends on unknown task '{dep}'", item=t.key, artifact=plan)
-                )
-    cycle = _find_cycle({t.key: [d for d in t.depends_on if d in keys] for t in plan.tasks})
-    if cycle:
+    kinds = {k.value for k in RequestKind}
+    if plan.request_kind not in kinds:
         res.findings.append(
-            hit(rule, "dependency cycle: " + " -> ".join(cycle), item=cycle[0], artifact=plan)
-        )
-    ask_ids = {a.id for a in plan.asks}
-    covered = {a for t in plan.tasks for a in t.covers_asks}
-    if not plan.asks:
-        res.findings.append(hit(rule, "the plan lists no asks", artifact=plan))
+            hit(rule, f"unknown request kind '{plan.request_kind}'", item="request_kind",
+                artifact=plan, fix=f"use one of {sorted(kinds)}")
+        )  # fmt: skip
+    ids = [a.id for a in plan.asks]
+    for dup in sorted({i for i in ids if ids.count(i) > 1}):
+        res.findings.append(hit(rule, f"ask id {dup} is used twice", item=dup, artifact=plan))
     for ask in plan.asks:
-        if ask.id not in covered:
+        if not _ASK_ID.match(ask.id):
             res.findings.append(
-                hit(rule, f"{ask.id} is not covered by any task", item=ask.id, artifact=plan)
+                hit(rule, f"ask id '{ask.id}' is not of the form ASK-n", item=ask.id, artifact=plan)
             )
-    for t in plan.tasks:
-        for a in t.covers_asks:
-            if a not in ask_ids:
-                res.findings.append(
-                    hit(rule, f"covers unknown ask '{a}'", item=t.key, artifact=plan)
-                )
-    res.notes.append(f"{len(plan.tasks)} tasks, {len(plan.asks)} asks: {sorted(ask_ids)}")
+        if not ask.text.strip():
+            res.findings.append(hit(rule, f"{ask.id} has no text", item=ask.id, artifact=plan))
+    known = set(ids)
+    for i, rq in enumerate(plan.research_questions, start=1):
+        if rq.ask not in known:
+            res.findings.append(
+                hit(rule, f"research question {i} names unknown ask '{rq.ask}'",
+                    item=rq.question[:80], artifact=plan)
+            )  # fmt: skip
+        if not rq.question.strip():
+            res.findings.append(
+                hit(rule, f"research question {i} is empty", item=f"question {i}", artifact=plan)
+            )
+    res.notes.append(
+        f"request kind {plan.request_kind}; asks {ids}; "
+        f"{len(plan.research_questions)} research questions"
+    )
     return res
-
-
-def _find_cycle(graph: dict[str, list[str]]) -> list[str] | None:
-    state: dict[str, int] = {}
-    stack: list[str] = []
-
-    def visit(node: str) -> list[str] | None:
-        state[node] = 1
-        stack.append(node)
-        for nxt in graph.get(node, []):
-            if state.get(nxt) == 1:
-                return [*stack[stack.index(nxt) :], nxt]
-            if state.get(nxt) is None:
-                found = visit(nxt)
-                if found:
-                    return found
-        stack.pop()
-        state[node] = 2
-        return None
-
-    for node in graph:
-        if state.get(node) is None:
-            found = visit(node)
-            if found:
-                return found
-    return None
 
 
 # --- every task ----------------------------------------------------------------------
@@ -556,7 +521,8 @@ def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
     res = HelperResult()
     plan = ctx.latest.get("plan")
     if isinstance(plan, Plan) and plan.research_questions:
-        res.notes.append(f"research questions in the plan: {plan.research_questions}")
+        questions = [f"{q.question} ({q.ask})" for q in plan.research_questions]
+        res.notes.append(f"research questions in the plan: {questions}")
     if ctx.task is not None:
         res.notes.append(f"task objective: {ctx.task.objective}")
     if not brief.answers:
@@ -613,6 +579,36 @@ def spec_coverage(ctx: AuditContext, rule: Rule) -> HelperResult:
                 res.findings.append(
                     hit(rule, f"{ac.id} has no planned check", item=ac.id, artifact=spec)
                 )
+    if spec.work_packages:
+        names = {c.name for c in spec.components}
+        owners: dict[str, list[str]] = {}
+        packages = [p.name for p in spec.work_packages]
+        for dup in sorted({n for n in packages if packages.count(n) > 1}):
+            res.findings.append(
+                hit(rule, f"work package {dup} is defined twice", item=dup, artifact=spec)
+            )
+        for pkg in spec.work_packages:
+            if not pkg.components:
+                res.findings.append(
+                    hit(rule, f"work package {pkg.name} has no components", item=pkg.name,
+                        artifact=spec)
+                )  # fmt: skip
+            for comp in pkg.components:
+                if comp not in names:
+                    res.findings.append(
+                        hit(rule, f"work package {pkg.name} names unknown component {comp}",
+                            item=pkg.name, artifact=spec)
+                    )  # fmt: skip
+                else:
+                    owners.setdefault(comp, []).append(pkg.name)
+        for comp in sorted(names):
+            owned = owners.get(comp, [])
+            if len(owned) != 1:
+                where = f"in {len(owned)} packages ({owned})" if owned else "in no work package"
+                res.findings.append(
+                    hit(rule, f"component {comp} is {where}; it must be in exactly one",
+                        item=comp, artifact=spec)
+                )  # fmt: skip
     return res
 
 

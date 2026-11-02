@@ -219,3 +219,17 @@ async def test_no_rules_means_no_model_call(
     await rule_store.set_enabled("R8", False)
     verdict = await rig.auditor.audit_run(run)
     assert verdict.passed and rig.llm.requests == []
+
+
+async def test_planning_gate_shows_the_full_request_and_the_plan(rig: Rig, run: Run) -> None:
+    from agent_team.core.artifacts import Ask, Plan
+
+    await rig.artifacts.save(
+        Plan(summary="s", run_id=run.id, request_kind="build", asks=[Ask(id="ASK-1", text="x")])
+    )
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_gate(run, Phase.PLANNING)
+    prompt = str(rig.llm.requests[0].messages[0].content[0])
+    assert "P1" in verdict.rules_checked
+    assert "User's original request:\nBuild a books API" in prompt
+    assert "plan@v1" in prompt
