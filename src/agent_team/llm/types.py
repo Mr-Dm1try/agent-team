@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol
 from pydantic import Field
 
 from agent_team.core.base import Contract
+from agent_team.core.config import Effort
 from agent_team.core.models import AgentName, Usage
 
 
@@ -38,7 +39,21 @@ class ToolResultBlock(Contract):
     stored_at: str | None = None  # path of the full result when it was too large to inline
 
 
-ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock
+class ThinkingBlock(Contract):
+    """A model's reasoning, kept so a tool loop can hand it back on the next call.
+
+    ``raw`` is the provider's block exactly as returned (a ``thinking`` block with its
+    signature, or a ``redacted_thinking`` block) and is never edited. Only the
+    provider in ``provider`` sends it back; every other provider drops it. ``model``
+    is the model that wrote it. Text and tool calls never include it."""
+
+    type: Literal["thinking"] = "thinking"
+    provider: str
+    model: str
+    raw: dict[str, Any]
+
+
+ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock
 
 
 class Message(Contract):
@@ -69,7 +84,8 @@ class LLMRequest(Contract):
     system: str
     messages: list[Message]
     tools: list[ToolSpec] = Field(default_factory=list)
-    max_tokens: int = 4096
+    #: Covers thinking as well as the answer, so it is set well above a typical reply.
+    max_tokens: int = 16_000
     run_id: str
     task_id: str | None = None
 
@@ -83,6 +99,9 @@ class LLMResponse(Contract):
     usage: Usage
     provider: str
     model: str
+    #: Thinking blocks the provider's API dropped from the request because their
+    #: history had been edited (e.g. by compaction); 0 when none were.
+    thinking_dropped: int = 0
 
     @property
     def text(self) -> str:
@@ -109,12 +128,16 @@ class Provider(Protocol):
 
     name: str
 
-    async def complete(self, request: LLMRequest, *, model: str) -> LLMResponse:
-        """One call to ``model``, returning the whole reply."""
+    async def complete(
+        self, request: LLMRequest, *, model: str, effort: Effort | None = None
+    ) -> LLMResponse:
+        """One call to ``model`` at the route's ``effort``, returning the whole reply."""
         ...
 
-    def stream(self, request: LLMRequest, *, model: str) -> AsyncIterator[StreamChunk]:
-        """One call to ``model``, streamed as chunks."""
+    def stream(
+        self, request: LLMRequest, *, model: str, effort: Effort | None = None
+    ) -> AsyncIterator[StreamChunk]:
+        """One call to ``model`` at the route's ``effort``, streamed as chunks."""
         ...
 
 

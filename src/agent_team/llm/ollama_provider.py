@@ -1,6 +1,10 @@
 """Local models through Ollama's OpenAI-compatible endpoint, using the openai SDK.
 
-The context window is raised with Ollama's ``options.num_ctx``. The SDK's own retries
+The context window is raised with Ollama's ``options.num_ctx``. The route's effort is
+sent as ``reasoning_effort`` (low, medium or high; xhigh and max become high) to the
+models in ``reasoning_models``, such as gpt-oss; Ollama rejects it for other models.
+Claude's thinking blocks are dropped: Ollama can't read them and has no way to take
+reasoning back in the history, so it thinks afresh on every call. The SDK's own retries
 are off; the gateway retries and falls back.
 """
 
@@ -12,7 +16,7 @@ from typing import Any
 
 import openai
 
-from agent_team.core.config import OllamaConfig
+from agent_team.core.config import Effort, OllamaConfig
 from agent_team.core.errors import TransientLLMError
 from agent_team.core.models import Usage
 from agent_team.llm.types import (
@@ -26,10 +30,18 @@ from agent_team.llm.types import (
 )
 
 _STOP: dict[str, Any] = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}
+_REASONING_EFFORT: dict[Effort, str] = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
 
 
 def to_chat_messages(system: str, messages: list[Message]) -> list[dict[str, Any]]:
-    """Our messages in the OpenAI chat format, system prompt first."""
+    """Our messages in the OpenAI chat format, system prompt first. Thinking blocks
+    are left out."""
     out: list[dict[str, Any]] = []
     if system:
         out.append({"role": "system", "content": system})
@@ -104,13 +116,15 @@ class OllamaProvider:
             )
         return self._client
 
-    def _params(self, request: LLMRequest, model: str) -> dict[str, Any]:
+    def _params(self, request: LLMRequest, model: str, effort: Effort | None) -> dict[str, Any]:
         params: dict[str, Any] = {
             "model": model,
             "max_tokens": request.max_tokens,
             "messages": to_chat_messages(request.system, request.messages),
             "extra_body": {"options": {"num_ctx": self.config.num_ctx}},
         }
+        if effort is not None and model.split(":", 1)[0] in self.config.reasoning_models:
+            params["reasoning_effort"] = _REASONING_EFFORT[effort]
         if request.tools:
             params["tools"] = [
                 {
@@ -125,10 +139,12 @@ class OllamaProvider:
             ]
         return params
 
-    async def complete(self, request: LLMRequest, *, model: str) -> LLMResponse:
+    async def complete(
+        self, request: LLMRequest, *, model: str, effort: Effort | None = None
+    ) -> LLMResponse:
         """One chat completion call."""
         try:
-            resp = await self.client.chat.completions.create(**self._params(request, model))
+            resp = await self.client.chat.completions.create(**self._params(request, model, effort))
         except openai.OpenAIError as exc:
             raise translate_error(exc, self.name) from exc
         choice = resp.choices[0]
@@ -155,9 +171,11 @@ class OllamaProvider:
             model=resp.model or model,
         )
 
-    async def stream(self, request: LLMRequest, *, model: str) -> AsyncIterator[StreamChunk]:
+    async def stream(
+        self, request: LLMRequest, *, model: str, effort: Effort | None = None
+    ) -> AsyncIterator[StreamChunk]:
         """One streamed chat completion; tool call deltas are joined."""
-        params = self._params(request, model)
+        params = self._params(request, model, effort)
         params["stream"] = True
         params["stream_options"] = {"include_usage": True}
         text: list[str] = []

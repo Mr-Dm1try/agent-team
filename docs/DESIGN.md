@@ -109,7 +109,7 @@ Every expert also reads the feedback on its own work: your answers to its questi
 2. Stub old tool results. Results older than the last few steps become one-line notes, such as "read src/models.py, 120 lines", since the files are still in the workspace.
 3. Summarize. One model call turns the older turns into a progress note covering what's done, the decisions made and what's left, checked against a schema.
 
-The system prompt, the task envelope with its findings and feedback, and the latest turns are never compacted. Each compaction is a context\_compacted event with token counts before and after, and the checkpoint saves the compacted history, so a resume continues from it. The orchestrator keeps only recent turns plus a running summary of your conversation, because a run's real state lives in the task store, not the chat. Tests use the fake model with a tiny window to force each step.
+Every step here rewrites history the model has already seen, so Claude's thinking blocks from after the rewritten point no longer match. The provider asks the API to drop such blocks rather than fail the call, so the next turn runs without that reasoning. The summary in step 3 should therefore carry what the model needs to keep going. The system prompt, the task envelope with its findings and feedback, and the latest turns are never compacted. Each compaction is a context\_compacted event with token counts before and after, and the checkpoint saves the compacted history, so a resume continues from it. The orchestrator keeps only recent turns plus a running summary of your conversation, because a run's real state lives in the task store, not the chat. Tests use the fake model with a tiny window to force each step.
 
 ## Task tracking and delegation
 
@@ -331,8 +331,8 @@ All model calls go through one small interface with three providers, and a confi
 
 **Providers:**
 
-- **Anthropic:** the official anthropic SDK, with claude-haiku-5-5 by default and claude-sonnet-5-5 where an agent needs more. We don't send temperature, since newer API versions reject it.
-- **Ollama:** its OpenAI-compatible endpoint on localhost:11434, with the context window raised to 16k to 32k tokens.
+- **Anthropic:** the official anthropic SDK, with claude-haiku-5-5 by default and claude-sonnet-5-5 where an agent needs more. We don't send temperature, since newer API versions reject it. Thinking is adaptive, and each agent's effort (low to max) comes from the routing file. Thinking blocks are kept in the history and sent back unchanged, which a tool loop needs; the API drops any block the current model can't read.
+- **Ollama:** its OpenAI-compatible endpoint on localhost:11434, with the context window raised to 16k to 32k tokens. The agent's effort goes out as reasoning\_effort (low, medium or high), which gpt-oss uses. Claude's thinking blocks are left out, since Ollama can't read them and thinks afresh on each call.
 - **Fake:** scripted responses for tests, with fault injection for bad JSON, timeouts and rate limits.
 
 **Structured output.** Each agent declares a Pydantic output model. We validate every response ourselves, whatever the provider promises, and run the repair loop when it fails.
@@ -340,9 +340,9 @@ All model calls go through one small interface with three providers, and a confi
 **Routing.** One file sets the default, per-agent overrides, the fallback order and the budget:
 
 ```yaml
-defaults: {provider: anthropic, model: claude-haiku-5-5}
+defaults: {provider: anthropic, model: claude-haiku-5-5, effort: low}
 agents:
-  engineer: {provider: anthropic, model: claude-sonnet-5-5}
+  engineer: {provider: anthropic, model: claude-sonnet-5-5, effort: medium}
   researcher: {provider: ollama, model: gpt-oss:20b}
 fallbacks: [anthropic, ollama]
 budget: {max_usd_per_run: 1.00, max_minutes_per_run: 30}

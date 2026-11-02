@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_team.core.config import Effort
 from agent_team.core.control import KillSwitch
 from agent_team.core.errors import BudgetExceeded, RunStopped, TransientLLMError
 from agent_team.core.events import InMemoryEventBus
@@ -272,7 +273,9 @@ async def test_stream_retries_before_first_chunk(
 
 
 class MidStreamFailure(FakeProvider):
-    async def stream(self, request: LLMRequest, *, model: str) -> AsyncIterator[StreamChunk]:
+    async def stream(
+        self, request: LLMRequest, *, model: str, effort: Effort | None = None
+    ) -> AsyncIterator[StreamChunk]:
         yield StreamChunk(text="partial")
         raise TransientLLMError("dropped", provider=self.name)
 
@@ -310,11 +313,13 @@ async def test_prices_by_requested_model_when_provider_echoes_a_snapshot(sleeps:
 
 
 class NoFinalChunk(FakeProvider):
-    async def stream(self, request: LLMRequest, *, model: str) -> AsyncIterator[StreamChunk]:
+    async def stream(
+        self, request: LLMRequest, *, model: str, effort: Effort | None = None
+    ) -> AsyncIterator[StreamChunk]:
         self.requests.append(request)
         if len(self.requests) == 1:
             return
-        async for chunk in super().stream(request, model=model):
+        async for chunk in super().stream(request, model=model, effort=effort):
             yield chunk
 
 
@@ -374,3 +379,48 @@ async def test_run_missing_from_store_still_works(sleeps: Sleeps, tmp_path: Path
     runs = SqliteTaskStore(Database(tmp_path / "db.sqlite"))
     gw = gateway(FakeProvider(["ok"]), sleeps=sleeps, runs=runs)
     assert (await gw.complete(request())).text == "ok"
+
+
+async def test_effort_comes_from_the_route_and_survives_fallback(sleeps: Sleeps) -> None:
+    config = make_config(
+        defaults={
+            "provider": "fake",
+            "model": "fake-small",
+            "context_budget": 1000,
+            "effort": "low",
+        },
+        agents={"engineer": {"provider": "fake", "model": "fake-big", "effort": "medium"}},
+    )
+    down = [TransientLLMError("down", provider="fake") for _ in range(4)]
+    fake = FakeProvider(["a", "b", *down])
+    backup = FakeProvider(["c"], name="backup")
+    gw = Gateway(config, {"fake": fake, "backup": backup}, sleep=sleeps)
+    await gw.complete(request(AgentName.PRODUCT))
+    await gw.complete(request(AgentName.ENGINEER))
+    gw.use_stronger_model("task_1")  # the stronger route sets no effort of its own
+    assert (await gw.complete(request(AgentName.ENGINEER))).provider == "backup"
+    assert fake.efforts[:2] == ["low", "medium"]
+    assert fake.efforts[2:] == ["medium"] * 4 and backup.efforts == ["medium"]
+
+
+async def test_after_event_reports_thinking_the_api_dropped(
+    sleeps: Sleeps, events: list[Event], bus: InMemoryEventBus
+) -> None:
+    from agent_team.core.models import Usage
+    from agent_team.llm.types import LLMResponse, TextBlock
+
+    def reply(dropped: int) -> LLMResponse:
+        return LLMResponse(
+            content=[TextBlock(text="x")],
+            stop_reason="end_turn",
+            usage=Usage(input_tokens=1),
+            provider="fake",
+            model="fake-small",
+            thinking_dropped=dropped,
+        )
+
+    gw = gateway(FakeProvider([reply(2), reply(0)]), sleeps=sleeps, bus=bus)
+    await gw.complete(request())
+    await gw.complete(request())
+    after = [e.data for e in events if e.name is EventName.LLM_CALL_AFTER]
+    assert after[0]["thinking_dropped"] == 2 and after[1]["thinking_dropped"] is None

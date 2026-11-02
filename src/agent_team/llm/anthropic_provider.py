@@ -2,8 +2,18 @@
 
 The SDK's own retries are off (``max_retries=0``): the gateway owns retries, backoff
 and fallback, so every attempt shows up in our logs. We don't send temperature.
-Thinking is set per model from the config; our message format has no thinking
-blocks, so the default config turns it off where the model allows that.
+
+Thinking is adaptive and the route's effort goes in ``output_config``. Thinking and
+redacted_thinking blocks come back as ``ThinkingBlock`` and are sent back unchanged on
+later calls, which a tool loop needs. That includes blocks another Claude model wrote
+(after a fallback or STRONGER_MODEL): the API drops, unbilled, any block the current
+model can't read, and the docs warn that stripping blocks ourselves can cause ordering
+and signature errors. Blocks from other providers are left out.
+
+With ``on_history_edit`` set, calls go through the beta Messages API with the
+``thinking-binding-controls-2026-08-01`` header, so a block whose earlier history was
+edited (compaction, a trimmed tool result) is handled as configured instead of the
+API's default.
 """
 
 from __future__ import annotations
@@ -13,7 +23,7 @@ from typing import Any
 
 import anthropic
 
-from agent_team.core.config import AnthropicConfig
+from agent_team.core.config import AnthropicConfig, Effort
 from agent_team.core.errors import TransientLLMError
 from agent_team.core.models import Usage
 from agent_team.llm.types import (
@@ -23,8 +33,13 @@ from agent_team.llm.types import (
     Message,
     StreamChunk,
     TextBlock,
+    ThinkingBlock,
     ToolUseBlock,
 )
+
+#: Beta that lets a request choose what happens to a thinking block whose history
+#: was edited.
+BINDING_BETA = "thinking-binding-controls-2026-08-01"
 
 _STOP: dict[str, Any] = {
     "end_turn": "end_turn",
@@ -34,13 +49,17 @@ _STOP: dict[str, Any] = {
 }
 
 
-def to_wire_messages(messages: list[Message]) -> list[dict[str, Any]]:
-    """Our messages in the Messages API format."""
+def to_wire_messages(messages: list[Message], *, provider: str) -> list[dict[str, Any]]:
+    """Our messages in the Messages API format. Thinking blocks written by
+    ``provider`` go back exactly as received; any others are left out."""
     out: list[dict[str, Any]] = []
     for m in messages:
         blocks: list[dict[str, Any]] = []
         for b in m.content:
-            if isinstance(b, TextBlock):
+            if isinstance(b, ThinkingBlock):
+                if b.provider == provider:
+                    blocks.append(b.raw)
+            elif isinstance(b, TextBlock):
                 blocks.append({"type": "text", "text": b.text})
             elif isinstance(b, ToolUseBlock):
                 blocks.append(
@@ -55,25 +74,37 @@ def to_wire_messages(messages: list[Message]) -> list[dict[str, Any]]:
                         "is_error": b.is_error,
                     }
                 )
-        out.append({"role": m.role, "content": blocks})
+        if blocks:
+            out.append({"role": m.role, "content": blocks})
     return out
 
 
 def from_wire_message(msg: Any, *, provider: str) -> LLMResponse:
-    """Translate an SDK ``Message``. Blocks other than text and tool_use (e.g. empty
-    thinking blocks) are dropped."""
+    """Translate an SDK ``Message``. Thinking and redacted_thinking blocks are kept
+    whole, even when their text is empty (the default display), since the signature
+    is what the API checks. Other block types are dropped."""
     content: list[ContentBlock] = []
     for block in msg.content:
-        if block.type == "text":
+        if block.type in ("thinking", "redacted_thinking"):
+            content.append(
+                ThinkingBlock(provider=provider, model=msg.model, raw=block.to_dict(mode="json"))
+            )
+        elif block.type == "text":
             content.append(TextBlock(text=block.text))
         elif block.type == "tool_use":
             content.append(ToolUseBlock(id=block.id, name=block.name, arguments=dict(block.input)))
+    dropped = [
+        t
+        for t in getattr(msg, "input_transformations", None) or []
+        if getattr(t, "type", None) == "thinking_dropped"
+    ]
     return LLMResponse(
         content=content,
         stop_reason=_STOP.get(msg.stop_reason or "", "other"),
         usage=Usage(input_tokens=msg.usage.input_tokens, output_tokens=msg.usage.output_tokens),
         provider=provider,
         model=msg.model,
+        thinking_dropped=len(dropped),
     )
 
 
@@ -107,11 +138,22 @@ class AnthropicProvider:
             self._client = anthropic.AsyncAnthropic(max_retries=0, timeout=self.config.timeout_s)
         return self._client
 
-    def _params(self, request: LLMRequest, model: str) -> dict[str, Any]:
+    @property
+    def _binding(self) -> bool:
+        return bool(self.config.on_history_edit) and self.config.thinking["type"] in (
+            "adaptive",
+            "enabled",
+        )
+
+    @property
+    def _api(self) -> Any:
+        return self.client.beta.messages if self._binding else self.client.messages
+
+    def _params(self, request: LLMRequest, model: str, effort: Effort | None) -> dict[str, Any]:
         params: dict[str, Any] = {
             "model": model,
             "max_tokens": request.max_tokens,
-            "messages": to_wire_messages(request.messages),
+            "messages": to_wire_messages(request.messages, provider=self.name),
         }
         if request.system:
             params["system"] = request.system
@@ -120,23 +162,31 @@ class AnthropicProvider:
                 {"name": t.name, "description": t.description, "input_schema": t.input_schema}
                 for t in request.tools
             ]
-        thinking = self.config.thinking.get(model)
-        if thinking is not None:
-            params["extra_body"] = {"thinking": thinking}
+        thinking = dict(self.config.thinking)
+        if self._binding:
+            thinking["block_binding"] = {"prefix_mismatch_behavior": self.config.on_history_edit}
+            params["betas"] = [BINDING_BETA]
+        params["thinking"] = thinking
+        if effort is not None:
+            params["output_config"] = {"effort": effort}
         return params
 
-    async def complete(self, request: LLMRequest, *, model: str) -> LLMResponse:
+    async def complete(
+        self, request: LLMRequest, *, model: str, effort: Effort | None = None
+    ) -> LLMResponse:
         """One Messages API call."""
         try:
-            msg = await self.client.messages.create(**self._params(request, model))
+            msg = await self._api.create(**self._params(request, model, effort))
         except anthropic.AnthropicError as exc:
             raise translate_error(exc, self.name) from exc
         return from_wire_message(msg, provider=self.name)
 
-    async def stream(self, request: LLMRequest, *, model: str) -> AsyncIterator[StreamChunk]:
+    async def stream(
+        self, request: LLMRequest, *, model: str, effort: Effort | None = None
+    ) -> AsyncIterator[StreamChunk]:
         """One streamed Messages API call."""
         try:
-            async with self.client.messages.stream(**self._params(request, model)) as s:
+            async with self._api.stream(**self._params(request, model, effort)) as s:
                 async for text in s.text_stream:
                     yield StreamChunk(text=text)
                 final = await s.get_final_message()

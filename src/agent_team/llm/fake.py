@@ -15,6 +15,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_team.core.config import Effort
 from agent_team.core.errors import TransientLLMError
 from agent_team.core.models import AgentName, Usage
 from agent_team.llm.chaos import BAD_JSON_TEXT, Fault
@@ -84,6 +85,7 @@ class FakeProvider:
         self.responder = responder
         self.requests: list[LLMRequest] = []
         self.models: list[str] = []
+        self.efforts: list[Effort | None] = []
         self._calls = 0
 
     @classmethod
@@ -149,15 +151,21 @@ class FakeProvider:
             model=model,
         )
 
-    async def complete(self, request: LLMRequest, *, model: str) -> LLMResponse:
-        """Answer with the next matching scripted turn."""
+    async def complete(
+        self, request: LLMRequest, *, model: str, effort: Effort | None = None
+    ) -> LLMResponse:
+        """Answer with the next matching scripted turn. The fake never writes
+        thinking blocks and takes no action on those in the request."""
         self.requests.append(request)
         self.models.append(model)
+        self.efforts.append(effort)
         return self._build(self._take(request), request, model)
 
-    async def stream(self, request: LLMRequest, *, model: str) -> AsyncIterator[StreamChunk]:
+    async def stream(
+        self, request: LLMRequest, *, model: str, effort: Effort | None = None
+    ) -> AsyncIterator[StreamChunk]:
         """Stream the next matching turn in small chunks, then the final response."""
-        response = await self.complete(request, model=model)
+        response = await self.complete(request, model=model, effort=effort)
         text = response.text
         for i in range(0, len(text), 16):
             yield StreamChunk(text=text[i : i + 16])

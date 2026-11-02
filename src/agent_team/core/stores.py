@@ -372,6 +372,10 @@ class SqliteCheckpointStore:
                 # writes each result once and keeps reused tool call ids apart.
                 if not await asyncio.to_thread(path.exists):
                     await asyncio.to_thread(_write_file, path, block.content)
+                # This rewrites history the model has already seen. On resume, Claude's
+                # thinking blocks after this point no longer match their history; with
+                # on_history_edit set to drop_block the API drops them and the call
+                # goes on (otherwise an enforced account gets a 400).
                 preview = block.content[: min(self.preview_chars, self.inline_limit)]
                 block = block.model_copy(
                     update={
