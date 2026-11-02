@@ -82,22 +82,19 @@ class Ask(_Strict):
     text: str
 
 
-class PlannedTask(_Strict):
-    key: str  # local key used by depends_on inside the plan, e.g. "research-1"
-    agent: str  # an AgentName value
-    phase: str  # a Phase value
-    objective: str
-    output_kind: str
-    covers_asks: list[str] = Field(default_factory=list)
-    depends_on: list[str] = Field(default_factory=list)
+class ResearchQuestion(_Strict):
+    question: str
+    ask: str  # the ASK id this question serves
 
 
 class Plan(ArtifactBase):
+    """The Orchestrator's reading of the request. The phase order is fixed in code, so
+    the plan holds no tasks: each research question becomes one Researcher task."""
+
     kind: Literal["plan"] = "plan"
     request_kind: str  # a RequestKind value
-    asks: list[Ask]
-    research_questions: list[str] = Field(default_factory=list)
-    tasks: list[PlannedTask]
+    asks: list[Ask] = Field(min_length=1)
+    research_questions: list[ResearchQuestion] = Field(default_factory=list)
 
 
 # --- research ----------------------------------------------------------------------
@@ -165,6 +162,11 @@ class PlannedCheck(_Strict):
     description: str
 
 
+class WorkPackage(_Strict):
+    name: str
+    components: list[str]  # Component names
+
+
 class Spec(ArtifactBase):
     kind: Literal["spec"] = "spec"
     components: list[Component]
@@ -174,6 +176,9 @@ class Spec(ArtifactBase):
     allowed_hosts: list[str] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
     affected_files: list[str] = Field(default_factory=list)  # set on revisions
+    # Empty means one Engineer task for the whole spec. Set it only when the parts are
+    # independent; each package becomes its own Engineer task, run one at a time.
+    work_packages: list[WorkPackage] = Field(default_factory=list)
 
 
 # --- implementation ----------------------------------------------------------------

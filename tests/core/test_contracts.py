@@ -73,3 +73,19 @@ def test_task_rejects_unknown_fields() -> None:
                 "surprise": 1,
             }
         )
+
+
+def test_plan_holds_asks_and_questions_but_no_tasks() -> None:
+    data = {
+        "kind": "plan",
+        "summary": "s",
+        "request_kind": "build",
+        "asks": [{"id": "ASK-1", "text": "An inventory API"}],
+        "research_questions": [{"question": "Which database?", "ask": "ASK-1"}],
+    }
+    plan = TypeAdapter(Artifact).validate_python(data)
+    assert plan.kind == "plan"
+    with pytest.raises(ValidationError):
+        TypeAdapter(Artifact).validate_python({**data, "tasks": []})
+    with pytest.raises(ValidationError):
+        TypeAdapter(Artifact).validate_python({**data, "asks": []})
