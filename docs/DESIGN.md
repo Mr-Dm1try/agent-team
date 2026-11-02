@@ -186,7 +186,7 @@ Every agent action leaves a structured log line tied to a trace, and every error
 
 **Log trail.** Every event goes to one JSON Lines file, runs/\<run\_id>/logs/events.jsonl. A line carries the timestamp, run, trace, span and parent span ids, agent, task, attempt, event name, level, and data such as tokens, cost, tool arguments and duration. Because each line is tagged with its agent, `agent-team logs <run_id> --agent researcher` (or a plain grep) shows one agent's own trail, and the unfiltered file keeps the whole run in time order.
 
-**Tracing.** Spans nest in this order: run, phase, task, attempt, then each model call or tool call. `agent-team trace <run_id>` prints that tree with status, duration, tokens and cost. Adding `--task <id>` shows one task's whole story, including any tracebacks.
+**Tracing.** Spans nest in this order: run, phase, task, attempt, then each model call, tool call or audit. A span is not a separate file: opening one writes a span\_started event and closing it writes a span\_finished event with status, duration, tokens, cost and any traceback, both in the same events.jsonl and tagged like every other line. `agent-team trace <run_id>` rebuilds the tree from those events and prints it. A span that started but never finished, because the process died, shows as open. Adding `--task <id>` shows one task's whole story, including any tracebacks.
 
 **Decision log.** Every choice the orchestrator makes is a decision event with its inputs, the option chosen and the reason: the plan, each delegation, every retry, escalation and upstream re-run, which phase a change reopens, and when to ask you. Choices made by code record the rule that applied, and choices made by the model record its stated reason. `agent-team trace --decisions` lists them, so you can see why a run went the way it did.
 
@@ -314,7 +314,7 @@ Logging, auditing, memory and the live terminal view are all hooks on one event 
 
 | Hook | Listens to | Does |
 | --- | --- | --- |
-| Tracer | Every event | Writes logs and spans |
+| Tracer | Every event | Writes each event, spans included, to events.jsonl |
 | Auditor | task\_finished, phase\_finished, run\_finished | Starts the auditor's sweep as a task |
 | Memory writer | audit\_verdict, run\_finished | Saves proposed memories once their audit passes, and writes the run summary |
 | Budget guard | llm\_call\_before | Blocks calls past the token or cost cap |

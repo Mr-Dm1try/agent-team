@@ -456,6 +456,8 @@ class EventName(StrEnum):
     MEMORY_FETCHED = "memory_fetched"
     CHECKPOINT_SAVED = "checkpoint_saved"
     CONTEXT_COMPACTED = "context_compacted"
+    SPAN_STARTED = "span_started"
+    SPAN_FINISHED = "span_finished"
     ERROR = "error"
     RUN_FINISHED = "run_finished"
 

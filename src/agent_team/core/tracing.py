@@ -1,13 +1,15 @@
-"""JSON Lines logs and spans.
+"""One JSON Lines log per run, holding events and spans.
 
 - ``JsonlTracer`` is an after hook on every event. It writes each event to one file,
   ``runs/<run>/logs/events.jsonl``. Every line carries its agent and task, so one
   agent's trail is a filter (``read_events``) rather than a separate file.
-- ``Tracer.span`` opens a span (run, phase, task, attempt, llm or tool call). Spans nest
-  through a context variable and are written to ``runs/<run>/logs/spans.jsonl`` when
-  they close, with status, duration, attributes and the traceback on error.
+- ``Tracer.span`` opens a span (run, phase, task, attempt, llm, tool or audit). Spans
+  nest through a context variable. Opening one emits ``span_started`` and closing it
+  emits ``span_finished`` with status, duration, attributes and the traceback on error.
+  Both go through the bus, so they land in ``events.jsonl`` like any other event.
 - ``read_events`` reads the event log back, optionally filtered by agent or task.
-- ``load_spans`` and ``span_tree`` rebuild the tree for ``agent-team trace``.
+- ``load_spans`` and ``span_tree`` rebuild the tree for ``agent-team trace``. A span
+  that started but never finished (the process died) shows as ``open``.
 """
 
 from __future__ import annotations
@@ -27,9 +29,10 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_team.core.interfaces import EventBus
-from agent_team.core.models import AgentName, Event, utcnow
+from agent_team.core.models import AgentName, Event, EventName, utcnow
 
-SpanKind = Literal["run", "phase", "task", "attempt", "llm", "tool", "other"]
+SpanKind = Literal["run", "phase", "task", "attempt", "llm", "tool", "audit", "other"]
+SpanStatus = Literal["ok", "error", "open"]
 
 
 def new_trace_id() -> str:
@@ -114,7 +117,8 @@ def read_events(
 
 
 class SpanRecord(BaseModel):
-    """One closed span as written to ``spans.jsonl``."""
+    """One span rebuilt from its ``span_started`` and ``span_finished`` events. An
+    ``open`` span has no end: the run stopped before it closed."""
 
     model_config = ConfigDict(extra="forbid")
     run_id: str
@@ -124,12 +128,13 @@ class SpanRecord(BaseModel):
     name: str
     kind: SpanKind
     task_id: str | None = None
-    agent: str | None = None
+    agent: AgentName | None = None
     attempt: int | None = None
     start: datetime
-    end: datetime
-    duration_ms: float
-    status: Literal["ok", "error"]
+    end: datetime | None = None
+    duration_ms: float | None = None
+    status: SpanStatus
+    error_type: str | None = None
     error: str | None = None
     traceback: str | None = None
     attrs: dict[str, Any] = Field(default_factory=dict)
@@ -146,7 +151,7 @@ class Span:
     name: str
     kind: SpanKind
     task_id: str | None = None
-    agent: str | None = None
+    agent: AgentName | None = None
     attempt: int | None = None
     attrs: dict[str, Any] = field(default_factory=dict)
     start: datetime = field(default_factory=utcnow)
@@ -159,6 +164,21 @@ class Span:
         """Accumulate a number, e.g. tokens or cost across calls."""
         self.attrs[key] = self.attrs.get(key, 0) + amount
 
+    def _event(self, name: EventName, ts: datetime, data: dict[str, Any]) -> Event:
+        return Event(
+            name=name,
+            run_id=self.run_id,
+            ts=ts,
+            task_id=self.task_id,
+            attempt=self.attempt,
+            agent=self.agent,
+            trace_id=self.trace_id,
+            span_id=self.span_id,
+            parent_span_id=self.parent_span_id,
+            level="error" if data.get("status") == "error" else "debug",
+            data={"name": self.name, "kind": self.kind, **data},
+        )
+
 
 _current: ContextVar[Span | None] = ContextVar("agent_team_span", default=None)
 
@@ -169,15 +189,11 @@ def current_span() -> Span | None:
 
 
 class Tracer:
-    """Opens nested spans and writes them to ``spans.jsonl``."""
+    """Opens nested spans and emits them as ``span_started`` and ``span_finished``
+    events. Attach a ``JsonlTracer`` to the same bus to write them."""
 
-    def __init__(self, runs_dir: str | Path) -> None:
-        self.runs_dir = Path(runs_dir)
-        self._out = _Appender()
-
-    def spans_path(self, run_id: str) -> Path:
-        """``runs/<run>/logs/spans.jsonl``."""
-        return self.runs_dir / run_id / "logs" / "spans.jsonl"
+    def __init__(self, bus: EventBus) -> None:
+        self.bus = bus
 
     @asynccontextmanager
     async def span(
@@ -187,14 +203,14 @@ class Tracer:
         kind: SpanKind = "other",
         *,
         task_id: str | None = None,
-        agent: str | None = None,
+        agent: AgentName | str | None = None,
         attempt: int | None = None,
         trace_id: str | None = None,
         parent_span_id: str | None = None,
         **attrs: Any,
     ) -> AsyncIterator[Span]:
-        """Open a span nested under the current one. It is written on close with its
-        status, duration and any traceback."""
+        """Open a span nested under the current one. It is emitted on open and again
+        on close with its status, duration and any traceback."""
         parent = _current.get()
         if parent is not None and parent.run_id != run_id:
             parent = None
@@ -206,44 +222,38 @@ class Tracer:
             name=name,
             kind=kind,
             task_id=task_id or (parent.task_id if parent else None),
-            agent=agent or (parent.agent if parent else None),
+            agent=AgentName(agent) if agent is not None else (parent.agent if parent else None),
             attempt=attempt if attempt is not None else (parent.attempt if parent else None),
             attrs=dict(attrs),
         )
+        await self.bus.emit(span._event(EventName.SPAN_STARTED, span.start, {}))
         token = _current.set(span)
         try:
             yield span
         except BaseException as exc:
-            self._close(span, "error", exc)
+            await self._close(span, exc)
             raise
         else:
-            self._close(span, "ok", None)
+            await self._close(span, None)
         finally:
             _current.reset(token)
 
-    def _close(self, span: Span, status: Literal["ok", "error"], exc: BaseException | None) -> None:
+    async def _close(self, span: Span, exc: BaseException | None) -> None:
         end = utcnow()
-        record = SpanRecord(
-            run_id=span.run_id,
-            trace_id=span.trace_id,
-            span_id=span.span_id,
-            parent_span_id=span.parent_span_id,
-            name=span.name,
-            kind=span.kind,
-            task_id=span.task_id,
-            agent=span.agent,
-            attempt=span.attempt,
-            start=span.start,
-            end=end,
-            duration_ms=(end - span.start).total_seconds() * 1000,
-            status=status,
-            error=None if exc is None else f"{type(exc).__name__}: {exc}",
-            traceback=None
-            if exc is None
-            else "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-            attrs=_jsonable(span.attrs),
-        )
-        self._out.append(self.spans_path(span.run_id), record.model_dump_json(exclude_none=True))
+        data: dict[str, Any] = {
+            "start": span.start.isoformat(),
+            "end": end.isoformat(),
+            "duration_ms": (end - span.start).total_seconds() * 1000,
+            "status": "ok" if exc is None else "error",
+            "attrs": _jsonable(span.attrs),
+        }
+        if exc is not None:
+            data["error_type"] = type(exc).__name__
+            data["error"] = str(exc)
+            data["traceback"] = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+        await self.bus.emit(span._event(EventName.SPAN_FINISHED, end, data))
 
 
 def _jsonable(attrs: dict[str, Any]) -> dict[str, Any]:
@@ -262,25 +272,60 @@ class SpanNode:
     children: list[SpanNode] = field(default_factory=list)
 
 
-def load_spans(path: str | Path) -> list[SpanRecord]:
-    """Spans from a ``spans.jsonl``, skipping unreadable lines."""
-    p = Path(path)
-    if not p.exists():
-        return []
-    spans: list[SpanRecord] = []
-    for line in p.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
+def spans_from_events(events: list[Event]) -> list[SpanRecord]:
+    """Spans rebuilt from ``span_started`` and ``span_finished`` events, in start
+    order. A start with no finish is an ``open`` span; a finish whose start line was
+    lost still counts. Events that are not spans, or that do not parse, are skipped."""
+    spans: dict[str, SpanRecord] = {}
+    for event in events:
+        if event.name not in (EventName.SPAN_STARTED, EventName.SPAN_FINISHED):
             continue
+        if event.span_id is None or event.trace_id is None:
+            continue
+        d = event.data
+        fields: dict[str, Any] = {
+            "run_id": event.run_id,
+            "trace_id": event.trace_id,
+            "span_id": event.span_id,
+            "parent_span_id": event.parent_span_id,
+            "name": d.get("name"),
+            "kind": d.get("kind"),
+            "task_id": event.task_id,
+            "agent": event.agent,
+            "attempt": event.attempt,
+        }
+        if event.name is EventName.SPAN_STARTED:
+            fields |= {"start": event.ts, "status": "open"}
+        else:
+            fields |= {
+                key: d.get(key)
+                for key in (
+                    "start",
+                    "end",
+                    "duration_ms",
+                    "status",
+                    "error_type",
+                    "error",
+                    "traceback",
+                )
+            }
+            fields["attrs"] = d.get("attrs") or {}
+            fields["start"] = fields["start"] or event.ts
         try:
-            spans.append(SpanRecord.model_validate_json(line))
+            spans[event.span_id] = SpanRecord.model_validate(fields)
         except ValueError:
-            continue  # a line cut off by a crash; keep the spans that survived
-    return spans
+            continue
+    return sorted(spans.values(), key=lambda s: s.start)
+
+
+def load_spans(runs_dir: str | Path, run_id: str) -> list[SpanRecord]:
+    """A run's spans, read from its ``events.jsonl``."""
+    return spans_from_events(read_events(runs_dir, run_id))
 
 
 def span_tree(spans: list[SpanRecord]) -> list[SpanNode]:
     """Roots in start order, each with children in start order. Spans whose parent
-    is missing (e.g. a crash before the parent closed) become roots."""
+    is missing become roots."""
     nodes = {s.span_id: SpanNode(s) for s in sorted(spans, key=lambda s: s.start)}
     roots: list[SpanNode] = []
     for node in nodes.values():
@@ -299,9 +344,10 @@ def render_tree(roots: list[SpanNode]) -> list[str]:
         for key in ("input_tokens", "output_tokens", "cost_usd"):
             if key in s.attrs:
                 extra.append(f"{key}={s.attrs[key]}")
-        mark = "ok" if s.status == "ok" else f"ERROR {s.error}"
+        mark = f"ERROR {s.error_type}: {s.error}" if s.status == "error" else s.status
+        took = f" {s.duration_ms:.0f}ms" if s.duration_ms is not None else ""
         suffix = f" {' '.join(extra)}" if extra else ""
-        lines.append(f"{'  ' * depth}{s.kind}:{s.name} [{mark}] {s.duration_ms:.0f}ms{suffix}")
+        lines.append(f"{'  ' * depth}{s.kind}:{s.name} [{mark}]{took}{suffix}")
         for child in node.children:
             walk(child, depth + 1)
 

@@ -8,7 +8,7 @@ from agent_team.core.control import KillSwitch
 from agent_team.core.errors import BudgetExceeded, RunStopped, TransientLLMError
 from agent_team.core.events import InMemoryEventBus
 from agent_team.core.models import AgentName, Event, EventName
-from agent_team.core.tracing import Tracer, load_spans
+from agent_team.core.tracing import JsonlTracer, Tracer, load_spans
 from agent_team.llm.chaos import BAD_JSON_TEXT, Chaos, parse_chaos
 from agent_team.llm.fake import FakeProvider, FakeTurn
 from agent_team.llm.gateway import Gateway
@@ -242,7 +242,9 @@ async def test_rate_limit_queues_by_rpm(sleeps: Sleeps) -> None:
 
 
 async def test_spans_carry_usage(sleeps: Sleeps, tmp_path: Path) -> None:
-    tracer = Tracer(tmp_path)
+    span_bus = InMemoryEventBus()
+    JsonlTracer(tmp_path).attach(span_bus)
+    tracer = Tracer(span_bus)
     gw = gateway(
         FakeProvider([FakeTurn(text="x", input_tokens=7, output_tokens=3)]),
         sleeps=sleeps,
@@ -250,7 +252,7 @@ async def test_spans_carry_usage(sleeps: Sleeps, tmp_path: Path) -> None:
     )
     async with tracer.span("run_1", "attempt", "attempt", task_id="task_1"):
         await gw.complete(request())
-    spans = {s.name: s for s in load_spans(tracer.spans_path("run_1"))}
+    spans = {s.name: s for s in load_spans(tmp_path, "run_1")}
     llm = spans["llm:product"]
     assert llm.kind == "llm" and llm.parent_span_id == spans["attempt"].span_id
     assert llm.attrs["input_tokens"] == 7 and llm.attrs["model"] == "fake-small"
