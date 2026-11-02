@@ -28,7 +28,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, nullcontext
 from typing import Any
 
-from agent_team.core.config import Config, Route
+from agent_team.core.config import Config, Effort, Route
 from agent_team.core.control import KillSwitch
 from agent_team.core.errors import BudgetExceeded, RunStopped, TransientLLMError
 from agent_team.core.events import InMemoryEventBus
@@ -115,6 +115,13 @@ class Gateway:
     def _primary(self, request: LLMRequest) -> Route:
         override = self._overrides.get(request.task_id) if request.task_id else None
         return override or self.config.route_for(request.agent)
+
+    def _effort(self, request: LLMRequest, primary: Route) -> Effort | None:
+        """The primary route's effort; an override without one (e.g. the stronger
+        model) keeps the agent's own. Fallbacks use the same effort."""
+        if primary.effort is not None:
+            return primary.effort
+        return self.config.route_for(request.agent).effort
 
     def routes(self, request: LLMRequest) -> list[tuple[str, str]]:
         """(provider, model) pairs to try, in order, limited to known providers."""
@@ -296,6 +303,7 @@ class Gateway:
                 duration_ms=round((time.monotonic() - started) * 1000, 1),
                 fallback=fallback,
                 chaos=fault.value if fault else None,
+                thinking_dropped=response.thinking_dropped or None,
             )
         )
 
@@ -323,6 +331,7 @@ class Gateway:
             await self._span(stack, request)
             routes = await self._preflight(request)
             primary = self._primary(request)
+            effort = self._effort(request, primary)
             started = time.monotonic()
             last: Exception | None = None
             for name, model in routes:
@@ -335,7 +344,7 @@ class Gateway:
                     try:
                         async with self._global, self._slot(name):
                             fault = self._inject(request.run_id, name)
-                            response = await provider.complete(request, model=model)
+                            response = await provider.complete(request, model=model, effort=effort)
                     except _PASS_THROUGH:
                         raise
                     except Exception as exc:
@@ -358,6 +367,7 @@ class Gateway:
             await self._span(stack, request)
             routes = await self._preflight(request)
             primary = self._primary(request)
+            effort = self._effort(request, primary)
             started = time.monotonic()
             last: Exception | None = None
             for name, model in routes:
@@ -371,7 +381,7 @@ class Gateway:
                     try:
                         async with self._global, self._slot(name):
                             fault = self._inject(request.run_id, name)
-                            async for chunk in provider.stream(request, model=model):
+                            async for chunk in provider.stream(request, model=model, effort=effort):
                                 if chunk.done and chunk.response is not None:
                                     response = self._finish(request, model, chunk.response, fault)
                                     await self._after(request, response, started, fallback, fault)

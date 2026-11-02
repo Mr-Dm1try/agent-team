@@ -13,9 +13,16 @@ from agent_team.core.config import AnthropicConfig
 from agent_team.core.errors import TransientLLMError
 from agent_team.llm import anthropic_provider as ap
 from agent_team.llm import ollama_provider as op
-from agent_team.llm.types import Message, TextBlock, ToolResultBlock, ToolSpec, ToolUseBlock
+from agent_team.llm.types import (
+    Message,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolSpec,
+    ToolUseBlock,
+)
 
-from .conftest import request
+from .conftest import Sleeps, make_config, request
 
 HISTORY = [
     Message.user("read it"),
@@ -89,17 +96,26 @@ def _response(status: int) -> httpx2.Response:
     return httpx2.Response(status, request=httpx2.Request("POST", "https://example.invalid"))
 
 
+def anthropic_client(messages: "StubAnthropicMessages") -> SimpleNamespace:
+    """A stub client; the beta namespace is what the provider uses by default."""
+    return SimpleNamespace(messages=messages, beta=SimpleNamespace(messages=messages))
+
+
 async def test_anthropic_translates_request_and_response() -> None:
     messages = StubAnthropicMessages(sdk_message())
-    provider = ap.AnthropicProvider(
-        AnthropicConfig(thinking={"claude-haiku-5-5": {"type": "disabled"}}),
-        client=SimpleNamespace(messages=messages),
+    provider = ap.AnthropicProvider(client=anthropic_client(messages))
+    resp = await provider.complete(
+        request(messages=HISTORY, tools=TOOLS), model="claude-haiku-5-5", effort="low"
     )
-    resp = await provider.complete(request(messages=HISTORY, tools=TOOLS), model="claude-haiku-5-5")
     sent = messages.calls[0]
     assert sent["model"] == "claude-haiku-5-5" and sent["system"] == "be brief"
     assert "temperature" not in sent
-    assert sent["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert sent["thinking"] == {
+        "type": "adaptive",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    }
+    assert sent["betas"] == [ap.BINDING_BETA]
+    assert sent["output_config"] == {"effort": "low"}
     assert sent["tools"][0]["input_schema"] == {"type": "object"}
     assert sent["messages"][1]["content"][1] == {
         "type": "tool_use",
@@ -113,22 +129,171 @@ async def test_anthropic_translates_request_and_response() -> None:
     assert (resp.usage.input_tokens, resp.usage.output_tokens) == (11, 7)
 
 
-async def test_anthropic_drops_thinking_blocks_and_maps_stop() -> None:
-    msg = sdk_message(
-        content=[
-            {"type": "thinking", "thinking": "", "signature": "sig"},
-            {"type": "text", "text": "done"},
-        ],
-        stop_reason="stop_sequence",
+async def test_anthropic_without_binding_uses_the_plain_api_and_no_effort() -> None:
+    plain = StubAnthropicMessages(sdk_message())
+    provider = ap.AnthropicProvider(
+        AnthropicConfig(on_history_edit=None),
+        client=SimpleNamespace(messages=plain, beta=SimpleNamespace(messages=None)),
     )
+    await provider.complete(request(), model="claude-haiku-5-5")
+    sent = plain.calls[0]
+    assert sent["thinking"] == {"type": "adaptive"}
+    assert "betas" not in sent and "output_config" not in sent
+
+
+async def test_anthropic_sends_no_block_binding_when_thinking_is_off() -> None:
+    plain = StubAnthropicMessages(sdk_message())
+    provider = ap.AnthropicProvider(
+        AnthropicConfig(thinking={"type": "disabled"}),
+        client=SimpleNamespace(messages=plain, beta=SimpleNamespace(messages=None)),
+    )
+    await provider.complete(request(), model="claude-haiku-5-5")
+    assert plain.calls[0]["thinking"] == {"type": "disabled"} and "betas" not in plain.calls[0]
+
+
+def test_anthropic_counts_thinking_blocks_the_api_dropped() -> None:
+    msg = anthropic.types.beta.BetaMessage.model_validate(
+        {
+            **sdk_message().model_dump(),
+            "input_transformations": [
+                {
+                    "type": "thinking_dropped",
+                    "path": "messages.1.content.0",
+                    "reason": "prefix_binding_mismatch",
+                },
+                {
+                    "type": "thinking_mismatch_allowed",
+                    "path": "messages.3.content.0",
+                    "reason": "prefix_binding_mismatch",
+                },
+            ],
+        }
+    )
+    assert ap.from_wire_message(msg, provider="anthropic").thinking_dropped == 1
+    assert ap.from_wire_message(sdk_message(), provider="anthropic").thinking_dropped == 0
+
+
+THINKING = {"type": "thinking", "thinking": "", "signature": "sig-abc"}
+REDACTED = {"type": "redacted_thinking", "data": "opaque=="}
+
+
+async def test_anthropic_keeps_thinking_blocks_and_sends_them_back_unchanged() -> None:
+    first = sdk_message(
+        content=[
+            THINKING,
+            {"type": "tool_use", "id": "tu_1", "name": "read", "input": {"p": "b"}},
+        ],
+    )
+    messages = StubAnthropicMessages(first)
+    provider = ap.AnthropicProvider(client=anthropic_client(messages))
+    resp = await provider.complete(request(), model="claude-haiku-5-5")
+    thinking = resp.content[0]
+    assert isinstance(thinking, ThinkingBlock)
+    assert (thinking.provider, thinking.model, thinking.raw) == (
+        "anthropic",
+        "claude-haiku-5-5",
+        THINKING,
+    )
+    assert resp.text == "" and [c.id for c in resp.tool_calls] == ["tu_1"]
+
+    history = [
+        Message.user("read it"),
+        Message(role="assistant", content=resp.content),
+        Message(role="user", content=[ToolResultBlock(tool_use_id="tu_1", content="body")]),
+    ]
+    await provider.complete(request(messages=history), model="claude-haiku-5-5")
+    assert messages.calls[1]["messages"][1]["content"] == [
+        THINKING,
+        {"type": "tool_use", "id": "tu_1", "name": "read", "input": {"p": "b"}},
+    ]
+
+
+async def test_anthropic_keeps_redacted_thinking_and_maps_stop() -> None:
+    msg = sdk_message(content=[REDACTED, {"type": "text", "text": "done"}], stop_reason="end_turn")
     resp = ap.from_wire_message(msg, provider="anthropic")
-    assert [b.type for b in resp.content] == ["text"] and resp.stop_reason == "end_turn"
+    assert [b.type for b in resp.content] == ["thinking", "text"] and resp.text == "done"
+    block = resp.content[0]
+    assert isinstance(block, ThinkingBlock) and block.raw == REDACTED
+    msg = sdk_message(content=[{"type": "text", "text": "x"}], stop_reason="stop_sequence")
+    assert ap.from_wire_message(msg, provider="anthropic").stop_reason == "end_turn"
+
+
+def test_thinking_from_another_claude_model_is_sent_another_providers_is_not() -> None:
+    sonnet = ThinkingBlock(provider="anthropic", model="claude-sonnet-5-5", raw=THINKING)
+    elsewhere = ThinkingBlock(provider="other", model="m", raw={"type": "thinking"})
+    wire = ap.to_wire_messages(
+        [
+            Message.user("go"),
+            Message(role="assistant", content=[sonnet, elsewhere, TextBlock(text="ok")]),
+            Message(role="assistant", content=[elsewhere]),
+        ],
+        provider="anthropic",
+    )
+    # A haiku call after STRONGER_MODEL ran on sonnet: the sonnet block goes back
+    # unchanged and the API drops it if haiku can't read it. A message left with no
+    # blocks is not sent at all.
+    assert wire[1]["content"] == [THINKING, {"type": "text", "text": "ok"}]
+    assert len(wire) == 2
+
+
+async def test_ollama_drops_thinking_and_sends_reasoning_effort() -> None:
+    claude = ThinkingBlock(provider="anthropic", model="claude-haiku-5-5", raw=THINKING)
+    history = [
+        Message.user("read it"),
+        Message(role="assistant", content=[claude, TextBlock(text="ok")]),
+    ]
+    provider, comps = ollama(chat_completion())
+    await provider.complete(request(messages=history), model="gpt-oss:20b", effort="medium")
+    await provider.complete(request(), model="gpt-oss:20b", effort="max")
+    await provider.complete(request(), model="gpt-oss:20b")
+    await provider.complete(request(), model="llama3.2:3b", effort="low")
+    sent = comps.calls[0]
+    assert sent["messages"][2] == {"role": "assistant", "content": "ok"}
+    assert "sig-abc" not in str(sent["messages"])
+    assert sent["reasoning_effort"] == "medium"
+    assert comps.calls[1]["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in comps.calls[2]
+    # Ollama rejects reasoning_effort for models that can't think.
+    assert "reasoning_effort" not in comps.calls[3]
+
+
+async def test_fallback_to_ollama_drops_claude_thinking(sleeps: Sleeps) -> None:
+    from agent_team.llm.gateway import Gateway
+
+    block = ThinkingBlock(provider="anthropic", model="claude-haiku-5-5", raw=THINKING)
+    history = [
+        Message.user("read it"),
+        Message(role="assistant", content=[block, TextBlock(text="ok")]),
+        Message.user("go on"),
+    ]
+    down = anthropic.InternalServerError("oops", response=_response(529), body=None)
+    claude_api = StubAnthropicMessages(down)
+    provider, comps = ollama(chat_completion())
+    config = make_config(
+        defaults={"provider": "anthropic", "model": "claude-haiku-5-5", "effort": "low"},
+        fallbacks=["anthropic", "ollama"],
+        fallback_models={"ollama": "gpt-oss:20b"},
+        retry={"delays_s": []},
+    )
+    gw = Gateway(
+        config,
+        {
+            "anthropic": ap.AnthropicProvider(client=anthropic_client(claude_api)),
+            "ollama": provider,
+        },
+        sleep=sleeps,
+    )
+    resp = await gw.complete(request(messages=history))
+    assert resp.provider == "ollama"
+    assert claude_api.calls[0]["messages"][1]["content"][0] == THINKING
+    assert "sig-abc" not in str(comps.calls[0]["messages"])
+    assert comps.calls[0]["reasoning_effort"] == "low"
 
 
 async def test_anthropic_stream() -> None:
     provider = ap.AnthropicProvider(
-        client=SimpleNamespace(
-            messages=StubAnthropicMessages(
+        client=anthropic_client(
+            StubAnthropicMessages(
                 sdk_message(content=[{"type": "text", "text": "hi"}], stop_reason="end_turn")
             )
         )
@@ -148,7 +313,7 @@ async def test_anthropic_stream() -> None:
     ],
 )
 async def test_anthropic_error_mapping(exc: Exception, transient: bool, status: int | None) -> None:
-    provider = ap.AnthropicProvider(client=SimpleNamespace(messages=StubAnthropicMessages(exc)))
+    provider = ap.AnthropicProvider(client=anthropic_client(StubAnthropicMessages(exc)))
     with pytest.raises(Exception) as info:
         await provider.complete(request(), model="m")
     assert isinstance(info.value, TransientLLMError) is transient

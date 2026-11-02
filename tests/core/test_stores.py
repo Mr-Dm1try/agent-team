@@ -39,7 +39,13 @@ from agent_team.core.stores import (
     SqliteTaskStore,
     SqliteVerdictStore,
 )
-from agent_team.llm.types import Message, TextBlock, ToolResultBlock, ToolUseBlock
+from agent_team.llm.types import (
+    Message,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 
 @pytest.fixture
@@ -243,6 +249,34 @@ async def test_checkpoints_keep_latest_and_offload_large_results(
     await store.save_step(task.id, 1, 3, msgs)
     blobs = await asyncio.to_thread(lambda: list((tmp_path / "runs" / run.id / "blobs").iterdir()))
     assert len(blobs) == 1
+
+
+async def test_checkpoints_round_trip_thinking_blocks_unchanged(
+    db: Database, tmp_path: Path
+) -> None:
+    tasks = SqliteTaskStore(db)
+    run = await tasks.create_run(make_run(tmp_path))
+    task = await tasks.create_task(make_task(run))
+    store = SqliteCheckpointStore(db, tmp_path / "runs")
+    raw = {"type": "thinking", "thinking": "", "signature": "c2lnbmF0dXJl"}
+    redacted = {"type": "redacted_thinking", "data": "b3BhcXVl"}
+    msgs = [
+        Message.user("go"),
+        Message(
+            role="assistant",
+            content=[
+                ThinkingBlock(provider="anthropic", model="claude-haiku-5-5", raw=raw),
+                ThinkingBlock(provider="anthropic", model="claude-haiku-5-5", raw=redacted),
+                ToolUseBlock(id="c1", name="read", arguments={}),
+            ],
+        ),
+    ]
+    await store.save_step(task.id, 1, 1, msgs)
+    loaded = await store.load_latest(task.id, 1)
+    assert loaded is not None and loaded[1] == msgs
+    first, second = loaded[1][1].content[:2]
+    assert isinstance(first, ThinkingBlock) and first.raw == raw
+    assert isinstance(second, ThinkingBlock) and second.raw == redacted
 
 
 async def test_decision_log_records_and_emits(

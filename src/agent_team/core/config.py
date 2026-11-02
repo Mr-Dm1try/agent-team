@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_team.core.models import AgentName, ReviewMode
 
@@ -21,12 +21,18 @@ class _Cfg(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+Effort = Literal["low", "medium", "high", "xhigh", "max"]
+
+
 class Route(_Cfg):
-    """A provider and model, with an optional prompt-token budget."""
+    """A provider and model, with an optional prompt-token budget and effort. Effort
+    sets how hard the model reasons: Claude's effort, or Ollama's reasoning_effort for
+    the models listed in ``providers.ollama.reasoning_models``."""
 
     provider: str
     model: str
     context_budget: int | None = None
+    effort: Effort | None = None
 
 
 class DefaultRoute(Route):
@@ -76,9 +82,22 @@ class AnthropicConfig(_Cfg):
     """Anthropic provider settings."""
 
     timeout_s: float = 120.0
-    #: Thinking setting per model, passed through as-is. Our message format has no
-    #: thinking blocks, so routes default to thinking off where the model allows it.
-    thinking: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    #: Sent as ``thinking`` on every call; adaptive lets the model decide how much to
+    #: think, and the route's effort sets how hard it tries.
+    thinking: dict[str, Any] = Field(default_factory=lambda: {"type": "adaptive"})
+    #: What the API does with a thinking block whose earlier history was edited
+    #: (compaction, trimmed tool results): "drop_block" drops it and the call goes on,
+    #: "error" fails the call with a 400. None sends neither and takes the API default,
+    #: which is a 400 on accounts where the check is enforced.
+    on_history_edit: Literal["drop_block", "error"] | None = "drop_block"
+
+    @field_validator("thinking")
+    @classmethod
+    def _one_setting(cls, value: dict[str, Any]) -> dict[str, Any]:
+        # The old format mapped model names to settings; catch it here, not as a 400.
+        if not isinstance(value.get("type"), str):
+            raise ValueError("thinking must be one setting with a type, e.g. {type: adaptive}")
+        return value
 
 
 class OllamaConfig(_Cfg):
@@ -87,6 +106,9 @@ class OllamaConfig(_Cfg):
     base_url: str = "http://localhost:11434/v1"
     num_ctx: int = 32_768
     timeout_s: float = 300.0
+    #: Models (by name before the ":" tag) that take ``reasoning_effort``. Ollama
+    #: rejects it for models that can't think, so others get no effort at all.
+    reasoning_models: list[str] = Field(default_factory=lambda: ["gpt-oss"])
 
 
 class ProvidersConfig(_Cfg):
@@ -133,13 +155,17 @@ class Config(_Cfg):
     paths: PathsConfig = Field(default_factory=PathsConfig)
 
     def route_for(self, agent: AgentName) -> Route:
-        """The agent's route, or the default, with a context budget filled in."""
+        """The agent's route, or the default, with the context budget and effort
+        filled in from the defaults when the agent's route leaves them out."""
         route = self.agents.get(agent)
         if route is None:
             return Route(**self.defaults.model_dump())
+        fill: dict[str, Any] = {}
         if route.context_budget is None:
-            route = route.model_copy(update={"context_budget": self.defaults.context_budget})
-        return route
+            fill["context_budget"] = self.defaults.context_budget
+        if route.effort is None:
+            fill["effort"] = self.defaults.effort
+        return route.model_copy(update=fill) if fill else route
 
     def context_budget(self, agent: AgentName) -> int:
         """Max prompt tokens for the agent's model."""

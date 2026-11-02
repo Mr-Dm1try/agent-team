@@ -1,7 +1,13 @@
 # Routing, budgets and review mode. Loaded by agent_team.core.config.
-defaults: {provider: anthropic, model: claude-haiku-5-5, context_budget: 90000}
+# effort (low, medium, high, xhigh, max) sets how hard the model reasons: Claude's
+# effort, or Ollama's reasoning_effort (xhigh and max become high). Cheap Claude roles
+# start at low, engineer and architect at medium. The researcher runs locally for
+# free, so it keeps gpt-oss's own default of medium.
+defaults: {provider: anthropic, model: claude-haiku-5-5, context_budget: 90000, effort: low}
 agents:
-  researcher: {provider: ollama, model: "gpt-oss:20b", context_budget: 20000}
+  researcher: {provider: ollama, model: "gpt-oss:20b", context_budget: 20000, effort: medium}
+  architect: {provider: anthropic, model: claude-haiku-5-5, effort: medium}
+  engineer: {provider: anthropic, model: claude-haiku-5-5, effort: medium}
 stronger_model: {provider: anthropic, model: claude-sonnet-5-5}
 fallbacks: [anthropic, ollama]
 # Model each provider uses when it stands in for another one.
@@ -22,11 +28,11 @@ prices:
 providers:
   anthropic:
     timeout_s: 120
-    # Our message format keeps no thinking blocks, so thinking stays off.
-    thinking:
-      claude-haiku-5-5: {type: disabled}
-      claude-sonnet-5-5: {type: between_tools}
-  ollama: {base_url: "http://localhost:11434/v1", num_ctx: 32768}
+    thinking: {type: adaptive}
+    # A thinking block whose earlier history was edited is dropped, not a 400.
+    on_history_edit: drop_block
+  # reasoning_models: models that take reasoning_effort; others get none.
+  ollama: {base_url: "http://localhost:11434/v1", num_ctx: 32768, reasoning_models: [gpt-oss]}
 # Fault injection; the --chaos flag overrides this.
 chaos: {rate: 0.0, faults: []}
 # Custom hooks as "module:function"; each function receives the event bus.

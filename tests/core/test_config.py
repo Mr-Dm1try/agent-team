@@ -21,6 +21,45 @@ def test_default_config_loads() -> None:
     assert cfg.prices["claude-haiku-5-5"].input_per_mtok == 0.10
 
 
+def test_default_config_turns_thinking_on_with_effort_per_agent() -> None:
+    cfg = load_config(DEFAULT_CONFIG)
+    claude = cfg.providers.anthropic
+    assert claude.thinking == {"type": "adaptive"}
+    assert claude.on_history_edit == "drop_block"
+    assert cfg.defaults.effort == "low"
+    efforts = {agent: cfg.route_for(agent).effort for agent in AgentName}
+    assert efforts[AgentName.ENGINEER] == efforts[AgentName.ARCHITECT] == "medium"
+    assert efforts[AgentName.PRODUCT] == efforts[AgentName.QA] == "low"
+    assert efforts[AgentName.RESEARCHER] == "medium"
+    assert cfg.providers.ollama.reasoning_models == ["gpt-oss"]
+
+
+def test_route_without_effort_takes_the_default(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "defaults: {provider: fake, model: m, effort: high}\n"
+        "agents: {qa: {provider: fake, model: n}}\n"
+    )
+    assert load_config(path).route_for(AgentName.QA).effort == "high"
+
+
+def test_thinking_in_the_old_per_model_format_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "defaults: {provider: fake, model: m}\n"
+        "providers: {anthropic: {thinking: {claude-haiku-5-5: {type: disabled}}}}\n"
+    )
+    with pytest.raises(ValueError, match="one setting"):
+        load_config(path)
+
+
+def test_bad_effort_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("defaults: {provider: fake, model: m, effort: extreme}\n")
+    with pytest.raises(ValueError):
+        load_config(path)
+
+
 def test_env_var_and_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "c.yaml"
     path.write_text("defaults: {provider: fake, model: m}\nbudget: {max_usd_per_run: 2}\n")
