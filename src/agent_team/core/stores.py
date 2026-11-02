@@ -27,6 +27,7 @@ from agent_team.core.models import (
     EventName,
     Feedback,
     Phase,
+    RuleScope,
     Run,
     Task,
     TaskStatus,
@@ -455,7 +456,7 @@ class SqliteFeedbackStore:
 
 
 class SqliteVerdictStore:
-    """Audit verdicts per task. Implements ``VerdictStore``."""
+    """Audit verdicts per task and per phase gate. Implements ``VerdictStore``."""
 
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -463,9 +464,16 @@ class SqliteVerdictStore:
     async def save(self, verdict: Verdict) -> None:
         """Store a verdict."""
         await self.db.execute(
-            f"INSERT INTO verdicts (id, run_id, task_id, seq, data) VALUES (?, ?, ?, "
-            f"{_seq('verdicts')}, ?)",
-            (verdict.id, verdict.run_id, verdict.task_id, verdict.model_dump_json()),
+            f"INSERT INTO verdicts (id, run_id, task_id, scope, phase, seq, data) "
+            f"VALUES (?, ?, ?, ?, ?, {_seq('verdicts')}, ?)",
+            (
+                verdict.id,
+                verdict.run_id,
+                verdict.task_id,
+                verdict.scope.value,
+                verdict.phase.value if verdict.phase else None,
+                verdict.model_dump_json(),
+            ),
         )
 
     async def latest_for_task(self, task_id: str) -> Verdict | None:
@@ -479,5 +487,13 @@ class SqliteVerdictStore:
         """Every verdict for the task, oldest first."""
         rows = await self.db.fetchall(
             "SELECT data FROM verdicts WHERE task_id = ? ORDER BY seq", (task_id,)
+        )
+        return [Verdict.model_validate_json(r["data"]) for r in rows]
+
+    async def for_gate(self, run_id: str, phase: Phase) -> list[Verdict]:
+        """Every phase-gate verdict for ``phase`` in the run, oldest first."""
+        rows = await self.db.fetchall(
+            "SELECT data FROM verdicts WHERE run_id = ? AND scope = ? AND phase = ? ORDER BY seq",
+            (run_id, RuleScope.PHASE.value, phase.value),
         )
         return [Verdict.model_validate_json(r["data"]) for r in rows]
