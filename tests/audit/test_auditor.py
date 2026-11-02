@@ -236,3 +236,11 @@ async def test_planning_gate_shows_the_full_request_and_the_plan(rig: Rig, run: 
     assert "P1" in verdict.rules_checked
     assert "User's original request:\nBuild a books API" in prompt
     assert "plan@v1" in prompt
+
+
+def test_second_check_material_keeps_the_start_and_the_end() -> None:
+    from agent_team.audit.auditor import _head_and_tail
+
+    text = "REQUEST" + "x" * 50_000 + "TOOLLOG"
+    cut = _head_and_tail(text, 24_000)
+    assert cut.startswith("REQUEST") and cut.endswith("TOOLLOG") and len(cut) < 24_100

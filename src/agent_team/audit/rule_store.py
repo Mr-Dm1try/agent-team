@@ -34,10 +34,16 @@ class SqliteRuleStore:
         self._lock = asyncio.Lock()
 
     def close(self) -> None:
+        """Close the database connection."""
         self._db.close()
 
     async def seed(self, rules: list[Rule]) -> None:
+        """Make the table match the catalog: add and update its rules, keep each stored
+        ``enabled`` flag, and delete rules the catalog no longer has."""
         async with self._lock:
+            ids = [r.id for r in rules]
+            marks = ",".join("?" * len(ids))
+            self._db.execute(f"DELETE FROM rules WHERE id NOT IN ({marks})", ids)
             for rule in rules:
                 row = self._db.execute("SELECT enabled FROM rules WHERE id = ?", (rule.id,))
                 existing = row.fetchone()
@@ -50,6 +56,7 @@ class SqliteRuleStore:
             self._db.commit()
 
     async def set_enabled(self, rule_id: str, enabled: bool) -> None:
+        """Switch one rule on or off. Raises ``KeyError`` for an unknown id."""
         async with self._lock:
             row = self._db.execute("SELECT data FROM rules WHERE id = ?", (rule_id,)).fetchone()
             if row is None:
@@ -62,6 +69,7 @@ class SqliteRuleStore:
             self._db.commit()
 
     async def all(self) -> list[Rule]:
+        """Every stored rule, enabled or not, by id."""
         async with self._lock:
             rows = self._db.execute("SELECT data FROM rules ORDER BY id").fetchall()
         return [Rule.model_validate_json(r[0]) for r in rows]
@@ -81,6 +89,7 @@ class SqliteRuleStore:
 
 
 def matches(rule: Rule, *, phase: Phase | None, agent: AgentName | None) -> bool:
+    """Whether a rule applies to this phase and agent; None skips that filter."""
     if phase is not None and rule.phases and phase not in rule.phases:
         return False
     return not (agent is not None and rule.agents and agent not in rule.agents)

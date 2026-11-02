@@ -14,19 +14,40 @@ from pydantic import BaseModel, ValidationError
 from agent_team.core.models import AgentName, Usage
 from agent_team.llm.types import LLMClient, LLMRequest, Message, TextBlock
 
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+_FENCE_LAZY = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+_FENCE_GREEDY = re.compile(r"```(?:json)?\s*(.*)```", re.DOTALL)
 
 
-def extract_json(text: str) -> str:
-    """The JSON object in a reply: inside a code fence, or from the first ``{``."""
-    fenced = _FENCE.search(text)
-    if fenced:
-        return fenced.group(1).strip()
+def json_candidates(text: str) -> list[str]:
+    """Places the JSON object in a reply may be, most likely first: a code fence (the
+    greedy match survives backticks inside string values), then first ``{`` to last ``}``."""
+    out: list[str] = []
+    for pattern in (_FENCE_LAZY, _FENCE_GREEDY):
+        m = pattern.search(text)
+        if m:
+            out.append(m.group(1).strip())
     start, end = text.find("{"), text.rfind("}")
-    return text[start : end + 1] if start != -1 and end > start else text.strip()
+    if start != -1 and end > start:
+        out.append(text[start : end + 1])
+    out.append(text.strip())
+    return list(dict.fromkeys(out))
+
+
+def parse_reply[T: BaseModel](text: str, schema: type[T]) -> T:
+    """The first candidate that validates; raises the first candidate's error otherwise."""
+    first: Exception | None = None
+    for candidate in json_candidates(text):
+        try:
+            return schema.model_validate(json.loads(candidate))
+        except (ValueError, ValidationError) as exc:
+            first = first or exc
+    raise first or ValueError("empty reply")
 
 
 class Reply[T: BaseModel]:
+    """The parsed value (None when every attempt failed), the model that answered, the
+    usage across attempts and the last parse error."""
+
     def __init__(self, value: T | None, model: str | None, usage: Usage, error: str | None):
         self.value = value
         self.model = model
@@ -45,6 +66,8 @@ async def ask_json[T: BaseModel](
     repairs: int = 2,
     max_tokens: int = 4096,
 ) -> Reply[T]:
+    """Ask for one JSON object matching ``schema``, sending parse errors back up to
+    ``repairs`` times. Model errors propagate; the caller decides how to fail closed."""
     messages = [Message.user(prompt)]
     usage = Usage()
     model: str | None = None
@@ -64,7 +87,7 @@ async def ask_json[T: BaseModel](
         model = response.model
         text = response.text
         try:
-            return Reply(schema.model_validate(json.loads(extract_json(text))), model, usage, None)
+            return Reply(parse_reply(text, schema), model, usage, None)
         except (ValueError, ValidationError) as exc:
             error = str(exc)[:2000]
         messages = [

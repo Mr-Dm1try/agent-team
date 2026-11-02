@@ -29,6 +29,7 @@ _ASSIGNED_SECRET = re.compile(
     r"(?i)\b(?:password|passwd|pwd|secret|secret_key|api_key|apikey|auth_token|access_token"
     r"|access_key|private_key|token)\b[\"']?\s*[:=]\s*[\"']([^\"'\s]{8,})[\"']"
 )
+_DOC_EXAMPLE = re.compile(r"(?i)example|x{6,}|0{8,}")
 _PLACEHOLDER = re.compile(
     r"(?i)changeme|example|dummy|placeholder|your[_-]|xxx|\*\*\*|<|\$\{|\{\{|test|fake|sample"
 )
@@ -36,20 +37,27 @@ _PLACEHOLDER = re.compile(
 
 @dataclass(frozen=True)
 class SecretHit:
+    """One secret-like string: what it looks like, redacted, and its line."""
+
     kind: str
     redacted: str
     line: int
 
 
 def redact(value: str) -> str:
+    """The first four characters and an ellipsis, so evidence never repeats a secret."""
     return value[:4] + "…" if len(value) > 4 else "…"
 
 
 def find_secrets(text: str) -> list[SecretHit]:
+    """Vendor key formats, private keys and hard-coded credentials, skipping
+    documentation samples and placeholders."""
     hits: list[SecretHit] = []
     for lineno, line in enumerate(text.splitlines(), start=1):
         for kind, pattern in _SECRET_PATTERNS:
             for m in pattern.finditer(line):
+                if _DOC_EXAMPLE.search(m.group(0)):
+                    continue  # documentation sample such as AKIAIOSFODNN7EXAMPLE
                 hits.append(SecretHit(kind, redact(m.group(0)), lineno))
         for m in _ASSIGNED_SECRET.finditer(line):
             value = m.group(1)
@@ -67,7 +75,7 @@ _DESTRUCTIVE = [
     re.compile(r">\s*/dev/(?:sd|nvme|disk)\w*"),
     re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
     re.compile(r"\bchmod\s+(?:-\w+\s+)*-R\s+0?777\s+/(?:\s|$)"),
-    re.compile(r"\b(?:shutdown|reboot|halt|poweroff)\b"),
+    re.compile(r"(?:^|[;&|]\s*|\bsudo\s+)(?:shutdown|reboot|halt|poweroff)\b"),
     re.compile(r"\bgit\s+push\b[^;&|]*\s(?:--force|-f)\b"),
 ]
 _PIPE_TO_SHELL = re.compile(
@@ -78,16 +86,16 @@ _PIPE_TO_SHELL = re.compile(
 _CREDENTIAL_PATH = re.compile(
     r"(?:^|[\s\"'=/~])\.ssh(?:/|\b)|\bid_(?:rsa|dsa|ecdsa|ed25519)\b|\.aws/credentials\b"
     r"|\.netrc\b|\.docker/config\.json\b|\.kube/config\b|/etc/shadow\b|\.gnupg\b"
-    r"|\.config/gh/hosts\.yml\b|\.pypirc\b|\.git-credentials\b|\.anthropic\b"
+    r"|\.config/gh/hosts\.yml\b|\.pypirc\b|\.git-credentials\b|(?:^|[\s\"'=/~])\.anthropic(?:/|\b)"
 )
 _UNCLEAR_COMMAND = re.compile(
     r"\b(?:sudo|su|ssh|scp|rsync|nc|ncat|netcat|telnet|chown|docker|kill|pkill|killall"
     r"|crontab|systemctl|iptables|mount)\b"
 )
 _UPLOAD_FLAGS = re.compile(
-    r"(?:^|\s)(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file|"
-    r"--post-data|--post-file|-X\s*(?:POST|PUT|PATCH))(?:\s|=|$)"
-)
+    r"(?:^|\s)(?:-[A-Za-z]*[dFT][A-Za-z]*|--data(?:-binary|-raw|-urlencode)?|--form|"
+    r"--upload-file|--post-data|--post-file|-X\s*(?:POST|PUT|PATCH))(?:\s|=|$)"
+)  # short flags may be combined, e.g. -sd
 _URL = re.compile(r"\bhttps?://([A-Za-z0-9.\-]+|\[[0-9a-fA-F:]+\])(?::\d+)?[^\s\"'<>)]*")
 
 LOCAL_HOSTS = frozenset(
@@ -104,11 +112,14 @@ def command_text(args: dict[str, Any]) -> str:
 
 
 def path_args(args: dict[str, Any]) -> list[str]:
+    """The file or directory paths in a tool call's args, whatever the key."""
     keys = ("path", "file", "file_path", "dir", "directory", "target", "dest")
     return [str(args[k]) for k in keys if isinstance(args.get(k), str)]
 
 
 def is_destructive(command: str) -> str | None:
+    """Why a command is destructive (disk wipes, fork bombs, shutdowns, force pushes,
+    downloads piped to a shell), or None."""
     for pattern in _DESTRUCTIVE:
         if pattern.search(command):
             return "destructive command"
@@ -118,22 +129,27 @@ def is_destructive(command: str) -> str | None:
 
 
 def touches_credentials(text: str) -> bool:
+    """Whether the text names a credential file such as ~/.ssh or ~/.aws/credentials."""
     return bool(_CREDENTIAL_PATH.search(text))
 
 
 def is_unclear_command(command: str) -> bool:
+    """Whether a command needs the model's judgment (sudo, ssh, docker, kill and so on)."""
     return bool(_UNCLEAR_COMMAND.search(command))
 
 
 def hosts_in(text: str) -> list[str]:
+    """Hosts of the http(s) URLs in the text, lowercased."""
     return [m.group(1).lower() for m in _URL.finditer(text)]
 
 
 def urls_in(text: str) -> list[str]:
+    """The http(s) URLs in the text."""
     return [m.group(0) for m in _URL.finditer(text)]
 
 
 def is_local_host(host: str, allowed: list[str] | tuple[str, ...] = ()) -> bool:
+    """Whether a host is local, a reserved test name, or allowed by the spec."""
     host = host.lower()
     if host in LOCAL_HOSTS or host.endswith((".example", ".test", ".localhost", ".invalid")):
         return True
@@ -141,6 +157,7 @@ def is_local_host(host: str, allowed: list[str] | tuple[str, ...] = ()) -> bool:
 
 
 def external_hosts(text: str, allowed: list[str] | tuple[str, ...] = ()) -> list[str]:
+    """Hosts in the text that are neither local nor allowed."""
     return sorted({h for h in hosts_in(text) if not is_local_host(h, allowed)})
 
 
@@ -171,22 +188,47 @@ def inside(path: str, root: str) -> bool:
     return True
 
 
-def rm_outside(command: str, workspace: str) -> list[str]:
-    """Paths outside the workspace that an ``rm -r`` / ``rm -f`` would delete."""
+_DELETERS = frozenset({"rm", "unlink", "shred", "rmdir"})
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+
+
+def _command_words(command: str) -> list[list[str]]:
+    """Shell words of each simple command, split on ``;``, ``&`` and ``|`` outside
+    quotes. Falls back to plain splitting when the quoting is broken."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        tokens = re.sub(r"([;&|]+)", r" \1 ", command).split()
+    groups: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= set(";&|"):
+            groups.append([])
+        else:
+            groups[-1].append(token)
+    return [g for g in groups if g]
+
+
+def rm_outside(command: str, workspace: str, _depth: int = 0) -> list[str]:
+    """Paths outside the workspace that an ``rm``, ``unlink``, ``shred`` or ``rmdir``
+    would delete, including inside ``sh -c '...'`` strings. Files under /tmp are
+    scratch space and allowed."""
     out: list[str] = []
-    for segment in re.split(r"[;&|]+", command):
-        try:
-            words = shlex.split(segment)
-        except ValueError:
-            words = segment.split()
+    for words in _command_words(command):
         for i, word in enumerate(words):
-            if posixpath.basename(word) != "rm":
+            name = posixpath.basename(word)
+            if name in _SHELLS and _depth < 3 and words[i + 1 : i + 2] == ["-c"]:
+                if i + 2 < len(words):
+                    out += rm_outside(words[i + 2], workspace, _depth + 1)
+                break
+            if name not in _DELETERS:
                 continue
-            rest = words[i + 1 :]
-            flags = "".join(w.lstrip("-") for w in rest if w.startswith("-"))
-            if "r" not in flags.lower() and "f" not in flags:
-                continue
-            out += [w for w in rest if not w.startswith("-") and not inside(w, workspace)]
+            for arg in words[i + 1 :]:
+                scratch = arg.startswith("/tmp/") and ".." not in arg
+                if not arg.startswith("-") and not scratch and not inside(arg, workspace):
+                    out.append(arg)
+            break
     return out
 
 
@@ -220,6 +262,8 @@ _ABS_PATH_LITERAL = re.compile(
 
 @dataclass(frozen=True)
 class CodeHit:
+    """One pattern hit in a code file: what it is, the line number and the line."""
+
     what: str
     line: int
     text: str
@@ -234,6 +278,7 @@ def _code_lines(text: str) -> list[tuple[int, str]]:
 
 
 def find_dangerous_code(text: str) -> list[CodeHit]:
+    """S2 patterns in code, skipping comment lines."""
     hits: list[CodeHit] = []
     for n, line in _code_lines(text):
         for what, pattern in _CODE_PATTERNS:
@@ -243,6 +288,7 @@ def find_dangerous_code(text: str) -> list[CodeHit]:
 
 
 def find_outside_paths(text: str) -> list[CodeHit]:
+    """String literals holding absolute paths outside a workspace, such as /etc/..."""
     return [
         CodeHit("path outside the workspace", n, m.group(1))
         for n, line in _code_lines(text)
@@ -261,6 +307,8 @@ KNOWN_PACKAGES = frozenset(
         "python-dotenv", "python-frontmatter", "python-multipart", "pyyaml", "requests",
         "rich", "ruff", "scipy", "setuptools", "sqlalchemy", "sqlmodel", "starlette",
         "typer", "typing-extensions", "urllib3", "uvicorn", "watchdog", "wheel",
+        "gunicorn", "scapy", "markdown2", "redis", "celery", "pyjwt", "passlib", "bcrypt",
+        "psycopg", "psycopg2", "pymongo", "tomli", "toml", "jsonschema", "tqdm", "pytz",
     }
 )  # fmt: skip
 _REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._\-]*)\s*(\[[^\]]*\])?\s*(===|==|>=|<=|~=|!=|>|<)?")
@@ -291,7 +339,7 @@ def lookalike_of(name: str) -> str | None:
     norm = _norm_pkg(name)
     if norm in KNOWN_PACKAGES:
         return None
-    limit = 1 if len(norm) <= 6 else 2
+    limit = 1 if len(norm) <= 8 else 2
     for known in sorted(KNOWN_PACKAGES):
         if abs(len(known) - len(norm)) <= limit and _osa_distance(norm, known) <= limit:
             return known
@@ -300,11 +348,20 @@ def lookalike_of(name: str) -> str | None:
 
 @dataclass(frozen=True)
 class DependencyIssue:
+    """A problem with one requirement string."""
+
     requirement: str
     problem: str
 
 
+def requirement_name(requirement: str) -> str:
+    """The package name of a requirement such as ``fastapi[all]>=0.115``."""
+    m = _REQ.match(requirement)
+    return m.group(1) if m else requirement
+
+
 def check_requirement(requirement: str) -> list[DependencyIssue]:
+    """Unpinned versions and lookalike names in one requirement."""
     m = _REQ.match(requirement)
     if not m:
         return [DependencyIssue(requirement, "can't parse the requirement")]
@@ -360,6 +417,7 @@ _INJECTION = re.compile(
 
 
 def injection_markers(text: str) -> list[str]:
+    """Phrases in fetched text that try to give an agent instructions."""
     return [m.group(0) for m in _INJECTION.finditer(text)]
 
 
@@ -367,6 +425,8 @@ def injection_markers(text: str) -> list[str]:
 
 
 def normalize_source(ref: str, workspace: str = "") -> str:
+    """A URL or path in one canonical form, so a citation can be matched to the call
+    that opened it."""
     ref = ref.strip()
     if re.match(r"^https?://", ref, re.IGNORECASE):
         parts = urlsplit(ref)

@@ -37,13 +37,11 @@ from agent_team.core.models import (
     Decision,
     Finding,
     Phase,
-    RequestKind,
     Rule,
     RuleScope,
     Run,
     Severity,
     Task,
-    TaskOrigin,
     TaskStatus,
     Verdict,
 )
@@ -69,16 +67,21 @@ KIND_PHASE: dict[str, Phase] = {
 }
 
 MAX_FILE_BYTES = 200_000
-REVISION_ORIGINS = frozenset(
-    {TaskOrigin.REVISION, TaskOrigin.CHANGE_REQUEST, TaskOrigin.GATE_FIX, TaskOrigin.USER_RERUN}
-)
 READ_TOOLS = frozenset({"read_file", "list_dir", "grep", "web_fetch", "fetch", "open_url"})
 OUTGOING_TOOLS = frozenset({"web_fetch", "web_search", "fetch", "http_request", "open_url"})
 
 
+_KIND_OF_TYPE: dict[type[ArtifactBase], str] = {cls: kind for kind, cls in ARTIFACT_TYPES.items()}
+
+
+def kind_of(artifact: ArtifactBase) -> str:
+    """The artifact's kind, such as ``prd``, from its class."""
+    return _KIND_OF_TYPE[type(artifact)]
+
+
 def ref_of(artifact: ArtifactBase) -> ArtifactRef:
-    kind: str = getattr(artifact, "kind")  # noqa: B009 - every concrete artifact has kind
-    return ArtifactRef(kind=kind, version=max(artifact.version, 1))
+    """The ``kind@vN`` reference of an artifact."""
+    return ArtifactRef(kind=kind_of(artifact), version=max(artifact.version, 1))
 
 
 @dataclass
@@ -102,15 +105,17 @@ class AuditContext:
 
     def find(self, kind: str) -> Artifact | None:
         """The newest artifact of ``kind`` in scope, else the latest in the run."""
-        mine = [a for _, a in self.outputs if getattr(a, "kind") == kind]  # noqa: B009
+        mine = [a for _, a in self.outputs if kind_of(a) == kind]
         if mine:
             return max(mine, key=lambda a: a.version)
         return self.latest.get(kind)
 
     def of_type[T: ArtifactBase](self, cls: type[T]) -> list[tuple[Task, T]]:
+        """The in-scope outputs of one artifact class, with the task that made each."""
         return [(t, a) for t, a in self.outputs if isinstance(a, cls)]
 
     def read_workspace(self, rel: str) -> str | None:
+        """A text file in the run's workspace, or None if it is outside, missing or large."""
         if not patterns.inside(rel, self.run.workspace):
             return None
         path = Path(rel) if Path(rel).is_absolute() else Path(self.run.workspace) / rel
@@ -137,6 +142,7 @@ class AuditContext:
 
     @property
     def allowed_hosts(self) -> list[str]:
+        """Network hosts the latest spec allows the code to reach."""
         spec = self.find("spec")
         return list(spec.allowed_hosts) if isinstance(spec, Spec) else []
 
@@ -147,6 +153,8 @@ class AuditContext:
 
 @dataclass
 class HelperResult:
+    """What one helper found: exact hits, and notes the model reads as evidence."""
+
     findings: list[Finding] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -156,6 +164,8 @@ HELPERS: dict[str, Helper] = {}
 
 
 def helper(name: str) -> Callable[[Helper], Helper]:
+    """Register an evidence helper under the name rules.yaml uses for it."""
+
     def register(fn: Helper) -> Helper:
         HELPERS[name] = fn
         return fn
@@ -173,6 +183,7 @@ def hit(
     fix: str | None = None,
     severity: Severity | None = None,
 ) -> Finding:
+    """A helper finding for ``rule``, marked ``from_helper``; severity defaults to the rule's."""
     ref = ref_of(artifact) if isinstance(artifact, ArtifactBase) else artifact
     return Finding(
         rule_id=rule.id,
@@ -228,12 +239,6 @@ def plan_check(ctx: AuditContext, rule: Rule) -> HelperResult:
     if not isinstance(plan, Plan):
         return _missing(rule, "plan")
     res = HelperResult()
-    kinds = {k.value for k in RequestKind}
-    if plan.request_kind not in kinds:
-        res.findings.append(
-            hit(rule, f"unknown request kind '{plan.request_kind}'", item="request_kind",
-                artifact=plan, fix=f"use one of {sorted(kinds)}")
-        )  # fmt: skip
     ids = [a.id for a in plan.asks]
     for dup in sorted({i for i in ids if ids.count(i) > 1}):
         res.findings.append(hit(rule, f"ask id {dup} is used twice", item=dup, artifact=plan))
@@ -267,6 +272,7 @@ def plan_check(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("schema")
 def schema(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R1: the task produced an artifact of the kind it was asked for, and it parses."""
     task, artifact = ctx.task, ctx.artifact
     if task is None:
         return HelperResult()
@@ -274,7 +280,7 @@ def schema(ctx: AuditContext, rule: Rule) -> HelperResult:
         return HelperResult(
             findings=[hit(rule, f"no {task.output_kind} artifact was produced", item=task.id)]
         )
-    kind: str = getattr(artifact, "kind")  # noqa: B009
+    kind = kind_of(artifact)
     if kind != task.output_kind:
         return HelperResult(
             findings=[
@@ -301,6 +307,7 @@ def _texts(model: BaseModel) -> str:
 
 @helper("secrets")
 def secrets(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """S1: secret-like strings in the outputs, the code files and the tool calls."""
     res = HelperResult()
     sources: list[tuple[str, str, ArtifactBase | None]] = []
     for _, artifact in ctx.outputs:
@@ -328,6 +335,8 @@ def secrets(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("dangerous_actions")
 def dangerous_actions(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """S5: destructive commands, downloads piped to a shell, deletes outside the
+    workspace and credential files, in the tool calls that ran."""
     res = HelperResult()
     for call in ctx.ran():
         command = patterns.command_text(call.args)
@@ -355,6 +364,8 @@ def dangerous_actions(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("injected_instructions")
 def injected_instructions(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """S6: text that reads like instructions in what a tool returned, and a hit when
+    a later call reuses a URL or command from that text."""
     res = HelperResult()
     calls = ctx.ran()
     for i, call in enumerate(calls):
@@ -393,6 +404,7 @@ def injected_instructions(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("data_leaving")
 def data_leaving(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """S7: secrets in outgoing web calls, and commands that upload to outside hosts."""
     res = HelperResult()
     allowed = ctx.allowed_hosts
     for call in ctx.ran():
@@ -423,6 +435,8 @@ def data_leaving(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("minimal_revision")
 def minimal_revision(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R12: what a revision changed against the version before it, and code files
+    changed outside the spec's ``affected_files``."""
     task, new, old = ctx.task, ctx.artifact, ctx.previous
     if task is None or new is None or old is None:
         return HelperResult()
@@ -478,6 +492,7 @@ def _changed_items(before: list[Any], after: list[Any]) -> list[str]:
 
 @helper("sources_opened")
 def sources_opened(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R2: every cited source was opened, exactly, by a read tool in this task."""
     artifact = ctx.artifact
     cited: list[str] = []
     if isinstance(artifact, ResearchBrief):
@@ -500,7 +515,7 @@ def sources_opened(ctx: AuditContext, rule: Rule) -> HelperResult:
     res = HelperResult(notes=[f"opened in this task: {sorted(opened)}"])
     for ref in sorted(set(cited)):
         norm = patterns.normalize_source(ref, ws)
-        if norm not in opened and not any(norm.startswith(o.rstrip("/") + "/") for o in opened):
+        if norm not in opened:  # exact: fetching a site root doesn't open its pages
             res.findings.append(
                 hit(
                     rule,
@@ -515,6 +530,7 @@ def sources_opened(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("brief_complete")
 def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """P2: every question in the brief has an answer or a reason it couldn't."""
     brief = ctx.artifact
     if not isinstance(brief, ResearchBrief):
         return HelperResult()
@@ -545,6 +561,7 @@ def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("testable_prd")
 def testable_prd(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R3: every requirement has at least one acceptance criterion."""
     prd = ctx.find("prd")
     if not isinstance(prd, PRD):
         return _missing(rule, "prd")
@@ -561,6 +578,8 @@ def testable_prd(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("spec_coverage")
 def spec_coverage(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R4: every requirement maps to a component and every criterion to a check;
+    work packages, when set, partition the components exactly."""
     spec, prd = ctx.find("spec"), ctx.find("prd")
     if not isinstance(spec, Spec):
         return _missing(rule, "spec")
@@ -614,6 +633,8 @@ def spec_coverage(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("coverage_scope")
 def coverage_scope(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R9: at the PRD gate every ask has a requirement (blocker) and requirements
+    cite only real asks (warning); at the spec gate components serve real requirements."""
     res = HelperResult()
     plan, prd, spec = ctx.find("plan"), ctx.find("prd"), ctx.find("spec")
     if ctx.phase is Phase.PRD:
@@ -662,6 +683,7 @@ def coverage_scope(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("open_questions")
 def open_questions(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R11: questions in the phase's outputs that are neither answered nor assumed."""
     res = HelperResult()
     for _, artifact in ctx.outputs:
         for q in artifact.questions:
@@ -684,6 +706,7 @@ def open_questions(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("files_exist")
 def files_exist(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R5: planned files exist, and nothing was written outside the workspace."""
     res = HelperResult()
     spec = ctx.find("spec")
     if not isinstance(spec, Spec):
@@ -714,6 +737,7 @@ def files_exist(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("tests_ran")
 def tests_ran(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R6: each code change reports a passing test run that the tool log backs up."""
     res = HelperResult()
     changes = ctx.of_type(CodeChange)
     if not changes:
@@ -758,6 +782,7 @@ def tests_ran(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("qa_clean")
 def qa_clean(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R7: QA's blocking issues and failed acceptance criteria."""
     reports = ctx.of_type(QAReport)
     report = reports[-1][1] if reports else ctx.find("qa_report")
     if not isinstance(report, QAReport):
@@ -787,6 +812,7 @@ def qa_clean(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("interface_names")
 def interface_names(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R10: spec interfaces (route paths, function names) missing from the code."""
     spec = ctx.find("spec")
     if not isinstance(spec, Spec):
         return HelperResult()
@@ -819,6 +845,8 @@ def _interface_needle(name: str) -> str:
 
 @helper("dangerous_code")
 def dangerous_code(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """S2: eval, exec, shell commands, unsafe deserialization, disabled TLS and
+    SQL built from strings, line by line in the code files."""
     res = HelperResult()
     files = ctx.code_files()
     for _, change, path, text in files:
@@ -838,6 +866,7 @@ def dangerous_code(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("unexpected_reach")
 def unexpected_reach(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """S3: hosts the spec doesn't allow, and absolute paths outside the workspace."""
     res = HelperResult(notes=[f"allowed hosts: {ctx.allowed_hosts}"])
     for _, change, path, text in ctx.code_files():
         for host in patterns.external_hosts(text, ctx.allowed_hosts):
@@ -864,6 +893,7 @@ def unexpected_reach(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("risky_dependencies")
 def risky_dependencies(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """S4: unpinned and lookalike dependencies in the spec and requirements.txt."""
     res = HelperResult()
     spec = ctx.find("spec")
     deps: list[tuple[str, ArtifactBase | None]] = []
@@ -888,6 +918,8 @@ def risky_dependencies(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("process_trail")
 def process_trail(ctx: AuditContext, rule: Rule) -> HelperResult:
+    """R8: every live task finished with times and a verdict within its attempts,
+    and every decision has a reason."""
     res = HelperResult()
     for task in ctx.tasks:
         if task.status is TaskStatus.SUPERSEDED or task.agent in (

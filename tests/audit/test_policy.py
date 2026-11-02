@@ -357,3 +357,31 @@ async def test_policy_class_reads_the_stores(run: Run) -> None:
     out = await policy.on_task_verdict(run, task, v, [])
     assert kinds(out) == [DecisionKind.ESCALATE, DecisionKind.STRONGER_MODEL]
     assert out[1].inputs["model"] == "strong-2"
+
+
+def test_dangerous_action_wins_over_a_fail_closed_verdict(run: Run) -> None:
+    task = make_task(run, AgentName.ENGINEER, Phase.IMPLEMENTATION, "code_change", attempt=1)
+    v = verdict(run, blocker(AUDIT_RULE), blocker("S5", "run_command"), task=task)
+    assert kinds(decide_task(run, task, v, [], [], LIMITS)) == [
+        DecisionKind.STOP,
+        DecisionKind.ASK_USER,
+    ]
+
+
+def test_a_passed_retry_resets_no_progress(run: Run) -> None:
+    task = spec_task(run, attempt=2)
+    failed = verdict(run, blocker("R4", "REQ-2", "spec@v1"), task=task)
+    passed = verdict(run, task=task)
+    again = verdict(run, blocker("R4", "REQ-2", "spec@v3"), task=task)
+    assert kinds(decide_task(run, task, again, [failed, passed], [], LIMITS)) == [
+        DecisionKind.RETRY
+    ]
+
+
+def test_superseded_tasks_are_never_gate_fix_targets(run: Run) -> None:
+    tasks, outputs = impl_tasks(run)
+    stale = tasks[0].model_copy(update={"status": TaskStatus.SUPERSEDED})
+    v = verdict(run, blocker("S2", "app/db.py", "code_change@v1"), phase=Phase.IMPLEMENTATION)
+    decisions = decide_gate(run, Phase.IMPLEMENTATION, v, None, [stale, *tasks[1:]], outputs, [],
+                            LIMITS)  # fmt: skip
+    assert all(d.task_id != stale.id for d in decisions)

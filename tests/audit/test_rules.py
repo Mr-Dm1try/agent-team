@@ -168,7 +168,6 @@ def test_p1_valid_plan(run: Run) -> None:
     assert blockers(run_helper("P1", ok)) == []
 
     bad_plan = plan(
-        request_kind="wish",
         asks=[Ask(id="ASK-1", text="books"), Ask(id="ASK-1", text="tests"), Ask(id="A3", text=" ")],
         research_questions=[ResearchQuestion(question="which host?", ask="ASK-9")],
     )
@@ -176,7 +175,6 @@ def test_p1_valid_plan(run: Run) -> None:
         run=run, scope=RuleScope.PHASE, phase=Phase.PLANNING, latest={"plan": bad_plan}
     )
     messages = " | ".join(f.message for f in run_helper("P1", bad).findings)
-    assert "unknown request kind 'wish'" in messages
     assert "ASK-1 is used twice" in messages
     assert "'A3' is not of the form ASK-n" in messages
     assert "A3 has no text" in messages
@@ -222,6 +220,19 @@ def test_r2_real_sources(run: Run) -> None:
         run=run, scope=RuleScope.TASK, task=task, artifact=brief, tool_calls=searched_only
     )
     assert sorted(blockers(run_helper("R2", bad))) == ["docs/a.md", "https://fastapi.tiangolo.com/"]
+
+
+def test_r2_site_root_does_not_open_its_pages(run: Run) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    page = "https://docs.python.org/3/library/asyncio-task.html"
+    brief = ResearchBrief(
+        summary="s",
+        answers=[AnsweredQuestion(question="q", answer="a")],
+        findings=[ResearchFinding(claim="c", sources=[Source(ref=page)])],
+    )
+    root = [call(run, task, "web_fetch", "index", url="https://docs.python.org/")]
+    ctx = AuditContext(run=run, scope=RuleScope.TASK, task=task, artifact=brief, tool_calls=root)
+    assert blockers(run_helper("R2", ctx)) == [page]
 
 
 def test_p2_brief_complete(run: Run) -> None:

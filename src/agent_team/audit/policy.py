@@ -17,8 +17,10 @@ triggers":
 5. Still failing after an upstream re-run, or past a cap: ASK_USER.
 
 Two more come from the auditor section: a dangerous agent action (S5, S6, S7) STOPs
-the run and asks the user, since it already happened; and a fail-closed verdict (an
-``AUDIT`` finding) escalates and asks, since the expert isn't at fault.
+the run and asks the user, since it already happened, and this wins over everything
+else, including a fail-closed verdict that still carries such a helper hit; and a
+fail-closed verdict (an ``AUDIT`` finding) escalates and asks, since the expert isn't
+at fault.
 
 Extra ``inputs`` keys beyond the contract's: ``finding_ids`` on most kinds,
 ``previous_output`` on RETRY, ``phase``/``gate``/``producer_task_id`` on
@@ -52,6 +54,8 @@ DANGEROUS_ACTION_RULES = frozenset({"S5", "S6", "S7"})
 
 @dataclass(frozen=True)
 class PolicyLimits:
+    """Caps the policy enforces beyond each task's own ``max_attempts``."""
+
     max_upstream_reruns: int = 2
     stronger_model: str = "claude-sonnet-5-5"
 
@@ -149,28 +153,6 @@ def decide_task(
     fids = _ids(blockers)
     out: list[Decision] = []
 
-    if any(f.rule_id == AUDIT_RULE for f in blockers):
-        reason = "the auditor produced no valid verdict, so the step stays unpassed"
-        return [
-            _decision(
-                run,
-                DecisionKind.ESCALATE,
-                task_id=task.id,
-                choice="escalate",
-                reason=reason,
-                rule="policy.fail_closed",
-                finding_ids=fids,
-            ),
-            _ask(
-                run,
-                task.id,
-                f"The audit of task {task.id} failed: {_summary(blockers)}. "
-                "Re-run the audit, or how should I proceed?",
-                "policy.fail_closed",
-                fids,
-            ),
-        ]
-
     dangerous = [f for f in blockers if f.rule_id in DANGEROUS_ACTION_RULES]
     if dangerous:
         return [
@@ -191,6 +173,28 @@ def decide_task(
                 f"{_summary(dangerous)}. The run is stopped. How should I proceed?",
                 "policy.dangerous_action",
                 _ids(dangerous),
+            ),
+        ]
+
+    if any(f.rule_id == AUDIT_RULE for f in blockers):
+        reason = "the auditor produced no valid verdict, so the step stays unpassed"
+        return [
+            _decision(
+                run,
+                DecisionKind.ESCALATE,
+                task_id=task.id,
+                choice="escalate",
+                reason=reason,
+                rule="policy.fail_closed",
+                finding_ids=fids,
+            ),
+            _ask(
+                run,
+                task.id,
+                f"The audit of task {task.id} failed: {_summary(blockers)}. "
+                "Re-run the audit, or how should I proceed?",
+                "policy.fail_closed",
+                fids,
             ),
         ]
 
@@ -499,6 +503,7 @@ def route(
     engineers = [t for t in phase_tasks if t.agent is AgentName.ENGINEER]
 
     def wrote(path: str) -> Task | None:
+        """The latest Engineer task whose code change wrote ``path``."""
         hits = [
             t
             for t in engineers
@@ -570,11 +575,14 @@ class CodeVerdictPolicy:
     async def on_task_verdict(
         self, run: Run, task: Task, verdict: Verdict, history: list[Verdict]
     ) -> list[Decision]:
+        """Decisions for a task verdict; see ``decide_task``."""
         past = await self.decisions.list(run.id)
         tasks = await self.tasks.list_tasks(run.id)
         return decide_task(run, task, verdict, history, past, self.limits, tasks)
 
     async def on_gate_verdict(self, run: Run, phase: Phase, verdict: Verdict) -> list[Decision]:
+        """Decisions for a gate verdict; see ``decide_gate``. Remembers each gate's last
+        verdict in memory, for the no-progress check."""
         tasks = await self.tasks.list_tasks(run.id)
         outputs: dict[str, Artifact] = {}
         for t in tasks:

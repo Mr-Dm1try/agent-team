@@ -105,6 +105,11 @@ async def test_lookalike_install_asks_the_model(
         "run_command", {"command": "pip install reqeusts"}, task, run
     )
     assert (result.decision, result.rule_id) == (PrecheckDecision.BLOCK, "S4")
+    llm.push({"decision": "block", "reason": "typosquat"})
+    result = await pc(rule_store, llm).check(
+        "run_command", {"command": "pip install 'reqeusts>=2.0'"}, task, run
+    )
+    assert (result.decision, result.rule_id) == (PrecheckDecision.BLOCK, "S4")
 
 
 async def test_unusable_model_answer_blocks(

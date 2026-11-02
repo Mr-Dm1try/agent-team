@@ -57,3 +57,12 @@ async def test_reseed_keeps_disabled_rules_off(tmp_path: Path) -> None:
     with pytest.raises(KeyError):
         await store.set_enabled("Z9", True)
     store.close()
+
+
+async def test_reseed_deletes_rules_the_catalog_dropped() -> None:
+    store = SqliteRuleStore()
+    await store.seed(load_catalog())
+    await store.seed([r for r in load_catalog() if r.id != "R10"])
+    assert "R10" not in {r.id for r in await store.all()}
+    assert len(await store.all()) == 20
+    store.close()

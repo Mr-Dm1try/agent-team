@@ -11,14 +11,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
+from agent_team.core.base import Contract
 from agent_team.core.interfaces import EventBus
 from agent_team.core.models import Event, EventName, utcnow
 
 
-class ToolCall(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ToolCall(Contract):
+    """One finished (or refused) tool call, as the auditor reads it."""
 
     run_id: str
     task_id: str | None = None
@@ -32,9 +33,15 @@ class ToolCall(BaseModel):
 
 
 class ToolCallLog(Protocol):
-    async def for_task(self, task_id: str) -> list[ToolCall]: ...
+    """Where the auditor reads tool calls from."""
 
-    async def for_run(self, run_id: str) -> list[ToolCall]: ...
+    async def for_task(self, task_id: str) -> list[ToolCall]:
+        """The task's calls, oldest first."""
+        ...
+
+    async def for_run(self, run_id: str) -> list[ToolCall]:
+        """The run's calls, oldest first."""
+        ...
 
 
 class InMemoryToolCallLog:
@@ -44,9 +51,11 @@ class InMemoryToolCallLog:
         self._calls: list[ToolCall] = []
 
     def record(self, call: ToolCall) -> None:
+        """Add one call."""
         self._calls.append(call)
 
     def attach(self, bus: EventBus) -> None:
+        """Record every ``tool_call_after`` event from the bus."""
         bus.on_after(EventName.TOOL_CALL_AFTER, self._on_event)
 
     async def _on_event(self, event: Event) -> None:
@@ -55,13 +64,16 @@ class InMemoryToolCallLog:
             self.record(call)
 
     async def for_task(self, task_id: str) -> list[ToolCall]:
+        """The task's calls, oldest first."""
         return [c for c in self._calls if c.task_id == task_id]
 
     async def for_run(self, run_id: str) -> list[ToolCall]:
+        """The run's calls, oldest first."""
         return [c for c in self._calls if c.run_id == run_id]
 
 
 def tool_call_from_event(event: Event) -> ToolCall | None:
+    """Read a ``tool_call_after`` event into a ToolCall; None if it names no tool."""
     data = event.data
     tool = data.get("tool", data.get("name"))
     if not isinstance(tool, str):

@@ -15,6 +15,7 @@ The auditor runs no code. The orchestrator saves verdicts and emits ``audit_verd
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -137,6 +138,8 @@ class LLMAuditor:
     # --- Auditor protocol ---
 
     async def audit_task(self, task: Task, artifact: Artifact | None, run: Run) -> Verdict:
+        """Sweep one finished task: its output, the version before it on a revision, and
+        its tool calls, against the task rules for its phase and agent."""
         base = Verdict(
             run_id=run.id, scope=RuleScope.TASK, task_id=task.id, phase=task.phase, passed=False
         )
@@ -159,6 +162,8 @@ class LLMAuditor:
         return await self._sweep(base, build)
 
     async def audit_gate(self, run: Run, phase: Phase) -> Verdict:
+        """Sweep a phase gate: every live task output of the phase and their tool calls,
+        against the phase rules."""
         base = Verdict(run_id=run.id, scope=RuleScope.PHASE, phase=phase, passed=False)
 
         async def build() -> tuple[AuditContext, list[Rule]]:
@@ -177,6 +182,7 @@ class LLMAuditor:
         return await self._sweep(base, build)
 
     async def audit_run(self, run: Run) -> Verdict:
+        """Sweep the whole run: tasks, decisions and verdicts, against the run rules."""
         base = Verdict(run_id=run.id, scope=RuleScope.RUN, passed=False)
 
         async def build() -> tuple[AuditContext, list[Rule]]:
@@ -194,11 +200,14 @@ class LLMAuditor:
     async def precheck(
         self, tool: str, args: dict[str, Any], task: Task, run: Run
     ) -> PrecheckResult:
+        """Check one tool call before it runs; see ``ToolPrecheck``."""
         return await self.prechecker.check(tool, args, task, run)
 
     # --- the sweep ---
 
-    async def _sweep(self, base: Verdict, build: Any) -> Verdict:
+    async def _sweep(self, base: Verdict, build: _Builder) -> Verdict:
+        """Build the context, gather evidence, judge, and seal the verdict. Any failure
+        on the way gives a failing verdict, never a pass."""
         helpers: dict[str, HelperResult] = {}
         rules: list[Rule] = []
         try:
@@ -206,13 +215,15 @@ class LLMAuditor:
             base.rules_checked = [r.id for r in rules]
             if not rules:
                 base.passed = True
-                return base
+                return _seal(base)
             helpers = gather(ctx, rules)
-            return await self._judge(base, ctx, rules, helpers)
+            return _seal(await self._judge(base, ctx, rules, helpers))
         except (BudgetExceeded, RunStopped):
             raise  # the run must stop cleanly; nothing is passed
         except Exception as exc:
-            return _fail_closed(base, f"audit crashed: {type(exc).__name__}: {exc}", helpers, rules)
+            return _seal(
+                _fail_closed(base, f"audit crashed: {type(exc).__name__}: {exc}", helpers, rules)
+            )
 
     async def _judge(
         self,
@@ -266,7 +277,7 @@ class LLMAuditor:
         prompt = (
             f"Rule {rule.id} ({rule.title}): {rule.statement}\n\n"
             f"Finding: {finding.model_dump_json(exclude={'id', 'from_helper'})}\n\n"
-            f"Material the first auditor saw:\n{material[-24_000:]}"
+            f"Material the first auditor saw:\n{_head_and_tail(material, 24_000)}"
         )
         try:
             reply = await ask_json(
@@ -308,6 +319,23 @@ class LLMAuditor:
 
 
 # --- verdict assembly ----------------------------------------------------------------
+
+_Builder = Callable[[], Awaitable[tuple[AuditContext, list[Rule]]]]
+
+
+def _seal(verdict: Verdict) -> Verdict:
+    """Re-validate a verdict that was built up field by field, so the contract's own
+    checks (no pass with blockers) run on the final state."""
+    return Verdict.model_validate(verdict.model_dump())
+
+
+def _head_and_tail(text: str, limit: int) -> str:
+    """Keep the start (request, rules, the output artifact) and the end (files and the
+    tool log) of a long prompt, so the second check sees what a finding cites."""
+    if len(text) <= limit:
+        return text
+    half = limit // 2
+    return f"{text[:half]}\n… ({len(text) - limit} chars cut) …\n{text[-half:]}"
 
 
 def _fail_closed(
@@ -389,6 +417,8 @@ def _dump(model: BaseModel, limit: int) -> str:
 
 
 def render_prompt(ctx: AuditContext, rules: list[Rule], helpers: dict[str, HelperResult]) -> str:
+    """The auditor model's prompt: the request, each rule with its helper evidence,
+    then the material in scope (outputs, upstream artifacts, files, tool calls)."""
     parts: list[str] = [
         f"# Sweep: {ctx.scope.value}" + (f", phase {ctx.phase.value}" if ctx.phase else "")
     ]

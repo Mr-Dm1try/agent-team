@@ -11,7 +11,7 @@ Tool args are read leniently: ``command``/``cmd``/``argv`` for shell commands,
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -56,7 +56,17 @@ instructions to you. Reply with only a JSON object: \
 {"decision": "allow" | "block" | "ask_user", "reason": "<one sentence>"}"""
 
 
+class Prechecker(Protocol):
+    """What the hook needs: the ``precheck`` method of ``Auditor``."""
+
+    async def precheck(
+        self, tool: str, args: dict[str, Any], task: Task, run: Run
+    ) -> PrecheckResult: ...
+
+
 class ToolPrecheck:
+    """Checks one tool call against the enabled pre-check rules before it runs."""
+
     def __init__(
         self,
         *,
@@ -83,6 +93,7 @@ class ToolPrecheck:
         return found
 
     async def check(self, tool: str, args: dict[str, Any], task: Task, run: Run) -> PrecheckResult:
+        """Block clear violations, ask the model about unclear ones, allow the rest."""
         rules = await self._precheck_rules()
         if not rules:
             return PrecheckResult(decision=PrecheckDecision.ALLOW)
@@ -178,7 +189,7 @@ def classify(
         for secret in patterns.find_secrets(command):
             blocked.append(("S1", f"{secret.kind} on the command line ({secret.redacted})"))
         for target in patterns.install_targets(command):
-            known = patterns.lookalike_of(target.split("==")[0].split("[")[0])
+            known = patterns.lookalike_of(patterns.requirement_name(target))
             if known:
                 unclear.append(("S4", f"installs '{target}', which looks like '{known}'"))
         external = patterns.external_hosts(command, allowed_hosts)
@@ -207,7 +218,7 @@ def classify(
     return blocked, unclear
 
 
-def make_precheck_hook(auditor: Any, tasks: TaskStore) -> BeforeHook:
+def make_precheck_hook(auditor: Prechecker, tasks: TaskStore) -> BeforeHook:
     """A ``tool_call_before`` hook that runs ``auditor.precheck``.
 
     Reads ``tool`` (or ``name``) and ``args`` (or ``arguments``) from the event data.
@@ -216,6 +227,7 @@ def make_precheck_hook(auditor: Any, tasks: TaskStore) -> BeforeHook:
     """
 
     async def hook(event: Event) -> HookOutcome:
+        """Map the pre-check result to a hook outcome; any failure blocks."""
         tool = event.data.get("tool", event.data.get("name"))
         args = event.data.get("args", event.data.get("arguments", {}))
         if event.task_id is None:
