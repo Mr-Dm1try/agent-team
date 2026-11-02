@@ -11,30 +11,29 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field, model_validator
 
 from agent_team.core.artifacts import Artifact, ArtifactRef
+from agent_team.core.base import Contract
 
 
 def new_id(prefix: str) -> str:
-    """Short, sortable-enough ids such as ``task_3f9a1c2e``."""
-    return f"{prefix}_{uuid4().hex[:8]}"
+    """Random ids such as ``task_3f9a1c2e4b5d6a7f``: 64 random bits, so collisions are
+    negligible across every run in one database. Not sortable; order by ``created_at``."""
+    return f"{prefix}_{uuid4().hex[:16]}"
 
 
 def utcnow() -> datetime:
+    """The current time in UTC, timezone-aware. Every timestamp in the store uses it."""
     return datetime.now(UTC)
-
-
-class Contract(BaseModel):
-    """Base for every contract model: strict about unknown fields."""
-
-    model_config = ConfigDict(extra="forbid")
 
 
 # --- enums -------------------------------------------------------------------------
 
 
 class Phase(StrEnum):
+    """The four phases a build goes through, in order (see PHASE_ORDER)."""
+
     PLANNING = "planning"
     PRD = "prd"
     SPEC = "spec"
@@ -45,6 +44,8 @@ PHASE_ORDER: tuple[Phase, ...] = (Phase.PLANNING, Phase.PRD, Phase.SPEC, Phase.I
 
 
 class AgentName(StrEnum):
+    """Who a task is assigned to: an expert, the orchestrator, the auditor or the user."""
+
     ORCHESTRATOR = "orchestrator"
     RESEARCHER = "researcher"
     PRODUCT = "product"
@@ -56,6 +57,9 @@ class AgentName(StrEnum):
 
 
 class TaskStatus(StrEnum):
+    """Where a task is in its life. Changes only through TaskStore.transition,
+    which checks ALLOWED_TRANSITIONS."""
+
     PENDING = "pending"
     READY = "ready"
     RUNNING = "running"
@@ -77,10 +81,17 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.ESCALATED,
             TaskStatus.WAITING,
             TaskStatus.READY,  # resumed after a crash or a pause
+            TaskStatus.SUPERSEDED,  # a change made its inputs stale mid-attempt
         }
     ),
     TaskStatus.AUDITING: frozenset(
-        {TaskStatus.DONE, TaskStatus.RETRY, TaskStatus.ESCALATED, TaskStatus.WAITING}
+        {
+            TaskStatus.DONE,
+            TaskStatus.RETRY,
+            TaskStatus.ESCALATED,
+            TaskStatus.WAITING,
+            TaskStatus.SUPERSEDED,
+        }
     ),
     TaskStatus.RETRY: frozenset({TaskStatus.READY, TaskStatus.SUPERSEDED}),
     TaskStatus.WAITING: frozenset({TaskStatus.READY, TaskStatus.DONE, TaskStatus.SUPERSEDED}),
@@ -91,10 +102,14 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
 
 
 def can_transition(src: TaskStatus, dst: TaskStatus) -> bool:
+    """Whether a task may move from ``src`` to ``dst``."""
     return dst in ALLOWED_TRANSITIONS[src]
 
 
 class TaskOrigin(StrEnum):
+    """Why a task exists: planned by the pipeline, or created later by a retry,
+    revision, research request, review, question, change request or gate fix."""
+
     PLAN = "plan"
     RETRY = "retry"
     REVISION = "revision"  # upstream changed; update, don't rebuild
@@ -107,6 +122,8 @@ class TaskOrigin(StrEnum):
 
 
 class RunStatus(StrEnum):
+    """Where a run is: working, waiting on the user, paused, stopped or done."""
+
     ACTIVE = "active"
     WAITING = "waiting"
     PAUSED = "paused"
@@ -124,17 +141,25 @@ class RequestKind(StrEnum):
 
 
 class ReviewMode(StrEnum):
+    """How much the run involves the user: review after every phase, only answer
+    agents' questions, or record assumptions and never stop."""
+
     EVERY_PHASE = "every_phase"
     QUESTIONS_ONLY = "questions_only"
     AUTO_ASSUMPTIONS = "auto_assumptions"
 
 
 class Severity(StrEnum):
+    """How much a finding matters: a blocker fails the step, a warning doesn't."""
+
     BLOCKER = "blocker"
     WARNING = "warning"
 
 
 class RuleScope(StrEnum):
+    """What an audit covers: one task's output, a whole phase at its gate, or the
+    whole run at the end."""
+
     TASK = "task"
     PHASE = "phase"
     RUN = "run"
@@ -144,6 +169,8 @@ class RuleScope(StrEnum):
 
 
 class Usage(Contract):
+    """Tokens and cost for one model call, or summed over many with ``+``."""
+
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
@@ -157,6 +184,9 @@ class Usage(Contract):
 
 
 class Run(Contract):
+    """One user request and everything done for it, with its own workspace,
+    artifacts, tasks and budget."""
+
     id: str = Field(default_factory=lambda: new_id("run"))
     title: str
     request: str
@@ -165,11 +195,17 @@ class Run(Contract):
     workspace: str  # absolute path to runs/<run_id>/workspace
     context_dirs: list[str] = Field(default_factory=list)  # read-only folders from --context
     upstream_reruns: int = 0
+    # Tokens and cost spent so far, saved with the run so a resumed run keeps counting
+    # against its budget instead of starting from zero.
+    usage: Usage = Field(default_factory=Usage)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
 
 class Task(Contract):
+    """One unit of delegated work: an agent, an objective, inputs and the artifact
+    kind it must produce. Tracks its attempts, output, last error and lineage."""
+
     id: str = Field(default_factory=lambda: new_id("task"))
     run_id: str
     phase: Phase
@@ -200,6 +236,8 @@ class Task(Contract):
 
 
 class FeedbackSource(StrEnum):
+    """Who gave a piece of feedback."""
+
     USER_ANSWER = "user_answer"
     USER_COMMENT = "user_comment"
     AUDITOR = "auditor"
@@ -207,6 +245,9 @@ class FeedbackSource(StrEnum):
 
 
 class Feedback(Contract):
+    """A comment on an artifact, handed to the next attempt that revises it: a user
+    answer, review comment, or a note from the auditor or QA."""
+
     id: str = Field(default_factory=lambda: new_id("fb"))
     artifact: ArtifactRef | None
     source: FeedbackSource
@@ -232,6 +273,8 @@ class TaskEnvelope(Contract):
 
 
 class ResultStatus(StrEnum):
+    """How an agent's attempt ended."""
+
     OK = "ok"  # artifact produced
     QUESTIONS = "questions"  # agent can't proceed safely without the user's answers
     RESEARCH_REQUEST = "research_request"  # agent hit a knowledge gap
@@ -239,6 +282,9 @@ class ResultStatus(StrEnum):
 
 
 class AgentResult(Contract):
+    """What an agent returns for one attempt: the artifact, or why there is none,
+    plus usage and, on error, the error type, message and traceback."""
+
     task_id: str
     status: ResultStatus
     artifact: Artifact | None = None
@@ -253,6 +299,9 @@ class AgentResult(Contract):
 
 
 class Rule(Contract):
+    """One auditor rule from config/rules.yaml: what it checks, where it applies,
+    how severe a miss is, and which code helper gathers its evidence."""
+
     id: str  # e.g. "R3", "S2", "P1"
     title: str
     scope: RuleScope
@@ -266,6 +315,9 @@ class Rule(Contract):
 
 
 class Finding(Contract):
+    """One rule the auditor found broken, with the artifact and item at fault, the
+    evidence and a suggested fix."""
+
     id: str = Field(default_factory=lambda: new_id("finding"))
     rule_id: str
     severity: Severity
@@ -278,6 +330,9 @@ class Finding(Contract):
 
 
 class Verdict(Contract):
+    """The outcome of one audit: pass or fail, the findings, and which rules were
+    checked. Can't pass while it holds a blocker."""
+
     id: str = Field(default_factory=lambda: new_id("verdict"))
     run_id: str
     scope: RuleScope
@@ -292,16 +347,29 @@ class Verdict(Contract):
 
     @property
     def blockers(self) -> list[Finding]:
+        """The findings with blocker severity."""
         return [f for f in self.findings if f.severity is Severity.BLOCKER]
+
+    @model_validator(mode="after")
+    def _no_pass_with_blockers(self) -> Verdict:
+        """Fail closed: a verdict that holds a blocker can't be a pass, whoever built it."""
+        if self.passed and self.blockers:
+            raise ValueError("a verdict with blocker findings cannot pass")
+        return self
 
 
 class PrecheckDecision(StrEnum):
+    """The pre-check's answer for a tool call."""
+
     ALLOW = "allow"
     BLOCK = "block"
     ASK_USER = "ask_user"
 
 
 class PrecheckResult(Contract):
+    """The pre-check's answer for a tool call, with the rule and reason when it
+    blocks or asks the user."""
+
     decision: PrecheckDecision
     rule_id: str | None = None
     reason: str | None = None
@@ -332,6 +400,8 @@ class ToolResult(Contract):
 
 
 class DecisionKind(StrEnum):
+    """The kinds of choices the orchestrator records in the decision log."""
+
     CLASSIFY_REQUEST = "classify_request"
     PLAN = "plan"
     DELEGATE = "delegate"
@@ -347,6 +417,9 @@ class DecisionKind(StrEnum):
 
 
 class Decision(Contract):
+    """One recorded choice: what was decided, from which inputs, why, and whether
+    code (with the rule) or the model made it."""
+
     id: str = Field(default_factory=lambda: new_id("decision"))
     run_id: str
     task_id: str | None = None
@@ -360,6 +433,9 @@ class Decision(Contract):
 
 
 class EventName(StrEnum):
+    """Every event the bus carries. The tracer writes them all to the run's JSONL
+    trace."""
+
     RUN_STARTED = "run_started"
     PHASE_STARTED = "phase_started"
     PHASE_FINISHED = "phase_finished"
@@ -385,6 +461,9 @@ class EventName(StrEnum):
 
 
 class Event(Contract):
+    """One thing that happened in a run, with trace ids for the span tree and
+    free-form ``data``."""
+
     name: EventName
     run_id: str
     ts: datetime = Field(default_factory=utcnow)

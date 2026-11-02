@@ -201,6 +201,11 @@ class VerdictStore(Protocol):
         """Every verdict on this task, oldest first: one per audited attempt."""
         ...
 
+    async def for_gate(self, run_id: str, phase: Phase) -> list[Verdict]:
+        """Every phase-gate verdict for ``phase`` in this run, oldest first, so gate
+        no-progress detection survives a resume."""
+        ...
+
 
 # --- tools and agents --------------------------------------------------------------
 
@@ -280,7 +285,9 @@ class Auditor(Protocol):
 
     async def audit_task(self, task: Task, artifact: Artifact | None, run: Run) -> Verdict:
         """Task sweep. Fails closed: if no valid verdict can be produced, return a
-        failing verdict with an ``AUDIT`` finding rather than raising."""
+        failing verdict with an ``AUDIT`` finding rather than raising. The one
+        exception is BudgetExceeded and RunStopped, which propagate so the run stops
+        cleanly; nothing is passed in that case."""
         ...
 
     async def audit_gate(self, run: Run, phase: Phase) -> Verdict:
