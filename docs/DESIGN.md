@@ -422,6 +422,13 @@ The total is now 27 hours, seven over the target, after adding gateway control, 
 
 **Trim candidates.** About 2 hours: the subprocess fallback (Docker is confirmed), switching runs mid-session beyond choosing one at the start, loading custom hooks from config, memory usefulness scoring and duplicate merging, and per-minute rate limits (a concurrency cap stays). About 1.5 hours more: build only the API demo end to end and keep the MCP server as a stretch.
 
+## Future work (out of scope)
+
+These are ideas we're keeping for later, not plans for this build.
+
+- **Read-only tools for the auditor.** Today the auditor model makes one call with no tools. It sees the evidence helpers' results and a clipped prompt: at most 20 files, the last tool calls, and artifacts trimmed to a size limit. Task and gate audits could get a few read-only tools: read an artifact, read a workspace file, and read a task's events and tool calls. They would be capped at about 5 tool turns and reuse the agents' tool loop. The helpers stay the deterministic floor for blocker rules, and the pre-check stays tool-free. The costs are several model calls per audit, verdicts that are harder to repeat, and untrusted material steering the tool calls.
+- **Dynamic rules.** These are rules the auditor proposes or tunes at run time, beyond the catalog in `config/rules.yaml`. They depend on read-only tools, because those would let the auditor check rules that have no evidence helper.
+
 ## Open questions for Dmitry
 
 - [x] Web search for the Researcher: free DuckDuckGo search (no key, sometimes flaky) or a keyed API with a free tier, such as Tavily or Brave? I'd start with DuckDuckGo. Decided: DuckDuckGo.
