@@ -66,6 +66,7 @@ def estimate_tokens(text: str) -> int:
 
 
 def _request_chars(request: LLMRequest) -> int:
+    """Size of the request in characters, for the fake token estimate."""
     return len(request.system) + len(request.model_dump_json(include={"messages", "tools"}))
 
 
@@ -79,6 +80,7 @@ class FakeProvider:
         name: str = "fake",
         responder: Responder | None = None,
     ) -> None:
+        """Script the replies; ``responder`` answers requests no scripted item matches."""
         self.name = name
         self._turns: list[ScriptItem] = list(turns)
         self.responder = responder
@@ -103,6 +105,7 @@ class FakeProvider:
         return len(self._turns)
 
     def _take(self, request: LLMRequest) -> ScriptItem:
+        """Pop the first scripted item for the request's agent, else ask the responder."""
         for i, item in enumerate(self._turns):
             agent = item.agent if isinstance(item, FakeTurn) else None
             if agent is None or agent is request.agent:
@@ -114,6 +117,7 @@ class FakeProvider:
         )
 
     def _build(self, item: ScriptItem, request: LLMRequest, model: str) -> LLMResponse:
+        """Turn a scripted item into a response, or raise its error."""
         if isinstance(item, BaseException):
             raise item
         if isinstance(item, LLMResponse):

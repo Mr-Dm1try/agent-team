@@ -47,6 +47,7 @@ class BudgetTracker:
     """Per-run spend and elapsed time, checked against the configured caps."""
 
     def __init__(self, config: BudgetConfig, *, clock: Clock = time.monotonic) -> None:
+        """Check runs against ``config``; ``clock`` is injectable for tests."""
         self.config = config
         self.clock = clock
         self._runs: dict[str, RunUsage] = {}
@@ -98,9 +99,11 @@ class BudgetGuard:
     """Before hook on ``llm_call_before`` that blocks calls past a cap."""
 
     def __init__(self, tracker: BudgetTracker) -> None:
+        """Check calls against ``tracker``."""
         self.tracker = tracker
 
     async def __call__(self, event: Event) -> HookOutcome:
+        """Block the call when the run has reached a cap."""
         hit = self.tracker.exceeded(event.run_id)
         if hit is None:
             return HookOutcome()
@@ -119,6 +122,7 @@ class RateLimiter:
         clock: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
+        """Set the caps; ``None`` or 0 means no cap. Clock and sleep are injectable for tests."""
         self._sem = asyncio.Semaphore(max_concurrent) if max_concurrent else None
         self.rpm = requests_per_minute
         self.clock = clock
@@ -127,6 +131,7 @@ class RateLimiter:
         self._rpm_lock = asyncio.Lock()
 
     async def _wait_rpm(self) -> None:
+        """Wait until a request fits in the last minute's allowance, then record it."""
         if not self.rpm:
             return
         async with self._rpm_lock:

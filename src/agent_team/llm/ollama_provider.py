@@ -110,6 +110,7 @@ class OllamaProvider:
     name = "ollama"
 
     def __init__(self, config: OllamaConfig | None = None, *, client: Any = None) -> None:
+        """Use ``config``; ``client`` replaces the SDK client in tests."""
         self.config = config or OllamaConfig()
         self._client = client
 
@@ -126,6 +127,7 @@ class OllamaProvider:
         return self._client
 
     def _params(self, request: LLMRequest, model: str, effort: Effort | None) -> dict[str, Any]:
+        """Keyword arguments for one chat completion call."""
         params: dict[str, Any] = {
             "model": model,
             "messages": to_chat_messages(request.system, request.messages),

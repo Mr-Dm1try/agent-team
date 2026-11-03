@@ -18,6 +18,8 @@ ENV_VAR = "AGENT_TEAM_CONFIG"
 
 
 class _Cfg(BaseModel):
+    """Base for config sections; unknown keys are an error, so typos fail at load."""
+
     model_config = ConfigDict(extra="forbid")
 
 
@@ -91,7 +93,7 @@ class AnthropicConfig(_Cfg):
     @field_validator("thinking")
     @classmethod
     def _one_setting(cls, value: dict[str, Any]) -> dict[str, Any]:
-        # The old format mapped model names to settings; catch it here, not as a 400.
+        """Reject the old per-model map here, at load, rather than as a 400 per call."""
         if not isinstance(value.get("type"), str):
             raise ValueError("thinking must be one setting with a type, e.g. {type: adaptive}")
         return value
@@ -160,6 +162,7 @@ class Config(_Cfg):
 
     @model_validator(mode="after")
     def _ollama_routes_fit(self) -> Config:
+        """Check agents routed to Ollama (or its stronger model) leave reply room in num_ctx."""
         # Budgets are counted at four characters per token (as compaction does); the
         # Ollama provider estimates more cautiously, so scale before comparing.
         ollama = self.providers.ollama

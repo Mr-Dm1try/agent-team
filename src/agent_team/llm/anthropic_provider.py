@@ -134,6 +134,7 @@ class AnthropicProvider:
     name = "anthropic"
 
     def __init__(self, config: AnthropicConfig | None = None, *, client: Any = None) -> None:
+        """Use ``config``; ``client`` replaces the SDK client in tests."""
         self.config = config or AnthropicConfig()
         self._client = client
 
@@ -146,6 +147,7 @@ class AnthropicProvider:
 
     @property
     def _binding(self) -> bool:
+        """Whether to send the history-edit setting; it only applies when thinking is on."""
         return bool(self.config.on_history_edit) and self.config.thinking["type"] in (
             "adaptive",
             "enabled",
@@ -153,9 +155,11 @@ class AnthropicProvider:
 
     @property
     def _api(self) -> Any:
+        """The beta Messages API when the binding beta is needed, else the plain one."""
         return self.client.beta.messages if self._binding else self.client.messages
 
     def _params(self, request: LLMRequest, model: str, effort: Effort | None) -> dict[str, Any]:
+        """Keyword arguments for one Messages API call."""
         params: dict[str, Any] = {
             "model": model,
             "max_tokens": request.max_tokens,

@@ -25,6 +25,7 @@ class ArtifactRef(Contract):
     version: int = Field(ge=1)
 
     def __str__(self) -> str:
+        """Short form for logs, e.g. ``prd@v2``."""
         return f"{self.kind}@v{self.version}"
 
     @classmethod

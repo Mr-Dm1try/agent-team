@@ -66,6 +66,7 @@ class Gateway:
         sleep: Sleep = asyncio.sleep,
         clock: Clock = time.monotonic,
     ) -> None:
+        """Wire up providers, hooks, limits and budgets; sleep and clock are for tests."""
         self.config = config
         self.providers = dict(providers)
         self.bus: EventBus = bus or InMemoryEventBus()
@@ -113,6 +114,7 @@ class Gateway:
         return route
 
     def _primary(self, request: LLMRequest) -> Route:
+        """The task's override route, else the agent's route."""
         override = self._overrides.get(request.task_id) if request.task_id else None
         return override or self.config.route_for(request.agent)
 
@@ -171,6 +173,7 @@ class Gateway:
     def _event(
         self, name: EventName, request: LLMRequest, level: Any = "info", **data: Any
     ) -> Event:
+        """An event for this request, tagged with the current span's ids."""
         span = current_span()
         return Event(
             name=name,
@@ -186,6 +189,7 @@ class Gateway:
         )
 
     async def _preflight(self, request: LLMRequest) -> list[tuple[str, str]]:
+        """Check the kill switch, seed the run's spend, run before hooks; return the routes."""
         if self.kill_switch is not None:
             self.kill_switch.check(request.run_id)
         await self._seed(request.run_id)
@@ -222,6 +226,7 @@ class Gateway:
         return routes
 
     def _inject(self, run_id: str, provider: str) -> Fault | None:
+        """Draw a chaos fault for this try and count it; transient faults raise here."""
         fault = self.chaos.next_fault() if self.chaos.enabled else None
         if fault is not None:
             self.budget.usage(run_id).chaos_injected += 1
@@ -232,6 +237,7 @@ class Gateway:
     def _finish(
         self, request: LLMRequest, model: str, response: LLMResponse, fault: Fault | None
     ) -> LLMResponse:
+        """Apply a bad-JSON fault, price the response, add usage to the tracker and span."""
         if fault is Fault.BAD_JSON:
             response = Chaos.corrupt(response)
         if response.usage.cost_usd == 0:
@@ -287,6 +293,7 @@ class Gateway:
         fallback: bool,
         fault: Fault | None,
     ) -> None:
+        """Count fallbacks, persist usage and emit llm_call_after."""
         if fallback:
             self.budget.usage(request.run_id).fallbacks += 1
         await self._persist(request.run_id, response.usage)
@@ -308,6 +315,7 @@ class Gateway:
         )
 
     async def _span(self, stack: AsyncExitStack, request: LLMRequest) -> None:
+        """Open an llm span for the call when a tracer is set."""
         if self.tracer is not None:
             await stack.enter_async_context(
                 self.tracer.span(
@@ -320,6 +328,7 @@ class Gateway:
             )
 
     def _slot(self, provider: str) -> Any:
+        """The provider's rate-limit slot, or a no-op when it has no limits."""
         limiter = self._limiters.get(provider)
         return limiter.slot() if limiter else nullcontext()
 

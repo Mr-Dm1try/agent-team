@@ -55,6 +55,7 @@ def parse_chaos(spec: str) -> ChaosSettings:
 
 
 def _rate(text: str) -> float:
+    """Parse a fault rate and check it is between 0 and 1."""
     value = float(text)
     if not 0.0 <= value <= 1.0:
         raise ValueError(f"chaos rate must be between 0 and 1, got {value}")
@@ -65,6 +66,7 @@ class Chaos:
     """Decides, per call, whether and which fault to inject."""
 
     def __init__(self, settings: ChaosSettings | None = None) -> None:
+        """Seed the random source and load any scripted faults."""
         self.settings = settings or ChaosSettings()
         self._rng = random.Random(self.settings.seed)
         self._script = list(self.settings.script)

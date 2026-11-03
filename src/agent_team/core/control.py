@@ -13,9 +13,11 @@ class KillSwitch:
     """Per-run stop flag stored as a file, shared between processes."""
 
     def __init__(self, runs_dir: str | Path) -> None:
+        """Keep the runs folder that holds each run's STOP file."""
         self.runs_dir = Path(runs_dir)
 
     def _flag(self, run_id: str) -> Path:
+        """Path of the run's STOP file."""
         return self.runs_dir / run_id / "STOP"
 
     def stop(self, run_id: str, reason: str = "stopped by user") -> None:
