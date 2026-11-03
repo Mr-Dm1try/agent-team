@@ -294,16 +294,24 @@ async def test_decision_log_records_and_emits(
     assert emitted[0].data["id"] == d1.id and emitted[0].data["kind"] == "plan"
 
 
-async def test_feedback_by_artifact_kind(db: Database) -> None:
+async def test_feedback_by_artifact_version_and_task(db: Database) -> None:
     store = SqliteFeedbackStore(db)
-    prd = ArtifactRef(kind="prd", version=1)
-    f1 = Feedback(artifact=prd, source=FeedbackSource.USER_COMMENT, text="add auth")
-    f2 = Feedback(artifact=None, source=FeedbackSource.USER_ANSWER, text="yes")
-    f3 = Feedback(artifact=prd, source=FeedbackSource.AUDITOR, text="REQ-2 untested")
-    for f in (f1, f2, f3):
+    pkg_a = ArtifactRef(kind="code_change", version=1)
+    pkg_b = ArtifactRef(kind="code_change", version=2)
+    f1 = Feedback(artifact=pkg_a, source=FeedbackSource.USER_COMMENT, text="add auth")
+    f2 = Feedback(artifact=None, task_id="t_new", source=FeedbackSource.USER_ANSWER, text="yes")
+    f3 = Feedback(artifact=pkg_b, source=FeedbackSource.AUDITOR, text="REQ-2 untested")
+    f4 = Feedback(artifact=pkg_a, task_id="t_a", source=FeedbackSource.AUDITOR, text="S2")
+    for f in (f1, f2, f3, f4):
         await store.add("r", f)
-    assert [f.id for f in await store.for_artifact("r", "prd")] == [f1.id, f3.id]
-    assert await store.for_artifact("r", "spec") == []
+    # One work package's feedback never reaches its sibling of the same kind.
+    found = await store.for_work("r", refs=[pkg_a], task_ids=["t_a"])
+    assert [f.id for f in found] == [f1.id, f4.id]
+    assert [f.id for f in await store.for_work("r", refs=[pkg_b], task_ids=[])] == [f3.id]
+    # Feedback for a task with no output yet is found by the task.
+    assert [f.id for f in await store.for_work("r", refs=[], task_ids=["t_new"])] == [f2.id]
+    assert await store.for_work("r", refs=[], task_ids=[]) == []
+    assert await store.for_work("other", refs=[pkg_a], task_ids=["t_a"]) == []
 
 
 async def test_verdicts_per_task(db: Database) -> None:

@@ -185,6 +185,7 @@ async def test_answer_to_an_escalation_without_output_reaches_the_agent(tmp_path
     assert reply.kind == "waiting" and reply.run_id
     reply = await team.orch.answer(reply.run_id, "Keep it to one endpoint")
     assert reply.kind == "done", reply.text
-    refs = [f.artifact for _, f in team.feedback.items if f.text == "Keep it to one endpoint"]
-    assert refs and refs[0] is not None and refs[0].kind == "prd"
+    [answer] = [f for _, f in team.feedback.items if f.text == "Keep it to one endpoint"]
+    prd = next(t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd")
+    assert answer.artifact is None and answer.task_id == prd.id  # no output yet: keyed by task
     assert "Keep it to one endpoint" in calls[-1].messages[0].content[0].text  # type: ignore[union-attr]

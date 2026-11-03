@@ -42,6 +42,7 @@ from agent_team.core.models import (
     new_id,
 )
 from agent_team.llm.types import LLMClient
+from agent_team.orchestrator.lineage import ancestry
 
 #: Marks a task whose attempt was cut short (crash, budget, kill switch). Its next
 #: dispatch resumes the same attempt from the checkpoint instead of starting a new one.
@@ -192,7 +193,14 @@ class Dispatcher:
 
         feedback: list[Feedback] = []
         if self.feedback is not None:
-            feedback = await self.feedback.for_artifact(run.id, task.output_kind)
+            # This line of work only: the task, the tasks it was reopened from, and the
+            # versions they wrote. Sibling work of the same kind keeps its own.
+            chain = ancestry(task, await self.tasks.list_tasks(run.id))
+            feedback = await self.feedback.for_work(
+                run.id,
+                refs=[t.output for t in chain if t.output is not None],
+                task_ids=[t.id for t in chain],
+            )
 
         findings: list[Finding] = []
         if self.verdicts is not None:

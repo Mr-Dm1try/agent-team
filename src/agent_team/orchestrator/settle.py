@@ -8,7 +8,6 @@ from agent_team.core.models import (
     AgentName,
     Decision,
     DecisionKind,
-    Feedback,
     FeedbackSource,
     ReviewMode,
     Run,
@@ -92,16 +91,12 @@ class SettleMixin(OrchestratorBase):
         open_qs = [q for q in artifact.questions if q.answer is None and q.assumption is None]
         if open_qs and run.review_mode is ReviewMode.AUTO_ASSUMPTIONS:
             for q in open_qs:
-                await self.feedback.add(
-                    run.id,
-                    Feedback(
-                        artifact=task.output,
-                        source=FeedbackSource.USER_ANSWER,
-                        question_id=q.id,
-                        text="Review mode is auto_assumptions: no answer will come. Record "
-                        "your best assumption in this question's `assumption` and continue.",
-                    ),
+                text = (
+                    "Review mode is auto_assumptions: no answer will come. Record your "
+                    "best assumption in this question's `assumption` and continue."
                 )
+                feedback = self._feedback(task, FeedbackSource.USER_ANSWER, text, question_id=q.id)
+                await self.feedback.add(run.id, feedback)
             await self._record(
                 Decision(
                     run_id=run.id,

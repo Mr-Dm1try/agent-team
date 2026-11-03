@@ -259,7 +259,11 @@ class Feedback(Contract):
     answer, review comment, or a note from the auditor or QA."""
 
     id: str = Field(default_factory=lambda: new_id("fb"))
+    #: The artifact version it is about. Sibling artifacts of one kind (one per work
+    #: package or research question) each get their own.
     artifact: ArtifactRef | None
+    #: The task it is for, which may have no output yet.
+    task_id: str | None = None
     source: FeedbackSource
     text: str
     question_id: str | None = None  # set when this answers an agent question

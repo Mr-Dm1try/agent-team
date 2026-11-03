@@ -283,14 +283,16 @@ class ConversationMixin(OrchestratorBase):
             and await self._keep_as_is(run, target, parent)
         ):
             return None
+        question_id = target.reason if target.reason and target.reason.startswith("Q-") else None
         await self.feedback.add(
             run.id,
-            Feedback(
-                artifact=await self._feedback_ref(run, parent) if parent else None,
+            self._feedback(parent, FeedbackSource.USER_ANSWER, text, question_id=question_id)
+            if parent
+            else Feedback(
+                artifact=None,
+                task_id=target.id,
                 source=FeedbackSource.USER_ANSWER,
-                question_id=target.reason
-                if target.reason and target.reason.startswith("Q-")
-                else None,
+                question_id=question_id,
                 text=text,
             ),
         )
@@ -373,14 +375,7 @@ class ConversationMixin(OrchestratorBase):
         in_phase = {t.id for t in experts}
         roots = [t for t in experts if not any(d in in_phase for d in t.depends_on)]
         for t in roots:
-            await self.feedback.add(
-                run.id,
-                Feedback(
-                    artifact=await self._feedback_ref(run, t),
-                    source=FeedbackSource.USER_COMMENT,
-                    text=text,
-                ),
-            )
+            await self.feedback.add(run.id, self._feedback(t, FeedbackSource.USER_COMMENT, text))
             await self.reopen(run, t, origin=TaskOrigin.REVISION, reason=f"user comment: {text}")
 
     async def request_change(self, run_id: str, text: str, *, target: str = "prd") -> Reply:
@@ -401,7 +396,7 @@ class ConversationMixin(OrchestratorBase):
         the run is active again, even if it had finished."""
         await self.feedback.add(
             run.id,
-            Feedback(artifact=producer.output, source=FeedbackSource.USER_COMMENT, text=text),
+            self._feedback(producer, FeedbackSource.USER_COMMENT, text),
         )
         await self.reopen(
             run, producer, origin=TaskOrigin.CHANGE_REQUEST, reason=f"change request: {text}"
@@ -445,14 +440,7 @@ class ConversationMixin(OrchestratorBase):
         redo = await self._redoing(run, target)
         if redo is None:
             return f"I couldn't find {plain_kind(target)} to change, so I left it as it is."
-        await self.feedback.add(
-            run.id,
-            Feedback(
-                artifact=await self._feedback_ref(run, redo),
-                source=FeedbackSource.USER_COMMENT,
-                text=text,
-            ),
-        )
+        await self.feedback.add(run.id, self._feedback(redo, FeedbackSource.USER_COMMENT, text))
         return f"Your change was added to the redo of {plain_kind(target)}, already under way."
 
     async def _propose_change(self, run: Run, text: str, target: str) -> str | None:

@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_team.core.artifacts import Artifact, ArtifactRef
+from agent_team.core.artifacts import Artifact
 from agent_team.core.errors import BudgetExceeded, RunStopped
 from agent_team.core.interfaces import (
     ArtifactStore,
@@ -28,6 +28,8 @@ from agent_team.core.models import (
     Decision,
     Event,
     EventName,
+    Feedback,
+    FeedbackSource,
     Finding,
     Phase,
     RequestKind,
@@ -199,13 +201,19 @@ class OrchestratorBase:
         status = RunStatus.STOPPED if isinstance(exc, RunStopped) else RunStatus.PAUSED
         await self._set_status(run_id, status)
 
-    async def _feedback_ref(self, run: Run, task: Task) -> ArtifactRef:
-        """Feedback is looked up by artifact kind, so feedback on a task that has no
-        output yet points at the latest version of its kind (or v1 before any)."""
-        if task.output is not None:
-            return task.output
-        latest = await self.artifacts.latest(run.id, task.output_kind)
-        return ArtifactRef(kind=task.output_kind, version=latest.version if latest else 1)
+    @staticmethod
+    def _feedback(
+        task: Task, source: FeedbackSource, text: str, *, question_id: str | None = None
+    ) -> Feedback:
+        """Feedback for ``task``'s next attempt: on its output when it has one, and for
+        the task itself either way, so a task with no output yet still gets it."""
+        return Feedback(
+            artifact=task.output,
+            task_id=task.id,
+            source=source,
+            text=text,
+            question_id=question_id,
+        )
 
     async def _emit_task(self, name: EventName, task: Task, data: dict[str, object]) -> None:
         """Emit an event about one task."""

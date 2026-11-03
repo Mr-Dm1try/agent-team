@@ -67,11 +67,13 @@ CREATE INDEX IF NOT EXISTS decisions_by_run ON decisions (run_id, seq);
 CREATE TABLE IF NOT EXISTS feedback (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
-    artifact_kind TEXT,
+    artifact TEXT,
+    task_id TEXT,
     seq INTEGER NOT NULL,
     data TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS feedback_by_kind ON feedback (run_id, artifact_kind, seq);
+CREATE INDEX IF NOT EXISTS feedback_by_artifact ON feedback (run_id, artifact);
+CREATE INDEX IF NOT EXISTS feedback_by_task ON feedback (run_id, task_id);
 CREATE TABLE IF NOT EXISTS verdicts (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,

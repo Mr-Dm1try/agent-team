@@ -163,3 +163,49 @@ async def test_result_of_a_task_superseded_mid_attempt_is_dropped(tmp_path: Path
     assert team.artifacts.kinds(task.run_id) == []
     finished = [e for e in team.bus.events if e.name is EventName.TASK_FINISHED]
     assert finished[-1].data["status"] == "discarded"
+
+
+async def test_feedback_reaches_only_its_own_line_of_work(tmp_path: Path) -> None:
+    from agent_team.core.models import Feedback, FeedbackSource, TaskOrigin
+
+    team = make_team(tmp_path)
+    run = await team.orch.start_run("Build a books API")
+
+    def engineer(package: str, **kw: Any) -> Task:
+        """An Engineer task for one work package."""
+        return Task(
+            run_id=run.id,
+            phase=Phase.IMPLEMENTATION,
+            agent=AgentName.ENGINEER,
+            objective=f"Implement {package}",
+            output_kind="code_change",
+            reason=f"work package {package}",
+            **kw,
+        )
+
+    from agent_team.core.artifacts import CodeChange
+
+    async def change(path: str) -> ArtifactRef:
+        """Save one package's code change."""
+        return await team.artifacts.save(
+            CodeChange(summary="s", run_id=run.id, files_written=[path])
+        )
+
+    a = await team.tasks.create_task(engineer("a", output=await change("a.py")))
+    b = await team.tasks.create_task(engineer("b", output=await change("b.py")))
+    a_fix = await team.tasks.create_task(engineer("a", origin=TaskOrigin.FIX, parent_task_id=a.id))
+
+    def note(task: Task, text: str) -> Feedback:
+        """Feedback on ``task``'s output, as the orchestrator files it."""
+        return Feedback(
+            artifact=task.output, task_id=task.id, source=FeedbackSource.AUDITOR, text=text
+        )
+
+    await team.feedback.add(run.id, note(a, "S2 on a.py"))
+    await team.feedback.add(run.id, note(b, "R6 on b"))
+    await team.feedback.add(run.id, note(a_fix, "keep the fix small"))
+
+    fix_view = await team.dispatcher.build_envelope(a_fix, run)
+    assert [f.text for f in fix_view.feedback] == ["S2 on a.py", "keep the fix small"]
+    b_view = await team.dispatcher.build_envelope(b, run)
+    assert [f.text for f in b_view.feedback] == ["R6 on b"]

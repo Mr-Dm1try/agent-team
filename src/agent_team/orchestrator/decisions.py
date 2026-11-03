@@ -8,7 +8,6 @@ from agent_team.core.models import (
     Decision,
     DecisionKind,
     EventName,
-    Feedback,
     FeedbackSource,
     Finding,
     Phase,
@@ -148,11 +147,5 @@ class DecisionsMixin(OrchestratorBase):
         """Turn audit findings into feedback the task's next attempt will read."""
         for f in findings:
             fix = f" Suggested fix: {f.suggested_fix}" if f.suggested_fix else ""
-            await self.feedback.add(
-                run.id,
-                Feedback(
-                    artifact=await self._feedback_ref(run, task),
-                    source=FeedbackSource.AUDITOR,
-                    text=f"{f.rule_id} on {f.item or 'the artifact'}: {f.message}.{fix}",
-                ),
-            )
+            text = f"{f.rule_id} on {f.item or 'the artifact'}: {f.message}.{fix}"
+            await self.feedback.add(run.id, self._feedback(task, FeedbackSource.AUDITOR, text))
