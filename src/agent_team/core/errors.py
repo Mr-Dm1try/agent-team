@@ -21,6 +21,7 @@ class TransientLLMError(AgentTeamError):
     retryable = True
 
     def __init__(self, message: str, *, provider: str, status: int | None = None) -> None:
+        """Keep which provider failed and its HTTP status, if any."""
         super().__init__(message)
         self.provider = provider
         self.status = status
@@ -32,6 +33,7 @@ class ContextTooLong(AgentTeamError):
     the prompt. Not retried on the same provider; the gateway moves to the next one."""
 
     def __init__(self, message: str, *, provider: str) -> None:
+        """Keep which provider refused the prompt."""
         super().__init__(message)
         self.provider = provider
 
@@ -42,6 +44,7 @@ class OutputValidationError(AgentTeamError):
     retryable = True
 
     def __init__(self, message: str, *, errors: list[str]) -> None:
+        """Keep the validation errors to send back to the model."""
         super().__init__(message)
         self.errors = errors
 
@@ -53,6 +56,7 @@ class ToolError(AgentTeamError):
     """
 
     def __init__(self, message: str, *, tool: str) -> None:
+        """Keep the name of the tool that failed."""
         super().__init__(message)
         self.tool = tool
 
@@ -61,6 +65,7 @@ class ToolBlocked(ToolError):
     """The auditor's pre-check refused a tool call."""
 
     def __init__(self, message: str, *, tool: str, rule_id: str) -> None:
+        """Keep the tool and the rule that blocked it."""
         super().__init__(message, tool=tool)
         self.rule_id = rule_id
 
@@ -73,6 +78,7 @@ class AuditFailure(AgentTeamError):
     """A blocker rule failed. Carries the verdict id so the orchestrator can route it."""
 
     def __init__(self, message: str, *, verdict_id: str) -> None:
+        """Keep the id of the verdict that failed."""
         super().__init__(message)
         self.verdict_id = verdict_id
 
@@ -81,6 +87,7 @@ class BudgetExceeded(AgentTeamError):
     """A run passed its token, cost or time cap. The run stops cleanly and can resume."""
 
     def __init__(self, message: str, *, limit: str) -> None:
+        """Keep the name of the cap that was hit."""
         super().__init__(message)
         self.limit = limit
 

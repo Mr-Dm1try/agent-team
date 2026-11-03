@@ -49,6 +49,7 @@ class _Appender:
     """Appends lines to files; one lock per process is plenty for our volume."""
 
     def __init__(self) -> None:
+        """One lock for every append in this process."""
         self._lock = threading.Lock()
 
     def append(self, path: Path, line: str) -> None:
@@ -63,6 +64,7 @@ class JsonlTracer:
     """After hook that writes every event to the run's ``events.jsonl``."""
 
     def __init__(self, runs_dir: str | Path) -> None:
+        """Write under ``runs_dir``, one events.jsonl per run."""
         self.runs_dir = Path(runs_dir)
         self._out = _Appender()
 
@@ -165,6 +167,7 @@ class Span:
         self.attrs[key] = self.attrs.get(key, 0) + amount
 
     def _event(self, name: EventName, ts: datetime, data: dict[str, Any]) -> Event:
+        """The span as an event; errors are logged at error level."""
         return Event(
             name=name,
             run_id=self.run_id,
@@ -193,6 +196,7 @@ class Tracer:
     events. Attach a ``JsonlTracer`` to the same bus to write them."""
 
     def __init__(self, bus: EventBus) -> None:
+        """Emit span events on ``bus``."""
         self.bus = bus
 
     @asynccontextmanager
@@ -239,6 +243,7 @@ class Tracer:
             _current.reset(token)
 
     async def _close(self, span: Span, exc: BaseException | None) -> None:
+        """Emit span_finished with timing, status, attrs and any error."""
         end = utcnow()
         data: dict[str, Any] = {
             "start": span.start.isoformat(),
@@ -257,6 +262,7 @@ class Tracer:
 
 
 def _jsonable(attrs: dict[str, Any]) -> dict[str, Any]:
+    """Attrs made JSON-safe; values JSON can't hold become strings."""
     out: dict[str, Any] = json.loads(json.dumps(attrs, default=str))
     return out
 
@@ -339,6 +345,7 @@ def render_tree(roots: list[SpanNode]) -> list[str]:
     lines: list[str] = []
 
     def walk(node: SpanNode, depth: int) -> None:
+        """Add one line for ``node``, then its children one level deeper."""
         s = node.span
         extra = []
         for key in ("input_tokens", "output_tokens", "cost_usd"):

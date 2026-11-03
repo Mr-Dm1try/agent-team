@@ -92,6 +92,7 @@ class Database:
     """Thin async wrapper around one sqlite3 connection."""
 
     def __init__(self, path: str | Path) -> None:
+        """Open (or create) the database, use WAL for a file database, create the tables."""
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -118,10 +119,12 @@ class Database:
     # --- sync helpers, run in a worker thread ------------------------------------------
 
     def _fetchall(self, sql: str, params: Params) -> list[sqlite3.Row]:
+        """Run a read query under the lock; called in a worker thread."""
         with self._lock:
             return list(self._conn.execute(sql, params).fetchall())
 
     def _transaction[T](self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Run ``fn`` between BEGIN IMMEDIATE and COMMIT, rolling back on any failure."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -135,7 +138,10 @@ class Database:
             return result
 
     def _write(self, statements: Iterable[tuple[str, Params]]) -> None:
+        """Run several statements in one transaction."""
+
         def run(conn: sqlite3.Connection) -> None:
+            """Execute each statement on the open transaction."""
             for sql, params in statements:
                 conn.execute(sql, params)
 

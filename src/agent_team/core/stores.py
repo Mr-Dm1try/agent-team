@@ -45,6 +45,7 @@ _FINISHED = frozenset({TaskStatus.DONE, TaskStatus.ESCALATED, TaskStatus.SUPERSE
 
 
 def _seq(table: str) -> str:
+    """SQL for the table's next sequence number, so rows keep insert order."""
     return f"(SELECT COALESCE(MAX(seq), 0) + 1 FROM {table})"
 
 
@@ -55,6 +56,7 @@ class SqliteTaskStore:
     """Runs and tasks. Implements ``TaskStore``; status changes only through ``transition``."""
 
     def __init__(self, db: Database, bus: EventBus | None = None) -> None:
+        """Use ``db``; ``bus`` gets task_state_changed events. The lock serialises transitions."""
         self.db = db
         self.bus = bus
         self._lock = asyncio.Lock()
@@ -117,6 +119,7 @@ class SqliteTaskStore:
         return Task.model_validate_json(row["data"])
 
     async def _put(self, task: Task) -> None:
+        """Overwrite a stored task with its new state."""
         await self.db.execute(
             "UPDATE tasks SET status = ?, phase = ?, data = ? WHERE id = ?",
             (task.status.value, task.phase.value, task.model_dump_json(), task.id),
@@ -205,6 +208,7 @@ class SqliteArtifactStore:
     """Versioned artifacts with lineage. Implements ``ArtifactStore``."""
 
     def __init__(self, db: Database, runs_dir: str | Path) -> None:
+        """Use ``db`` for rows and ``runs_dir`` for the artifact JSON copies."""
         self.db = db
         self.runs_dir = Path(runs_dir)
 
@@ -222,6 +226,7 @@ class SqliteArtifactStore:
         created = utcnow().isoformat()
 
         def insert(conn: sqlite3.Connection) -> tuple[ArtifactRef, str]:
+            """Claim the next version and insert its rows in one transaction."""
             row = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) FROM artifacts WHERE run_id = ? AND kind = ?",
                 (run_id, artifact.kind),
@@ -293,10 +298,12 @@ class SqliteArtifactStore:
 
 
 def _digest(text: str) -> str:
+    """Short content hash used to name blob files."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
 def _write_file(path: Path, body: str) -> None:
+    """Write a temp file, then rename it over the target, so a crash leaves no partial file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(body, encoding="utf-8")
@@ -320,6 +327,7 @@ class SqliteCheckpointStore:
         inline_limit: int = 20_000,
         preview_chars: int = 2_000,
     ) -> None:
+        """Use ``db`` for rows and ``runs_dir`` for blobs of results over ``inline_limit``."""
         self.db = db
         self.runs_dir = Path(runs_dir)
         self.bus = bus
@@ -327,6 +335,7 @@ class SqliteCheckpointStore:
         self.preview_chars = preview_chars
 
     async def _run_id(self, task_id: str) -> str:
+        """The task's run id (it names the blob folder), or ``_unassigned`` if unknown."""
         row = await self.db.fetchone("SELECT run_id FROM tasks WHERE id = ?", (task_id,))
         return str(row["run_id"]) if row else "_unassigned"
 
@@ -354,6 +363,7 @@ class SqliteCheckpointStore:
             )
 
     async def _offload(self, run_id: str, task_id: str, attempt: int, message: Message) -> Message:
+        """Move large tool results to blob files, leaving a preview and the path."""
         blocks = []
         changed = False
         for block in message.content:
@@ -406,6 +416,7 @@ class SqliteDecisionLog:
     """The orchestrator's decision log. Implements ``DecisionLog``."""
 
     def __init__(self, db: Database, bus: EventBus | None = None) -> None:
+        """Use ``db``; ``bus`` gets a decision event per record."""
         self.db = db
         self.bus = bus
 
@@ -439,6 +450,7 @@ class SqliteFeedbackStore:
     """User answers, comments and findings per artifact kind. Implements ``FeedbackStore``."""
 
     def __init__(self, db: Database) -> None:
+        """Use ``db`` for feedback rows."""
         self.db = db
 
     async def add(self, run_id: str, feedback: Feedback) -> None:
@@ -463,6 +475,7 @@ class SqliteVerdictStore:
     """Audit verdicts per task and per phase gate. Implements ``VerdictStore``."""
 
     def __init__(self, db: Database) -> None:
+        """Use ``db`` for verdict rows."""
         self.db = db
 
     async def save(self, verdict: Verdict) -> None:

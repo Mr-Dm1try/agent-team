@@ -18,6 +18,7 @@ class InMemoryEventBus:
     """In-process event bus. Implements ``EventBus``."""
 
     def __init__(self) -> None:
+        """Start with no hooks; before hooks are per event, after hooks may listen to all."""
         self._before: dict[EventName, list[BeforeHook]] = defaultdict(list)
         self._after: dict[EventName | None, list[AfterHook]] = defaultdict(list)
 
