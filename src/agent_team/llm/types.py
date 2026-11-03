@@ -156,6 +156,10 @@ class LLMClient(Protocol):
         """Max prompt tokens for this agent's model, from the routing file."""
         ...
 
+    def next_provider(self, agent: AgentName, task_id: str | None) -> str:
+        """The provider the next call for this agent and task tries first."""
+        ...
+
     def use_stronger_model(self, task_id: str) -> object:
         """Route this task's next calls to the routing file's stronger model
         (the STRONGER_MODEL decision). Returns the route now in force."""

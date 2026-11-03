@@ -56,6 +56,9 @@ class FakeLLM:
     def context_budget(self, agent: AgentName) -> int:
         return 90_000
 
+    def next_provider(self, agent: AgentName, task_id: str | None) -> str:
+        return "fake"
+
     def use_stronger_model(self, task_id: str) -> object:
         self.overrides[task_id] = "stronger"
         return "stronger"

@@ -213,6 +213,10 @@ async def test_stronger_model_override(sleeps: Sleeps) -> None:
     assert fake.models == ["fake-strong", "fake-small", "fake-small"]
     gw.set_override("task_1", {"provider": "fake", "model": "fake-custom"})
     assert gw.routes(request())[0] == ("fake", "fake-custom")
+    assert gw.next_provider(AgentName.PRODUCT, "task_1") == "fake"
+    gw.set_override("task_1", {"provider": "backup", "model": "b-1"})
+    assert gw.next_provider(AgentName.PRODUCT, "task_1") == "backup"
+    assert gw.next_provider(AgentName.PRODUCT, None) == "fake"  # no task: the agent's route
 
 
 async def test_unknown_providers_are_skipped(sleeps: Sleeps) -> None:

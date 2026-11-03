@@ -68,3 +68,20 @@ def test_calibration_measures_the_prompt_without_thinking() -> None:
     msgs = [Message(role="assistant", content=[thought, TextBlock(text="hi")])]
     assert "t" * 500 in sent_json("s", msgs)  # the estimate counts it at raw size
     assert "t" * 500 not in sent_json("s", msgs, thinking=False)
+
+
+def test_thinking_the_next_provider_drops_is_not_counted() -> None:
+    claude = ThinkingBlock(provider="anthropic", model="m", raw={"thinking": "t" * 4000})
+    msgs = [
+        Message.user("go"),
+        Message(role="assistant", content=[claude, TextBlock(text="hi")]),
+        Message.user("next"),
+    ]
+    everything = estimate_tokens("s", msgs, chars_per_token=4)
+    same = estimate_tokens("s", msgs, chars_per_token=4, provider="anthropic")
+    other = estimate_tokens("s", msgs, chars_per_token=4, provider="ollama")
+    assert same == everything and other < everything - 900  # ~4000 chars left out
+    # Messages appended after an anchor are counted the same way.
+    anchor = Anchor(sent=1, tokens=10)
+    anchored = context_tokens("s", msgs, anchor=anchor, chars_per_token=4, provider="ollama")
+    assert anchored < 10 + 100

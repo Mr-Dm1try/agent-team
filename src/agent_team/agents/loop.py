@@ -272,8 +272,17 @@ class ToolLoop[M: BaseModel]:
         # The lowest ratio over the models seen: after a fallback the next call may go
         # to either, so estimate for the one that counts more tokens.
         ratio = self.calibration.ratio(None)
+        # Thinking blocks from another provider (left by a fallback) are dropped by the
+        # one the next call goes to, so they don't count.
+        provider = self.llm.next_provider(self.agent, self.task_id)
         if not self.compactor.needs_compaction(
-            self.system, messages, budget, specs, anchor=self._anchor, chars_per_token=ratio
+            self.system,
+            messages,
+            budget,
+            specs,
+            anchor=self._anchor,
+            chars_per_token=ratio,
+            provider=provider,
         ):
             return messages
         result = await self.compactor.compact(
@@ -289,6 +298,7 @@ class ToolLoop[M: BaseModel]:
             tools=specs,
             anchor=self._anchor,
             chars_per_token=ratio,
+            provider=provider,
         )
         self._usage = self._usage + result.usage
         if result.steps:

@@ -97,6 +97,11 @@ class Gateway:
         """Max prompt tokens for the agent's model, from the routing file."""
         return self.config.context_budget(agent)
 
+    def next_provider(self, agent: AgentName, task_id: str | None) -> str:
+        """The provider the next call for this agent and task tries first."""
+        override = self._overrides.get(task_id) if task_id else None
+        return (override or self.config.route_for(agent)).provider
+
     def set_override(self, task_id: str, route: Route | Mapping[str, Any] | None) -> None:
         """Route one task's calls elsewhere, e.g. one attempt on the stronger model.
         Takes a Route or a ``{provider, model}`` mapping; ``None`` removes the override."""
