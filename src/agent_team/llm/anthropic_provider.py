@@ -184,9 +184,15 @@ class AnthropicProvider:
     async def complete(
         self, request: LLMRequest, *, model: str, effort: Effort | None = None
     ) -> LLMResponse:
-        """One Messages API call."""
+        """One Messages API call. A call that may write a long reply is streamed and
+        returns the final message, so the timeout bounds each read, not the whole reply."""
+        params = self._params(request, model, effort)
         try:
-            msg = await self._api.create(**self._params(request, model, effort))
+            if request.max_tokens > self.config.stream_above_tokens:
+                async with self._api.stream(**params) as s:
+                    msg = await s.get_final_message()
+            else:
+                msg = await self._api.create(**params)
         except anthropic.AnthropicError as exc:
             raise translate_error(exc, self.name) from exc
         return from_wire_message(msg, provider=self.name)

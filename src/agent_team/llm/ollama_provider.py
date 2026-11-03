@@ -175,6 +175,10 @@ class OllamaProvider:
             ]
         prompt = self._prompt_tokens(request, model, params)
         params["max_tokens"] = self._max_tokens(prompt, request.max_tokens)
+        # A long reply at local speeds can outlast the plain timeout.
+        params["timeout"] = max(
+            self.config.timeout_s, params["max_tokens"] / self.config.min_tokens_per_s
+        )
         return params
 
     @staticmethod

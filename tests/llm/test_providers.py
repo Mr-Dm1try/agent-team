@@ -55,10 +55,12 @@ def sdk_message(**kw: Any) -> anthropic.types.Message:
 
 
 class StubAnthropicStream:
-    def __init__(self, final: anthropic.types.Message) -> None:
+    def __init__(self, final: Any) -> None:
         self.final = final
 
     async def __aenter__(self) -> "StubAnthropicStream":
+        if isinstance(self.final, Exception):
+            raise self.final
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -80,9 +82,11 @@ class StubAnthropicMessages:
     def __init__(self, result: Any) -> None:
         self.result = result
         self.calls: list[dict[str, Any]] = []
+        self.streamed: list[bool] = []
 
     async def create(self, **kw: Any) -> anthropic.types.Message:
         self.calls.append(kw)
+        self.streamed.append(False)
         if isinstance(self.result, Exception):
             raise self.result
         assert isinstance(self.result, anthropic.types.Message)
@@ -90,6 +94,7 @@ class StubAnthropicMessages:
 
     def stream(self, **kw: Any) -> StubAnthropicStream:
         self.calls.append(kw)
+        self.streamed.append(True)
         return StubAnthropicStream(self.result)
 
 
@@ -128,6 +133,15 @@ async def test_anthropic_translates_request_and_response() -> None:
     assert resp.stop_reason == "tool_use" and resp.text == "hi"
     assert resp.tool_calls[0].arguments == {"p": "b"}
     assert (resp.usage.input_tokens, resp.usage.output_tokens) == (11, 7)
+
+
+async def test_anthropic_streams_calls_that_may_write_a_long_reply() -> None:
+    messages = StubAnthropicMessages(sdk_message())
+    provider = ap.AnthropicProvider(client=anthropic_client(messages))
+    long = await provider.complete(request(max_tokens=16_000), model="claude-haiku-5-5")
+    await provider.complete(request(max_tokens=1_000), model="claude-haiku-5-5")
+    assert messages.streamed == [True, False]  # the timeout bounds each read, not the reply
+    assert long.text == "hi" and messages.calls[0]["max_tokens"] == 16_000
 
 
 async def test_anthropic_without_binding_uses_the_plain_api_and_no_effort() -> None:
@@ -427,6 +441,15 @@ async def test_ollama_translates_request_and_response() -> None:
     assert resp.tool_calls[0].arguments == {"p": "x"}
     assert resp.tool_calls[1].arguments == {"_invalid_json": "{broken"}
     assert (resp.usage.input_tokens, resp.usage.output_tokens) == (3, 4)
+
+
+async def test_ollama_timeout_grows_with_the_reply_it_may_write() -> None:
+    provider, comps = ollama(chat_completion())
+    await provider.complete(request(max_tokens=1_000), model="gpt-oss:20b")
+    await provider.complete(request(max_tokens=16_000), model="gpt-oss:20b")
+    short, long = (c["timeout"] for c in comps.calls)
+    assert short == provider.config.timeout_s  # the plain timeout covers a short reply
+    assert long == comps.calls[1]["max_tokens"] / provider.config.min_tokens_per_s > short
 
 
 async def test_ollama_fits_prompt_and_reply_into_num_ctx() -> None:
