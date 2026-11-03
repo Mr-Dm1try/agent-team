@@ -50,7 +50,7 @@ def _item(request: LLMRequest, question: str) -> str:
     return found.group(1)
 
 
-def _team(
+async def _team(
     tmp_path: Path, message: Responder, questions: list[dict[str, str]] | None = None
 ) -> Team:
     """A build whose PRD asks ``questions`` once; ``message`` scripts the message loop
@@ -77,7 +77,7 @@ def _team(
 
         script[AgentName.PRODUCT] = product
     mode = ReviewMode.QUESTIONS_ONLY if questions else ReviewMode.AUTO_ASSUMPTIONS
-    return make_team(tmp_path, script=script, review_mode=mode)
+    return await make_team(tmp_path, script=script, review_mode=mode)
 
 
 def _then_reply(text: str, first: list[ContentBlock]) -> Responder:
@@ -109,7 +109,7 @@ async def test_the_right_item_is_answered_when_two_are_pending(tmp_path: Path) -
             "answer_pending", {"task_id": _item(request, "Which auth?"), "text": "OAuth"}
         )
 
-    team = _team(tmp_path, message, QUESTIONS)
+    team = await _team(tmp_path, message, QUESTIONS)
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "waiting" and reply.run_id and len(reply.pending) == 2
     reply = await team.orch.handle("OAuth, please", run_id=reply.run_id)
@@ -124,7 +124,7 @@ async def test_the_right_item_is_answered_when_two_are_pending(tmp_path: Path) -
 
 
 async def test_run_question_leaves_the_item_pending(tmp_path: Path) -> None:
-    team = _team(
+    team = await _team(
         tmp_path,
         _then_reply("The requirements were redone once.", tool_call("list_tasks", {})),
         QUESTIONS[:1],
@@ -157,7 +157,7 @@ async def test_an_answer_and_a_change_in_one_message(tmp_path: Path) -> None:
             ),
         ]
 
-    team = _team(tmp_path, message, QUESTIONS[:1])
+    team = await _team(tmp_path, message, QUESTIONS[:1])
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     run_id = reply.run_id
@@ -186,7 +186,7 @@ async def _proposed(tmp_path: Path) -> tuple[Team, str]:
             return change
         return default(request)
 
-    team = _team(tmp_path, message)
+    team = await _team(tmp_path, message)
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "done" and reply.run_id
     reply = await team.orch.handle("make it paginate", run_id=reply.run_id)
@@ -230,7 +230,7 @@ async def test_a_task_id_that_is_not_pending_is_rejected(tmp_path: Path) -> None
             return json.dumps({"reply": "Which question is that for?"})
         return tool_call("answer_pending", {"task_id": "task_0000000000000000", "text": "yes"})
 
-    team = _team(tmp_path, message, QUESTIONS)
+    team = await _team(tmp_path, message, QUESTIONS)
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     reply = await team.orch.handle("yes", run_id=reply.run_id)
@@ -259,7 +259,7 @@ async def test_a_change_confirmation_takes_yes_or_no(tmp_path: Path) -> None:
 
 
 async def test_fallback_acts_on_nothing(tmp_path: Path) -> None:
-    team = _team(tmp_path, lambda request: "not json at all", QUESTIONS[:1])
+    team = await _team(tmp_path, lambda request: "not json at all", QUESTIONS[:1])
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     reply = await team.orch.handle("Postgres", run_id=reply.run_id)
@@ -277,7 +277,7 @@ async def test_the_reply_shows_no_internal_ids(tmp_path: Path) -> None:
             return json.dumps({"reply": f"Answered {task_id} (see prd@v1, run_0123456789abcdef)."})
         return tool_call("answer_pending", {"task_id": task_id, "text": "Postgres"})
 
-    team = _team(tmp_path, message, QUESTIONS[:1])
+    team = await _team(tmp_path, message, QUESTIONS[:1])
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     reply = await team.orch.handle("Postgres", run_id=reply.run_id)
@@ -314,7 +314,7 @@ async def test_a_change_to_work_an_answer_just_reopened_is_folded_in(tmp_path: P
 
 
 async def test_stopping_one_run_and_starting_another_drives_the_new_one(tmp_path: Path) -> None:
-    team = _team(
+    team = await _team(
         tmp_path,
         _then_reply(
             "Stopped that one and started the new one.",
@@ -346,7 +346,7 @@ async def test_running_out_of_budget_while_reading_pauses_and_acts_on_nothing(
         """The gateway refuses the call: the run is over budget."""
         raise BudgetExceeded("token cap reached", limit="tokens")
 
-    team = _team(tmp_path, message, QUESTIONS[:1])
+    team = await _team(tmp_path, message, QUESTIONS[:1])
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     reply = await team.orch.handle("Postgres", run_id=reply.run_id)
@@ -361,7 +361,7 @@ async def test_a_crash_while_reading_is_logged_and_acts_on_nothing(tmp_path: Pat
         """A bug in the loop."""
         raise RuntimeError("boom")
 
-    team = _team(tmp_path, message, QUESTIONS[:1])
+    team = await _team(tmp_path, message, QUESTIONS[:1])
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     reply = await team.orch.handle("Postgres", run_id=reply.run_id)

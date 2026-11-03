@@ -19,7 +19,7 @@ from orchestrator.harness import make_team
 
 
 async def test_build_runs_all_four_phases(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     reply = await team.orch.handle("Build a REST API that lists books")
     assert reply.kind == "done", reply.text
     run_id = reply.run_id
@@ -65,7 +65,7 @@ async def test_build_runs_all_four_phases(tmp_path: Path) -> None:
 
 
 async def test_research_question_gets_an_answer_and_no_code(tmp_path: Path) -> None:
-    team = make_team(tmp_path, kind="research_question")
+    team = await make_team(tmp_path, kind="research_question")
     reply = await team.orch.handle("Which Python web framework is fastest?")
     assert reply.kind == "done", reply.text
     assert reply.run_id is not None
@@ -112,7 +112,7 @@ async def test_work_packages_become_serial_engineer_tasks(tmp_path: Path) -> Non
         ],
     )
     script[AgentName.ARCHITECT] = lambda r: json.dumps(spec)
-    team = make_team(tmp_path, script=script)
+    team = await make_team(tmp_path, script=script)
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "done", reply.text
     assert reply.run_id

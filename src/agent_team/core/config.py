@@ -55,6 +55,10 @@ class LimitsConfig(_Cfg):
     max_attempts: int = 3
     max_upstream_reruns: int = 2
     max_concurrent_calls: int = 4
+    #: Attempts of each check (auditor task) before it fails closed.
+    max_check_attempts: int = 3
+    #: Wall-clock limit on one attempt of a task or a check.
+    task_timeout_s: float = 600.0
 
 
 class RetryConfig(_Cfg):

@@ -55,7 +55,7 @@ class Boom:
 
 
 async def test_ok_result_saves_artifact_and_moves_to_auditing(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     task = await _prd_task(team, tmp_path)
     result = await team.dispatcher.dispatch(task)
     assert result.status is ResultStatus.OK
@@ -70,7 +70,7 @@ async def test_ok_result_saves_artifact_and_moves_to_auditing(tmp_path: Path) ->
 
 
 async def test_exception_is_caught_with_traceback_and_retried(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     team.dispatcher.agents = {AgentName.PRODUCT: Boom(ValueError("bug in our code"))}  # type: ignore[dict-item]
     task = await _prd_task(team, tmp_path)
     result = await team.dispatcher.dispatch(task)
@@ -84,7 +84,7 @@ async def test_exception_is_caught_with_traceback_and_retried(tmp_path: Path) ->
 
 
 async def test_timeout_and_escalation_on_last_attempt(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     team.dispatcher.agents = {AgentName.PRODUCT: Boom(sleep=1)}  # type: ignore[dict-item]
     team.dispatcher.timeout_s = 0.01
     task = await _prd_task(team, tmp_path)
@@ -97,7 +97,7 @@ async def test_timeout_and_escalation_on_last_attempt(tmp_path: Path) -> None:
 
 
 async def test_budget_pauses_without_using_an_attempt(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     team.dispatcher.agents = {AgentName.PRODUCT: Boom(BudgetExceeded("cap", limit="usd"))}  # type: ignore[dict-item]
     task = await _prd_task(team, tmp_path)
     await team.dispatcher.dispatch(task)
@@ -116,7 +116,7 @@ async def test_orchestrator_pauses_run_on_budget(tmp_path: Path) -> None:
         raise BudgetExceeded("over budget", limit="max_usd_per_run")
 
     script[AgentName.PRODUCT] = broke
-    team = make_team(tmp_path, script=script)
+    team = await make_team(tmp_path, script=script)
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "stopped"
     assert reply.run_id is not None
@@ -124,7 +124,7 @@ async def test_orchestrator_pauses_run_on_budget(tmp_path: Path) -> None:
 
 
 async def test_envelope_errors_are_a_failed_attempt(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     task = await _prd_task(team, tmp_path)
     task.inputs = [ArtifactRef(kind="research_brief", version=7)]  # never saved
     await team.tasks.update_task(task)
@@ -134,7 +134,7 @@ async def test_envelope_errors_are_a_failed_attempt(tmp_path: Path) -> None:
 
 
 async def test_timeout_is_reported_not_raised(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     team.dispatcher.agents = {AgentName.PRODUCT: Boom(sleep=1)}  # type: ignore[dict-item]
     team.dispatcher.timeouts = {AgentName.PRODUCT: 0.01}
     task = await _prd_task(team, tmp_path)
@@ -144,7 +144,7 @@ async def test_timeout_is_reported_not_raised(tmp_path: Path) -> None:
 
 
 async def test_result_of_a_task_superseded_mid_attempt_is_dropped(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     task = await _prd_task(team, tmp_path)
     agent = default_agents()[AgentName.PRODUCT]
 
@@ -168,7 +168,7 @@ async def test_result_of_a_task_superseded_mid_attempt_is_dropped(tmp_path: Path
 async def test_feedback_reaches_only_its_own_line_of_work(tmp_path: Path) -> None:
     from agent_team.core.models import Feedback, FeedbackSource, TaskOrigin
 
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     run = await team.orch.start_run("Build a books API")
 
     def engineer(package: str, **kw: Any) -> Task:

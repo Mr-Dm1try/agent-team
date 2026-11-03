@@ -19,7 +19,7 @@ async def _pipeline_tasks(tmp_path: Path) -> set[tuple[Phase, AgentName]]:
         ("build", "Build a books API"),
         ("research_question", "Which Python web framework is fastest?"),
     ):
-        team = make_team(tmp_path / kind, kind=kind)
+        team = await make_team(tmp_path / kind, kind=kind)
         reply = await team.orch.handle(request)
         assert reply.kind == "done" and reply.run_id, reply.text
         for t in await team.tasks.list_tasks(reply.run_id):

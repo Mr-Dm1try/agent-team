@@ -14,7 +14,7 @@ from orchestrator.harness import make_team
 
 
 async def _ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     run = await team.tasks.get_run(reply.run_id)

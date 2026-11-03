@@ -10,6 +10,7 @@ from typing import Any
 
 from agents.scenario import PRD, team_script
 
+from agent_team.app import build_app
 from agent_team.core.artifacts import Artifact
 from agent_team.core.errors import BudgetExceeded
 from agent_team.core.models import (
@@ -26,24 +27,22 @@ from agent_team.core.models import (
     Verdict,
 )
 from agent_team.llm.types import LLMRequest
-from agent_team.orchestrator import Orchestrator, OrchestratorConfig
+from agent_team.orchestrator import Orchestrator
+from agent_team.orchestrator.policy import SimplePolicy
 from orchestrator.harness import Team, make_team
 
 
-def _fresh_orchestrator(team: Team, tmp_path: Path) -> Orchestrator:
+async def _fresh_orchestrator(team: Team) -> Orchestrator:
     """A new process over the same stores: nothing carried over in memory."""
-    return Orchestrator(
-        tasks=team.tasks,
-        artifacts=team.artifacts,
-        checkpoints=team.checkpoints,
-        decisions=team.decisions,
-        feedback=team.feedback,
-        verdicts=team.verdicts,
+    app = await build_app(
+        team.app.config,
+        stores=team.app.stores,
         bus=team.bus,
         llm=team.llm,
-        dispatcher=team.dispatcher,
-        config=OrchestratorConfig(runs_dir=tmp_path / "runs"),
+        auditor=team.auditor,
+        policy=SimplePolicy(),
     )
+    return app.orchestrator
 
 
 def _live(tasks: list[Task]) -> Counter[str]:
@@ -55,7 +54,7 @@ def _live(tasks: list[Task]) -> Counter[str]:
 
 
 async def test_finished_phases_survive_a_restart(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     from orchestrator.test_flows import failing
 
     team.auditor.fail_next["spec"] += [failing("R4", "REQ-1")] * 3
@@ -66,7 +65,7 @@ async def test_finished_phases_survive_a_restart(tmp_path: Path) -> None:
     assert all(t.status is TaskStatus.DONE for t in tasks if t.id in early)
 
     team.auditor.task_calls.clear()
-    reply = await _fresh_orchestrator(team, tmp_path).answer(reply.run_id, "Use one module")
+    reply = await (await _fresh_orchestrator(team)).answer(reply.run_id, "Use one module")
     assert reply.kind == "done", reply.text
     # The finished phases' tasks were neither run nor checked again.
     assert early.isdisjoint(team.auditor.task_calls)
@@ -75,7 +74,7 @@ async def test_finished_phases_survive_a_restart(tmp_path: Path) -> None:
 
 
 async def test_failed_check_kept_by_the_user(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     from orchestrator.test_flows import failing
 
     team.auditor.fail_next["prd"] += [failing("R3", "REQ-1")] * 3
@@ -94,7 +93,7 @@ async def test_failed_check_kept_by_the_user(tmp_path: Path) -> None:
 
 
 async def test_failed_check_comment_is_one_more_attempt(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     from orchestrator.test_flows import failing
 
     team.auditor.fail_next["prd"] += [failing("R3", "REQ-1")] * 3
@@ -108,7 +107,7 @@ async def test_failed_check_comment_is_one_more_attempt(tmp_path: Path) -> None:
 
 
 async def test_plan_that_fails_its_check_cannot_be_kept(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     from orchestrator.test_flows import failing
 
     team.auditor.fail_next["plan"] += [failing("P1", "ASK-1")] * 3
@@ -124,7 +123,7 @@ async def test_plan_that_fails_its_check_cannot_be_kept(tmp_path: Path) -> None:
 
 
 async def test_budget_during_an_audit_pauses_and_resumes(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     passing = team.auditor.audit_task
     calls: list[str] = []
 
@@ -153,7 +152,7 @@ async def test_budget_during_an_audit_pauses_and_resumes(tmp_path: Path) -> None
 
 
 async def test_an_auditor_crash_retries_the_check_not_the_task(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     passing = team.auditor.audit_task
     crashes: list[str] = []
 
@@ -179,7 +178,7 @@ async def test_an_auditor_crash_retries_the_check_not_the_task(tmp_path: Path) -
 
 
 async def test_a_check_that_keeps_failing_closes_and_asks(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     passing = team.auditor.audit_task
 
     async def audit(task: Task, artifact: Artifact | None, run: Run) -> Verdict:
@@ -202,7 +201,7 @@ async def test_a_check_that_keeps_failing_closes_and_asks(tmp_path: Path) -> Non
 
 
 async def test_reopening_the_plan_rebuilds_the_pipeline_once(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     before = _live(await team.tasks.list_tasks(reply.run_id))
@@ -218,7 +217,7 @@ async def test_reopen_supersedes_open_questions(tmp_path: Path) -> None:
     script = team_script()
     asked = dict(PRD, questions=[{"id": "Q-1", "text": "Paginate?", "why": "list size"}])
     script[AgentName.PRODUCT] = lambda r: json.dumps(asked)
-    team = make_team(tmp_path, script=script, review_mode=ReviewMode.QUESTIONS_ONLY)
+    team = await make_team(tmp_path, script=script, review_mode=ReviewMode.QUESTIONS_ONLY)
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "waiting" and reply.run_id
     run = await team.tasks.get_run(reply.run_id)
@@ -241,7 +240,7 @@ async def test_answer_to_an_escalation_without_output_reaches_the_agent(tmp_path
         return json.dumps(PRD)
 
     script[AgentName.PRODUCT] = flaky
-    team = make_team(tmp_path, script=script)
+    team = await make_team(tmp_path, script=script)
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "waiting" and reply.run_id
     reply = await team.orch.answer(reply.run_id, "Keep it to one endpoint")

@@ -44,7 +44,7 @@ async def _tasks(store: FakeTaskStore, run_id: str, kind: str) -> list[Task]:
 
 
 async def test_audit_failure_retries_with_findings(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     team.auditor.fail_next["prd"].append(failing())
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "done" and reply.run_id
@@ -60,7 +60,7 @@ async def test_audit_failure_retries_with_findings(tmp_path: Path) -> None:
 
 
 async def test_escalation_asks_the_user(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     team.auditor.fail_next["spec"] += [failing("R4", "REQ-1")] * 3
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "waiting" and reply.run_id
@@ -87,7 +87,7 @@ async def test_questions_only_mode_waits_for_answers(tmp_path: Path) -> None:
         return json.dumps(asked if len(calls) == 1 else answered)
 
     script[AgentName.PRODUCT] = product
-    team = make_team(tmp_path, script=script, review_mode=ReviewMode.QUESTIONS_ONLY)
+    team = await make_team(tmp_path, script=script, review_mode=ReviewMode.QUESTIONS_ONLY)
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "waiting" and reply.run_id
     assert reply.pending[0].question.startswith("Paginate?")
@@ -101,7 +101,7 @@ async def test_questions_only_mode_waits_for_answers(tmp_path: Path) -> None:
 
 
 async def test_every_phase_review_approve_and_comment(tmp_path: Path) -> None:
-    team = make_team(tmp_path, review_mode=ReviewMode.EVERY_PHASE)
+    team = await make_team(tmp_path, review_mode=ReviewMode.EVERY_PHASE)
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "waiting" and reply.run_id
     run_id = reply.run_id
@@ -130,7 +130,7 @@ async def test_research_request_creates_a_researcher_task(tmp_path: Path) -> Non
         return json.dumps(gap if len(calls) == 1 else SPEC)
 
     script[AgentName.ARCHITECT] = architect
-    team = make_team(tmp_path, script=script)
+    team = await make_team(tmp_path, script=script)
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "done", reply.text
     assert reply.run_id
@@ -169,7 +169,7 @@ class UpstreamPolicy:
 
 
 async def test_upstream_rerun_supersedes_and_rebuilds_downstream(tmp_path: Path) -> None:
-    team = make_team(tmp_path, policy=UpstreamPolicy())
+    team = await make_team(tmp_path, policy=UpstreamPolicy())
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "done", reply.text
     assert reply.run_id
@@ -221,7 +221,7 @@ class FixPolicy:
 
 async def test_fix_routes_findings_back_and_reruns_the_check(tmp_path: Path) -> None:
     policy = FixPolicy()
-    team = make_team(tmp_path, policy=policy)
+    team = await make_team(tmp_path, policy=policy)
     policy.tasks = team.tasks
     finding = Finding(
         id="f1", rule_id="S2", severity=Severity.BLOCKER, item="app.py", message="eval on input"
@@ -247,7 +247,7 @@ async def test_fix_routes_findings_back_and_reruns_the_check(tmp_path: Path) -> 
 
 
 async def test_resume_continues_an_interrupted_attempt(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     run = await team.orch.start_run("Build a books API")
     plan_task = (await team.tasks.list_tasks(run.id))[0]
     # Simulate a crash mid-attempt: task RUNNING with one checkpoint saved.
@@ -270,7 +270,7 @@ async def test_resume_continues_an_interrupted_attempt(tmp_path: Path) -> None:
 
 
 async def test_change_request_reopens_from_the_target(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     reply = await team.orch.request_change(
@@ -285,7 +285,7 @@ async def test_change_request_reopens_from_the_target(tmp_path: Path) -> None:
 
 
 async def test_auditor_crash_fails_closed(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
 
     async def broken(task: Task, artifact: Any, run: Run) -> Verdict:
         raise RuntimeError("judge offline")
@@ -335,7 +335,7 @@ class EscalateThenStrongerPolicy(UpstreamPolicy):
 
 
 async def test_escalate_then_stronger_model(tmp_path: Path) -> None:
-    team = make_team(tmp_path, policy=EscalateThenStrongerPolicy())
+    team = await make_team(tmp_path, policy=EscalateThenStrongerPolicy())
     team.auditor.fail_next["prd"].append(failing())
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "done", reply.text
@@ -349,7 +349,7 @@ async def test_escalate_then_stronger_model(tmp_path: Path) -> None:
 
 
 async def test_tool_events_carry_the_auditor_keys(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     await team.orch.handle("Build a books API")
     after = [e for e in team.bus.events if e.name.value == "tool_call_after"]
     assert after and {"tool", "args", "result", "is_error", "blocked"} <= set(after[0].data)
