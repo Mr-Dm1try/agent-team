@@ -151,7 +151,7 @@ def code_ctx(run: Run, code: str = GOOD_CODE, **change_kw: Any) -> AuditContext:
     change = CodeChange(**data)
     ctx = AuditContext(
         run=run,
-        scope=RuleScope.PHASE,
+        scope=RuleScope.TASK,
         phase=Phase.IMPLEMENTATION,
         outputs=[(eng, change)],
         latest={"spec": spec(), "prd": prd()},
@@ -164,7 +164,7 @@ def code_ctx(run: Run, code: str = GOOD_CODE, **change_kw: Any) -> AuditContext:
 
 
 def test_p1_valid_plan(run: Run) -> None:
-    ok = AuditContext(run=run, scope=RuleScope.PHASE, phase=Phase.PLANNING, latest={"plan": plan()})
+    ok = AuditContext(run=run, scope=RuleScope.TASK, phase=Phase.PLANNING, latest={"plan": plan()})
     assert blockers(run_helper("P1", ok)) == []
 
     bad_plan = plan(
@@ -172,7 +172,7 @@ def test_p1_valid_plan(run: Run) -> None:
         research_questions=[ResearchQuestion(question="which host?", ask="ASK-9")],
     )
     bad = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.PLANNING, latest={"plan": bad_plan}
+        run=run, scope=RuleScope.TASK, phase=Phase.PLANNING, latest={"plan": bad_plan}
     )
     messages = " | ".join(f.message for f in run_helper("P1", bad).findings)
     assert "ASK-1 is used twice" in messages
@@ -182,7 +182,7 @@ def test_p1_valid_plan(run: Run) -> None:
 
 
 def test_p1_missing_plan_is_a_hit(run: Run) -> None:
-    ctx = AuditContext(run=run, scope=RuleScope.PHASE, phase=Phase.PLANNING)
+    ctx = AuditContext(run=run, scope=RuleScope.TASK, phase=Phase.PLANNING)
     assert blockers(run_helper("P1", ctx)) == ["plan"]
 
 
@@ -363,18 +363,18 @@ def test_r12_minimal_revision(run: Run) -> None:
 
 
 def test_r3_testable_prd(run: Run) -> None:
-    ok = AuditContext(run=run, scope=RuleScope.PHASE, phase=Phase.PRD, latest={"prd": prd()})
+    ok = AuditContext(run=run, scope=RuleScope.TASK, phase=Phase.PRD, latest={"prd": prd()})
     assert blockers(run_helper("R3", ok)) == []
     untestable = prd(
         requirements=[Requirement(id="REQ-1", text="x", asks=["ASK-1"], acceptance_criteria=[])]
     )
-    bad = AuditContext(run=run, scope=RuleScope.PHASE, phase=Phase.PRD, latest={"prd": untestable})
+    bad = AuditContext(run=run, scope=RuleScope.TASK, phase=Phase.PRD, latest={"prd": untestable})
     assert blockers(run_helper("R3", bad)) == ["REQ-1"]
 
 
 def test_r4_spec_coverage(run: Run) -> None:
     ok = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.SPEC, latest={"prd": prd(), "spec": spec()}
+        run=run, scope=RuleScope.TASK, phase=Phase.SPEC, latest={"prd": prd(), "spec": spec()}
     )
     assert blockers(run_helper("R4", ok)) == []
     gappy = spec(
@@ -382,7 +382,7 @@ def test_r4_spec_coverage(run: Run) -> None:
         checks=[PlannedCheck(id="CHK-1", criteria=["AC-1.1"], kind="unit_test", description="d")],
     )
     bad = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.SPEC, latest={"prd": prd(), "spec": gappy}
+        run=run, scope=RuleScope.TASK, phase=Phase.SPEC, latest={"prd": prd(), "spec": gappy}
     )
     assert sorted(blockers(run_helper("R4", bad))) == ["AC-2.1", "REQ-2"]
 
@@ -400,7 +400,7 @@ def test_r4_work_packages(run: Run) -> None:
         ],
     )
     ok = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.SPEC, latest={"prd": prd(), "spec": ok_spec}
+        run=run, scope=RuleScope.TASK, phase=Phase.SPEC, latest={"prd": prd(), "spec": ok_spec}
     )
     assert blockers(run_helper("R4", ok)) == []
     bad_spec = spec(
@@ -411,7 +411,7 @@ def test_r4_work_packages(run: Run) -> None:
         ],
     )
     bad = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.SPEC, latest={"prd": prd(), "spec": bad_spec}
+        run=run, scope=RuleScope.TASK, phase=Phase.SPEC, latest={"prd": prd(), "spec": bad_spec}
     )
     messages = " | ".join(f.message for f in run_helper("R4", bad).findings)
     assert "unknown component cache" in messages
@@ -421,7 +421,7 @@ def test_r4_work_packages(run: Run) -> None:
 
 def test_r9_coverage_and_scope(run: Run) -> None:
     ok = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.PRD, latest={"plan": plan(), "prd": prd()}
+        run=run, scope=RuleScope.TASK, phase=Phase.PRD, latest={"plan": plan(), "prd": prd()}
     )
     assert run_helper("R9", ok).findings == []
 
@@ -442,7 +442,7 @@ def test_r9_coverage_and_scope(run: Run) -> None:
         ]
     )
     bad = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.PRD, latest={"plan": plan(), "prd": missed}
+        run=run, scope=RuleScope.TASK, phase=Phase.PRD, latest={"plan": plan(), "prd": missed}
     )
     found = run_helper("R9", bad).findings
     assert {(f.item, f.severity) for f in found} == {
@@ -457,7 +457,7 @@ def test_r9_coverage_and_scope(run: Run) -> None:
         ]
     )
     spec_ctx = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.SPEC, latest={"prd": prd(), "spec": extra}
+        run=run, scope=RuleScope.TASK, phase=Phase.SPEC, latest={"prd": prd(), "spec": extra}
     )
     found = run_helper("R9", spec_ctx).findings
     assert [(f.item, f.severity) for f in found] == [("admin", Severity.WARNING)]
@@ -471,10 +471,10 @@ def test_r11_questions_resolved(run: Run) -> None:
             Question(id="Q-2", text="auth?", why="w", assumption="none"),
         ]
     )
-    ok = AuditContext(run=run, scope=RuleScope.PHASE, phase=Phase.PRD, outputs=[(task, answered)])
+    ok = AuditContext(run=run, scope=RuleScope.TASK, phase=Phase.PRD, outputs=[(task, answered)])
     assert blockers(run_helper("R11", ok)) == []
     open_q = prd(questions=[Question(id="Q-1", text="db?", why="w")])
-    bad = AuditContext(run=run, scope=RuleScope.PHASE, phase=Phase.PRD, outputs=[(task, open_q)])
+    bad = AuditContext(run=run, scope=RuleScope.TASK, phase=Phase.PRD, outputs=[(task, open_q)])
     assert blockers(run_helper("R11", bad)) == ["Q-1"]
 
 
@@ -524,7 +524,7 @@ def test_r7_qa_clean(run: Run) -> None:
         issues=[QAIssue(severity="warning", text="slow")],
     )
     ok = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.IMPLEMENTATION, outputs=[(qa, clean)]
+        run=run, scope=RuleScope.TASK, phase=Phase.IMPLEMENTATION, outputs=[(qa, clean)]
     )
     assert blockers(run_helper("R7", ok)) == []
     dirty = QAReport(
@@ -534,7 +534,7 @@ def test_r7_qa_clean(run: Run) -> None:
         issues=[QAIssue(severity="blocker", text="crash", files=["app/main.py"])],
     )
     bad = AuditContext(
-        run=run, scope=RuleScope.PHASE, phase=Phase.IMPLEMENTATION, outputs=[(qa, dirty)]
+        run=run, scope=RuleScope.TASK, phase=Phase.IMPLEMENTATION, outputs=[(qa, dirty)]
     )
     assert sorted(blockers(run_helper("R7", bad))) == ["AC-1.1", "app/main.py"]
 

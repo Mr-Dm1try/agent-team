@@ -82,7 +82,6 @@ CREATE TABLE IF NOT EXISTS verdicts (
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS verdicts_by_task ON verdicts (task_id, seq);
-CREATE INDEX IF NOT EXISTS verdicts_by_gate ON verdicts (run_id, scope, phase, seq);
 """
 
 Params = Sequence[Any]

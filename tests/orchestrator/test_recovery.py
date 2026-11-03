@@ -1,5 +1,5 @@
-"""Failure paths: restarts, failed gates, budget stops during audits, re-opened plans
-and questions left open by a re-open."""
+"""Failure paths: restarts, failed checks the user keeps or comments on, budget stops
+during audits, re-opened plans and questions left open by a re-open."""
 
 from __future__ import annotations
 
@@ -14,13 +14,10 @@ from agent_team.core.artifacts import Artifact
 from agent_team.core.errors import BudgetExceeded
 from agent_team.core.models import (
     AgentName,
-    Finding,
     Phase,
     ReviewMode,
-    RuleScope,
     Run,
     RunStatus,
-    Severity,
     Task,
     TaskOrigin,
     TaskStatus,
@@ -28,7 +25,6 @@ from agent_team.core.models import (
 )
 from agent_team.llm.types import LLMRequest
 from agent_team.orchestrator import Orchestrator, OrchestratorConfig
-from agent_team.orchestrator.gates import passed_gates
 from orchestrator.harness import Team, make_team
 
 
@@ -49,21 +45,11 @@ def _fresh_orchestrator(team: Team, tmp_path: Path) -> Orchestrator:
     )
 
 
-def _failed_gate(run: Run, phase: Phase) -> Verdict:
-    return Verdict(
-        run_id=run.id,
-        scope=RuleScope.PHASE,
-        phase=phase,
-        passed=False,
-        findings=[Finding(rule_id="R7", severity=Severity.BLOCKER, message="no NFRs")],
-    )
-
-
 def _live(tasks: list[Task]) -> Counter[str]:
     return Counter(t.output_kind for t in tasks if t.status is not TaskStatus.SUPERSEDED)
 
 
-async def test_passed_gates_survive_a_restart(tmp_path: Path) -> None:
+async def test_finished_phases_survive_a_restart(tmp_path: Path) -> None:
     team = make_team(tmp_path)
     from orchestrator.test_flows import failing
 
@@ -71,58 +57,65 @@ async def test_passed_gates_survive_a_restart(tmp_path: Path) -> None:
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "waiting" and reply.run_id
     tasks = await team.tasks.list_tasks(reply.run_id)
-    assert await passed_gates(team.verdicts, reply.run_id, tasks) == {Phase.PLANNING, Phase.PRD}
+    early = {t.id for t in tasks if t.phase in (Phase.PLANNING, Phase.PRD)}
+    assert all(t.status is TaskStatus.DONE for t in tasks if t.id in early)
 
-    team.auditor.gates.clear()
+    team.auditor.task_calls.clear()
     reply = await _fresh_orchestrator(team, tmp_path).answer(reply.run_id, "Use one module")
     assert reply.kind == "done", reply.text
-    # The earlier gates were not audited again.
-    assert team.auditor.gates == [Phase.SPEC, Phase.IMPLEMENTATION]
+    # The finished phases' tasks were neither run nor checked again.
+    assert early.isdisjoint(team.auditor.task_calls)
+    kinds = {t.output_kind for t in await team.tasks.list_tasks(reply.run_id)}
+    assert {"code_change", "qa_report"} <= kinds
 
 
-async def test_failed_gate_accepted_by_the_user(tmp_path: Path) -> None:
+async def test_failed_check_kept_by_the_user(tmp_path: Path) -> None:
     team = make_team(tmp_path)
-    passing = team.auditor.audit_gate
+    from orchestrator.test_flows import failing
 
-    async def gate(run: Run, phase: Phase) -> Verdict:
-        if phase is Phase.PRD and Phase.PRD not in team.auditor.gates:
-            team.auditor.gates.append(phase)
-            return _failed_gate(run, phase)
-        return await passing(run, phase)
-
-    team.auditor.audit_gate = gate  # type: ignore[method-assign]
+    team.auditor.fail_next["prd"] += [failing("R3", "REQ-1")] * 3
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "waiting" and reply.run_id
-    assert (await team.tasks.get_task(reply.pending[0].task_id)).phase is Phase.PRD
+    asked = await team.tasks.get_task(reply.pending[0].task_id)
+    assert asked.phase is Phase.PRD and "'approve' to keep the work" in asked.objective
     reply = await team.orch.answer(reply.run_id, "approve")
     assert reply.kind == "done", reply.text
-    assert team.auditor.gates.count(Phase.PRD) == 1
-    accepted = (await team.verdicts.for_gate(reply.run_id, Phase.PRD))[-1]
-    assert accepted.passed and accepted.summary and "R7" in accepted.summary
-    assert (
-        len([t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd"]) == 1
-    )
+    prds = [t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd"]
+    assert len(prds) == 1 and prds[0].status is TaskStatus.DONE and prds[0].attempt == 3
+    accepted = await team.verdicts.latest_for_task(prds[0].id)
+    assert accepted is not None and accepted.passed and accepted.model == "user"
+    assert accepted.summary and "R3" in accepted.summary
+    assert any(d.choice == "accept as is" for d in team.decisions.items)
 
 
-async def test_failed_gate_comment_reopens_the_phase(tmp_path: Path) -> None:
+async def test_failed_check_comment_is_one_more_attempt(tmp_path: Path) -> None:
     team = make_team(tmp_path)
-    passing = team.auditor.audit_gate
+    from orchestrator.test_flows import failing
 
-    async def gate(run: Run, phase: Phase) -> Verdict:
-        if phase is Phase.PRD and Phase.PRD not in team.auditor.gates:
-            team.auditor.gates.append(phase)
-            return _failed_gate(run, phase)
-        return await passing(run, phase)
-
-    team.auditor.audit_gate = gate  # type: ignore[method-assign]
+    team.auditor.fail_next["prd"] += [failing("R3", "REQ-1")] * 3
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     reply = await team.orch.answer(reply.run_id, "Add a latency target")
     assert reply.kind == "done", reply.text
-    assert team.auditor.gates.count(Phase.PRD) == 2
     prds = [t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd"]
-    assert [t.status for t in prds] == [TaskStatus.SUPERSEDED, TaskStatus.DONE]
+    assert len(prds) == 1 and prds[0].status is TaskStatus.DONE and prds[0].attempt == 4
     assert any(f.text == "Add a latency target" for _, f in team.feedback.items)
+
+
+async def test_plan_that_fails_its_check_cannot_be_kept(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    from orchestrator.test_flows import failing
+
+    team.auditor.fail_next["plan"] += [failing("P1", "ASK-1")] * 3
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "waiting" and reply.run_id
+    asked = await team.tasks.get_task(reply.pending[0].task_id)
+    assert "keep the work" not in asked.objective
+    reply = await team.orch.answer(reply.run_id, "approve")
+    # Taken as guidance: the planner tries once more, then the pipeline is built.
+    assert reply.kind == "done", reply.text
+    plan = next(t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "plan")
+    assert plan.attempt == 4
 
 
 async def test_budget_during_an_audit_pauses_and_resumes(tmp_path: Path) -> None:

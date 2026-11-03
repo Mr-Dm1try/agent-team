@@ -1,11 +1,12 @@
 """The orchestrator: the only agent you talk to.
 
 It works out what each message means (orchestrator/messages.py), starts runs, and
-drives a run through the fixed phases:
-plan, dispatch ready tasks (in parallel, Engineer tasks one at a time), audit each
-output, apply the verdict policy's decisions, audit each phase gate, and finish with a
-whole-run audit. Every choice goes to the decision log. Run state lives in the task
-store, so ``drive`` can be called again after a crash and picks up where it left off.
+drives a run through the fixed phases: plan, dispatch ready tasks (in parallel,
+Engineer tasks one at a time), check each task's output at its end, apply the verdict
+policy's decisions, move to the next phase once all of a phase's tasks are done, and
+finish with a whole-run audit. Every choice goes to the decision log. Run state lives
+in the task store, so ``drive`` can be called again after a crash and picks up where
+it left off.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import asyncio
 from pathlib import Path
 
 from agent_team.agents.planner import kind_from_objective, planning_objective
-from agent_team.core.artifacts import Artifact, Plan, Spec
+from agent_team.core.artifacts import Artifact, Plan, Spec, plain_kind
 from agent_team.core.models import (
     AgentName,
     Decision,
@@ -31,10 +32,8 @@ from agent_team.core.models import (
     Task,
     TaskOrigin,
     TaskStatus,
-    Verdict,
     new_id,
 )
-from agent_team.orchestrator import gates
 from agent_team.orchestrator.base import (
     PAUSING,
     OrchestratorConfig,
@@ -44,14 +43,14 @@ from agent_team.orchestrator.control import create_user_task
 from agent_team.orchestrator.conversation import ConversationMixin
 from agent_team.orchestrator.decisions import DecisionsMixin
 from agent_team.orchestrator.dispatcher import INTERRUPTED, PAUSING_ERRORS
-from agent_team.orchestrator.phases import PhaseMachine
+from agent_team.orchestrator.lineage import ancestry
+from agent_team.orchestrator.phases import PhaseMachine, expert_tasks, reviewed
 from agent_team.orchestrator.planning import RULE as PIPELINE
 from agent_team.orchestrator.planning import expand_plan, implementation_tasks
 from agent_team.orchestrator.policy import SimplePolicy
 from agent_team.orchestrator.replies import (
     Reply,
     done_reply,
-    plain_kind,
     upper_first,
     waiting_reply,
 )
@@ -145,15 +144,21 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             if await self._settle(run, tasks):
                 continue
             machine = PhaseMachine(self._kind(tasks))
-            phase = machine.current(tasks, await gates.passed_gates(self.verdicts, run.id, tasks))
+            phase = machine.current(tasks)
+            if await self._phases_finished(run, machine, tasks, before=phase):
+                continue  # a review was requested
             if phase is None:
                 return await self._finish_run(run)
             await self._phase_started(run, phase)
 
             open_tasks = machine.open_tasks(tasks, phase)
             if not open_tasks:
-                await self._gate(run, phase, machine, tasks)
-                continue
+                # The phase has no work yet: Implementation is built from the spec.
+                if phase is Phase.IMPLEMENTATION and await self._start_implementation(run, tasks):
+                    continue
+                return Reply(
+                    kind="error", text=f"Run has no work for {phase.value}.", run_id=run.id
+                )
 
             ready = await self._ready(run.id, phase)
             if not ready:
@@ -237,8 +242,14 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             return  # superseded by a reopen while the auditor ran
         task.finding_ids = [f.id for f in verdict.findings if f.severity is Severity.BLOCKER]
         task = await self.tasks.update_task(task)
-        # Earlier verdicts only; the policy compares them with this one (no-progress).
-        history = [v for v in await self.verdicts.for_task(task.id) if v.id != verdict.id]
+        # Earlier verdicts of the task and the tasks it was reopened from; the policy
+        # compares the last one with this one (no progress).
+        history = [
+            v
+            for t in ancestry(task, await self.tasks.list_tasks(run.id))
+            for v in await self.verdicts.for_task(t.id)
+            if v.id != verdict.id
+        ]
         decisions = await self.policy.on_task_verdict(run, task, verdict, history)
         if not decisions and not verdict.passed:
             decisions = await SimplePolicy().on_task_verdict(run, task, verdict, history)
@@ -269,18 +280,19 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             reason=f"{plan.request_kind} pipeline with one Researcher task per research question",
         )
 
-    async def _start_implementation(self, run: Run, tasks: list[Task]) -> None:
-        """When the Spec gate passes: one Engineer task per work package, then QA."""
+    async def _start_implementation(self, run: Run, tasks: list[Task]) -> bool:
+        """Once the spec is done: one Engineer task per work package, then QA. Returns
+        whether tasks were created."""
         live_tasks = [t for t in tasks if t.status is not TaskStatus.SUPERSEDED]
-        if gates.expert_tasks(live_tasks, Phase.IMPLEMENTATION):
-            return
+        if expert_tasks(live_tasks, Phase.IMPLEMENTATION):
+            return False
         spec_tasks = [
             t
             for t in live_tasks
             if t.agent is AgentName.ARCHITECT and t.status is TaskStatus.DONE and t.output
         ]
         if not spec_tasks:
-            return
+            return False
         spec_task = spec_tasks[-1]
         assert spec_task.output is not None
         spec = await self.artifacts.load(run.id, spec_task.output)
@@ -303,8 +315,9 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             spec_task,
             new_tasks,
             inputs={"spec": str(spec_task.output), "work_packages": packages},
-            reason=f"spec gate passed; {len(packages)} work package(s), run one at a time",
+            reason=f"spec done; {len(packages)} work package(s), run one at a time",
         )
+        return True
 
     async def _record_pipeline(
         self,
@@ -330,53 +343,50 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             )
         )
 
-    # --- gates and the end of a run -------------------------------------------------
+    # --- the end of a phase and of a run --------------------------------------------
 
-    async def _gate(self, run: Run, phase: Phase, machine: PhaseMachine, tasks: list[Task]) -> None:
-        """Audit a finished phase; on a pass start the next phase's work and ask for a review if the
-        mode wants one."""
-        try:
-            verdict = await self.auditor.audit_gate(run, phase)
-        except PAUSING as exc:
-            await self._pause(run.id, exc)
-            return
-        except Exception as exc:
-            verdict = failed_verdict(run, f"auditor error: {exc}", phase=phase)
-        verdict = gates.as_gate_verdict(verdict, phase)
-        decisions = await self.policy.on_gate_verdict(run, phase, verdict)
-        if not decisions and not verdict.passed:
-            decisions = await SimplePolicy().on_gate_verdict(run, phase, verdict)
-        await self._save_verdict(verdict)
-        if decisions:
-            for d in decisions:
-                await self._apply(run, d, verdict)
-            return
-        await self.bus.emit(
-            Event(name=EventName.PHASE_FINISHED, run_id=run.id, data={"phase": phase.value})
-        )
-        if phase is Phase.SPEC:
-            await self._start_implementation(run, tasks)
-        if (
-            run.review_mode is ReviewMode.EVERY_PHASE
-            and machine.next(phase) is not None
-            and not gates.reviewed(tasks, phase)
-        ):
-            await self._request_review(run, phase, tasks, verdict)
+    async def _phases_finished(
+        self, run: Run, machine: PhaseMachine, tasks: list[Task], *, before: Phase | None
+    ) -> bool:
+        """For each finished phase before ``before`` (all of them when None): emit
+        phase_finished once per process, like phase_started, and in ``every_phase``
+        mode ask for a review of it if its current output wasn't reviewed. Returns
+        whether a review was requested."""
+        for phase in machine.phases:
+            if phase is before:
+                break
+            newest = max(expert_tasks(tasks, phase), key=lambda t: t.created_at)
+            key = (phase, newest.id)
+            if key not in self._finished.setdefault(run.id, set()):
+                self._finished[run.id].add(key)
+                await self.bus.emit(
+                    Event(name=EventName.PHASE_FINISHED, run_id=run.id, data={"phase": phase.value})
+                )
+            if (
+                run.review_mode is ReviewMode.EVERY_PHASE
+                and machine.next(phase) is not None
+                and not reviewed(tasks, phase)
+            ):
+                await self._request_review(run, phase, tasks)
+                return True
+        return False
 
-    async def _request_review(
-        self, run: Run, phase: Phase, tasks: list[Task], gate: Verdict
-    ) -> None:
-        """Ask the user to review a phase, with the audit summary, warnings and outputs."""
-        experts = gates.expert_tasks(tasks, phase)
+    async def _request_review(self, run: Run, phase: Phase, tasks: list[Task]) -> None:
+        """Ask the user to review a phase, with each output's summary and the warnings
+        from the checks at the end of its tasks."""
+        experts = expert_tasks(tasks, phase)
         outputs = [str(t.output) for t in experts if t.output]
-        summaries = [f"Audit: {gate.summary}"] if gate.summary else []
-        summaries += [
-            f"Warning: {f.message}" for f in gate.findings if f.severity is Severity.WARNING
-        ]
+        summaries: list[str] = []
         for t in experts:
             if t.output:
                 art = await self.artifacts.load(run.id, t.output)
                 summaries.append(f"{upper_first(plain_kind(t.output.kind))}: {art.summary}")
+            latest = await self.verdicts.latest_for_task(t.id)
+            summaries += [
+                f"Warning: {f.message}"
+                for f in (latest.findings if latest else [])
+                if f.severity is Severity.WARNING
+            ]
         child = await create_user_task(
             self.tasks,
             run,

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from agent_team.audit.auditor import AUDIT_RULE
-from agent_team.audit.policy import CodeVerdictPolicy, PolicyLimits, decide_gate, decide_task
+from agent_team.audit.policy import CodeVerdictPolicy, PolicyLimits, decide_task
 from agent_team.core.artifacts import ArtifactRef, CodeChange, QAReport
 from agent_team.core.models import (
+    AUDIT_RULE,
     AgentName,
     Decision,
     DecisionKind,
@@ -32,14 +32,12 @@ def blocker(rule: str, item: str | None = None, artifact: str | None = None) -> 
     return Finding(rule_id=rule, severity=Severity.BLOCKER, item=item, artifact=ref, message="bad")
 
 
-def verdict(
-    run: Run, *findings: Finding, task: Task | None = None, phase: Phase | None = None
-) -> Verdict:
+def verdict(run: Run, *findings: Finding, task: Task | None = None) -> Verdict:
     return Verdict(
         run_id=run.id,
-        scope=RuleScope.TASK if task else RuleScope.PHASE,
+        scope=RuleScope.TASK if task else RuleScope.RUN,
         task_id=task.id if task else None,
-        phase=phase,
+        phase=task.phase if task else None,
         passed=not any(f.severity is Severity.BLOCKER for f in findings),
         findings=list(findings),
     )
@@ -199,10 +197,11 @@ def test_fail_closed_verdict_escalates_and_asks(run: Run) -> None:
     ]
 
 
-# --- gate verdicts -------------------------------------------------------------------
+# --- faults in other tasks' outputs (a QA task's end check) --------------------------
 
 
 def impl_tasks(run: Run) -> tuple[list[Task], dict[str, CodeChange | QAReport]]:
+    """Two Engineer tasks and the QA task whose end check is being decided."""
     t0 = utcnow()
     e1 = make_task(
         run,
@@ -231,9 +230,9 @@ def impl_tasks(run: Run) -> tuple[list[Task], dict[str, CodeChange | QAReport]]:
         Phase.IMPLEMENTATION,
         "qa_report",
         attempt=1,
-        status=TaskStatus.DONE,
+        status=TaskStatus.AUDITING,
         output=ArtifactRef.parse("qa_report@v1"),
-        depends_on=[e2.id],
+        depends_on=[e1.id, e2.id],
         created_at=t0 + timedelta(seconds=2),
     )
     outputs: dict[str, CodeChange | QAReport] = {
@@ -244,18 +243,25 @@ def impl_tasks(run: Run) -> tuple[list[Task], dict[str, CodeChange | QAReport]]:
     return [e1, e2, qa], outputs
 
 
-def test_gate_pass_returns_no_decisions(run: Run) -> None:
-    tasks, outputs = impl_tasks(run)
-    v = verdict(run, phase=Phase.IMPLEMENTATION)
-    assert decide_gate(run, Phase.IMPLEMENTATION, v, None, tasks, outputs, [], LIMITS) == []
+def qa_check(
+    run: Run,
+    tasks: list[Task],
+    outputs: dict[str, CodeChange | QAReport],
+    *findings: Finding,
+    history: list[Verdict] | None = None,
+) -> list[Decision]:
+    """Decide the end check of the QA task (the last of ``tasks``) with ``findings``."""
+    qa = tasks[-1]
+    v = verdict(run, *findings, task=qa)
+    return decide_task(run, qa, v, history or [], [], LIMITS, tasks, outputs)
 
 
-def test_gate_failure_routes_each_finding_to_its_producer(run: Run) -> None:
+def test_a_fault_in_another_task_is_fixed_there_and_later_tasks_rerun(run: Run) -> None:
     tasks, outputs = impl_tasks(run)
     e1, e2, qa = tasks
-    v = verdict(run, blocker("S2", "app/db.py", "code_change@v1"), phase=Phase.IMPLEMENTATION)
-    [fix] = decide_gate(run, Phase.IMPLEMENTATION, v, None, tasks, outputs, [], LIMITS)
-    assert fix.kind is DecisionKind.GATE_FIX
+    v = verdict(run, blocker("S2", "app/db.py", "code_change@v1"), task=qa)
+    [fix] = decide_task(run, qa, v, [], [], LIMITS, tasks, outputs)
+    assert fix.kind is DecisionKind.FIX and fix.rule == "policy.fix"
     assert fix.inputs["task_id"] == e1.id
     assert fix.inputs["finding_ids"] == [v.findings[0].id]
     assert fix.inputs["rerun_after"] == [e2.id, qa.id]  # later tasks re-run too
@@ -268,61 +274,141 @@ def test_qa_blockers_become_engineer_fixes_then_a_fresh_qa(run: Run) -> None:
         run,
         blocker("R7", "app/routes.py", "qa_report@v1"),
         blocker("R7", "AC-1.1", "qa_report@v1"),
-        phase=Phase.IMPLEMENTATION,
+        task=qa,
     )
-    [fix] = decide_gate(run, Phase.IMPLEMENTATION, v, None, tasks, outputs, [], LIMITS)
+    [fix] = decide_task(run, qa, v, [], [], LIMITS, tasks, outputs)
     assert fix.inputs["task_id"] == e2.id  # wrote routes.py; the AC goes to the last engineer
     assert len(fix.inputs["finding_ids"]) == 2
     assert fix.inputs["rerun_after"] == [qa.id]
 
 
-def test_gate_finding_by_file_without_artifact(run: Run) -> None:
+def test_qa_own_fault_is_retried_on_qa(run: Run) -> None:
     tasks, outputs = impl_tasks(run)
-    v = verdict(run, blocker("R5", "app/db.py"), phase=Phase.IMPLEMENTATION)
-    [fix] = decide_gate(run, Phase.IMPLEMENTATION, v, None, tasks, outputs, [], LIMITS)
+    check = qa_check(run, tasks, outputs, blocker("R1", "results", "qa_report@v1"))
+    assert kinds(check) == [DecisionKind.RETRY]
+
+
+def test_a_finding_by_file_without_artifact_goes_to_its_writer(run: Run) -> None:
+    tasks, outputs = impl_tasks(run)
+    [fix] = qa_check(run, tasks, outputs, blocker("R5", "app/db.py"))
     assert fix.inputs["task_id"] == tasks[0].id
 
 
-def test_gate_upstream_fault_reopens_the_earlier_phase(run: Run) -> None:
+def test_an_upstream_fault_reopens_the_earlier_phase(run: Run) -> None:
     tasks, outputs = impl_tasks(run)
+    qa = tasks[-1]
     arch = make_task(
         run, AgentName.ARCHITECT, Phase.SPEC, "spec", output=ArtifactRef.parse("spec@v1")
     )
-    v = verdict(run, blocker("R10", "GET /books", "spec@v1"), phase=Phase.IMPLEMENTATION)
-    [d] = decide_gate(run, Phase.IMPLEMENTATION, v, None, [*tasks, arch], outputs, [], LIMITS)
-    assert d.kind is DecisionKind.UPSTREAM_RERUN
+    v = verdict(run, blocker("R10", "GET /books", "spec@v1"), task=qa)
+    decisions = decide_task(run, qa, v, [], [], LIMITS, [*tasks, arch], outputs)
+    assert kinds(decisions) == [DecisionKind.ESCALATE, DecisionKind.UPSTREAM_RERUN]
+    d = decisions[1]
     assert d.inputs["artifact"] == "spec@v1" and d.inputs["producer_task_id"] == arch.id
-    assert d.inputs["gate"] == "implementation"
-    # and if the gate still fails after that re-run, ask the user
-    again = verdict(run, blocker("R10", "GET /books", "spec@v2"), phase=Phase.IMPLEMENTATION)
-    [ask] = decide_gate(
-        run, Phase.IMPLEMENTATION, again, None, [*tasks, arch], outputs, [d], LIMITS
-    )
-    assert ask.kind is DecisionKind.ASK_USER
+    assert d.inputs["phase"] == "spec" and "gate" not in d.inputs
+    # the QA task re-run after that (its copy points back at it) still fails: ask
+    copy = qa.model_copy(update={"id": "task_copy", "parent_task_id": qa.id})
+    again = verdict(run, blocker("R10", "GET /books", "spec@v2"), task=copy)
+    out = decide_task(run, copy, again, [], [d], LIMITS, [*tasks, arch], outputs)
+    assert out[-1].kind is DecisionKind.ASK_USER
 
 
-def test_gate_no_progress_asks_the_user(run: Run) -> None:
+def test_the_same_failure_after_a_fix_is_no_progress_and_asks(run: Run) -> None:
     tasks, outputs = impl_tasks(run)
-    first = verdict(run, blocker("S2", "app/db.py", "code_change@v1"), phase=Phase.IMPLEMENTATION)
-    second = verdict(run, blocker("S2", "app/db.py", "code_change@v3"), phase=Phase.IMPLEMENTATION)
-    decisions = decide_gate(run, Phase.IMPLEMENTATION, second, first, tasks, outputs, [], LIMITS)
+    first = verdict(run, blocker("S2", "app/db.py", "code_change@v1"), task=tasks[-1])
+    again = blocker("S2", "app/db.py", "code_change@v3")
+    decisions = qa_check(run, tasks, outputs, again, history=[first])
     assert kinds(decisions) == [DecisionKind.NO_PROGRESS, DecisionKind.ASK_USER]
 
 
-def test_gate_fix_cap_asks_the_user(run: Run) -> None:
+def test_a_fix_for_a_task_without_attempts_left_asks_the_user(run: Run) -> None:
     tasks, outputs = impl_tasks(run)
     tasks[0] = tasks[0].model_copy(update={"attempt": 3})
-    v = verdict(run, blocker("S2", "app/db.py", "code_change@v1"), phase=Phase.IMPLEMENTATION)
-    [ask] = decide_gate(run, Phase.IMPLEMENTATION, v, None, tasks, outputs, [], LIMITS)
-    assert ask.kind is DecisionKind.ASK_USER and ask.rule == "policy.gate_cap"
+    [ask] = qa_check(run, tasks, outputs, blocker("S2", "app/db.py", "code_change@v1"))
+    assert ask.kind is DecisionKind.ASK_USER and ask.rule == "policy.fix_cap"
 
 
-def test_gate_fail_closed_asks_the_user(run: Run) -> None:
+def test_qa_without_a_report_is_its_own_fault(run: Run) -> None:
     tasks, outputs = impl_tasks(run)
-    v = verdict(run, blocker(AUDIT_RULE), phase=Phase.IMPLEMENTATION)
-    assert kinds(decide_gate(run, Phase.IMPLEMENTATION, v, None, tasks, outputs, [], LIMITS)) == [
-        DecisionKind.ASK_USER
-    ]
+    for rule in ("R1", "R7"):  # no report, or one R7 can't read: nothing names an artifact
+        check = qa_check(run, tasks, outputs, blocker(rule, "qa_report"))
+        assert kinds(check) == [DecisionKind.RETRY], rule
+
+
+def test_the_checkers_own_blockers_ride_on_the_fix(run: Run) -> None:
+    tasks, outputs = impl_tasks(run)
+    e1, _, qa = tasks
+    v = verdict(
+        run,
+        blocker("S2", "app/db.py", "code_change@v1"),
+        blocker("R5", "app/db.py"),
+        blocker("R11", "Q-1", "qa_report@v1"),
+        task=qa,
+    )
+    [fix] = decide_task(run, qa, v, [], [], LIMITS, tasks, outputs)
+    assert fix.inputs["task_id"] == e1.id
+    assert fix.inputs["finding_ids"] == [v.findings[0].id, v.findings[1].id]
+    assert fix.inputs["checker"] == qa.id
+    assert fix.inputs["checker_finding_ids"] == [v.findings[2].id]
+
+
+def test_a_mixed_fix_with_one_task_out_of_attempts_only_asks(run: Run) -> None:
+    tasks, outputs = impl_tasks(run)
+    tasks[0] = tasks[0].model_copy(update={"attempt": 3})
+    decisions = qa_check(
+        run,
+        tasks,
+        outputs,
+        blocker("S2", "app/db.py", "code_change@v1"),
+        blocker("S2", "app/routes.py", "code_change@v2"),
+    )
+    # A fix for the other task would supersede the QA task the question hangs on.
+    assert kinds(decisions) == [DecisionKind.ASK_USER]
+    assert decisions[0].task_id == tasks[-1].id
+
+
+def test_a_requested_brief_in_a_later_phase_is_not_upstream_of_itself(run: Run) -> None:
+    brief = make_task(
+        run,
+        AgentName.RESEARCHER,
+        Phase.PRD,
+        "research_brief",
+        attempt=1,
+        output=ArtifactRef.parse("research_brief@v3"),
+    )
+    v = verdict(run, blocker("R2", "claim 1", "research_brief@v3"), task=brief)
+    assert kinds(decide_task(run, brief, v, [], [], LIMITS, [brief], {})) == [DecisionKind.RETRY]
+
+
+def test_a_brief_blaming_the_plan_asks_instead_of_rebuilding_it(run: Run) -> None:
+    planner = make_task(
+        run,
+        AgentName.ORCHESTRATOR,
+        Phase.PLANNING,
+        "plan",
+        status=TaskStatus.DONE,
+        output=ArtifactRef.parse("plan@v1"),
+    )
+    brief = make_task(
+        run,
+        AgentName.RESEARCHER,
+        Phase.PLANNING,
+        "research_brief",
+        attempt=3,
+        output=ArtifactRef.parse("research_brief@v1"),
+    )
+    v = verdict(run, blocker("P2", "Which database?", "plan@v1"), task=brief)
+    decisions = decide_task(run, brief, v, [], [], LIMITS, [planner, brief], {})
+    assert DecisionKind.FIX not in kinds(decisions)
+    assert kinds(decisions)[0] is DecisionKind.ESCALATE
+
+
+def test_superseded_tasks_are_never_fix_targets(run: Run) -> None:
+    tasks, outputs = impl_tasks(run)
+    stale = tasks[0].model_copy(update={"status": TaskStatus.SUPERSEDED})
+    finding = blocker("S2", "app/db.py", "code_change@v1")
+    decisions = qa_check(run, [stale, *tasks[1:]], outputs, finding)
+    assert all(d.task_id != stale.id for d in decisions)
 
 
 # --- the VerdictPolicy implementation over the stores --------------------------------
@@ -346,21 +432,11 @@ async def test_policy_class_reads_the_stores(run: Run) -> None:
     )
     assert policy.limits == PolicyLimits(max_upstream_reruns=1, stronger_model="strong-2")
 
-    gate = verdict(run, blocker("S2", "app/db.py", "code_change@v1"), phase=Phase.IMPLEMENTATION)
-    await verdicts.save(gate)  # saved before the policy runs: it must not count as previous
-    assert kinds(await policy.on_gate_verdict(run, Phase.IMPLEMENTATION, gate)) == [
-        DecisionKind.GATE_FIX
-    ]
-    # a new policy instance (as after a resume) reads the gate history from the store
-    resumed = CodeVerdictPolicy(tasks=store, artifacts=artifacts, decisions=log, verdicts=verdicts)
-    same = verdict(run, blocker("S2", "app/db.py", "code_change@v3"), phase=Phase.IMPLEMENTATION)
-    again = await resumed.on_gate_verdict(run, Phase.IMPLEMENTATION, same)
-    assert kinds(again) == [DecisionKind.NO_PROGRESS, DecisionKind.ASK_USER]
-    # another phase's gate history doesn't count
-    other = await resumed.on_gate_verdict(
-        run, Phase.SPEC, same.model_copy(update={"phase": Phase.SPEC})
-    )
-    assert DecisionKind.NO_PROGRESS not in kinds(other)
+    # The phase's outputs come from the store, so a finding by file finds its writer.
+    qa = tasks[-1]
+    check = verdict(run, blocker("R5", "app/routes.py"), task=qa)
+    [fix] = await policy.on_task_verdict(run, qa, check, [])
+    assert fix.kind is DecisionKind.FIX and fix.task_id == tasks[1].id
 
     task = tasks[1].model_copy(update={"attempt": 3})
     v = verdict(run, blocker("R1", "x", "code_change@v2"), task=task)
@@ -386,12 +462,3 @@ def test_a_passed_retry_resets_no_progress(run: Run) -> None:
     assert kinds(decide_task(run, task, again, [failed, passed], [], LIMITS)) == [
         DecisionKind.RETRY
     ]
-
-
-def test_superseded_tasks_are_never_gate_fix_targets(run: Run) -> None:
-    tasks, outputs = impl_tasks(run)
-    stale = tasks[0].model_copy(update={"status": TaskStatus.SUPERSEDED})
-    v = verdict(run, blocker("S2", "app/db.py", "code_change@v1"), phase=Phase.IMPLEMENTATION)
-    decisions = decide_gate(run, Phase.IMPLEMENTATION, v, None, [stale, *tasks[1:]], outputs, [],
-                            LIMITS)  # fmt: skip
-    assert all(d.task_id != stale.id for d in decisions)

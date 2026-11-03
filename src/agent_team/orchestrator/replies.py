@@ -5,20 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from agent_team.core.artifacts import Artifact
+from agent_team.core.artifacts import Artifact, plain_kind
 from agent_team.core.interfaces import ArtifactStore
 from agent_team.core.models import AgentName, Run, Task, TaskOrigin, TaskStatus
-
-PLAIN_KINDS = {
-    "plan": "the plan",
-    "research_brief": "the research",
-    "research_answer": "the answer",
-    "prd": "the requirements",
-    "spec": "the design",
-    "code_change": "the code",
-    "qa_report": "the QA check",
-}
-
 
 PLAIN_AGENTS = {
     AgentName.ORCHESTRATOR: "the planner",
@@ -38,11 +27,6 @@ def plain_agent(agent: AgentName) -> str:
 def upper_first(text: str) -> str:
     """The text with its first letter capitalised and the rest left as it is."""
     return text[:1].upper() + text[1:]
-
-
-def plain_kind(kind: str) -> str:
-    """An artifact kind as the user would say it."""
-    return PLAIN_KINDS.get(kind, kind.replace("_", " "))
 
 
 @dataclass

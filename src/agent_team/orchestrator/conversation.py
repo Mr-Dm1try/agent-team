@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import traceback
 
+from agent_team.core.artifacts import plain_kind
 from agent_team.core.errors import BudgetExceeded
 from agent_team.core.models import (
     AgentName,
@@ -22,19 +23,22 @@ from agent_team.core.models import (
     FeedbackSource,
     Phase,
     RequestKind,
+    RuleScope,
     Run,
     RunStatus,
     Task,
     TaskOrigin,
     TaskStatus,
+    Verdict,
 )
-from agent_team.orchestrator import gates
 from agent_team.orchestrator.base import (
     APPROVE,
-    GATE_QUESTION,
+    ESCALATION,
     PAUSING,
     RUN_QUESTION,
+    TASK_QUESTION,
     OrchestratorBase,
+    can_keep,
 )
 from agent_team.orchestrator.control import create_user_task
 from agent_team.orchestrator.lineage import downstream
@@ -49,7 +53,8 @@ from agent_team.orchestrator.messages import (
     interpret,
     scrub,
 )
-from agent_team.orchestrator.replies import Reply, pending_items, plain_kind
+from agent_team.orchestrator.phases import expert_tasks
+from agent_team.orchestrator.replies import Reply, pending_items
 
 #: The order actions are carried out in: answers and a new run, then changes, then a stop.
 _ORDER = {"answer_pending": 0, "start_run": 0, "request_change": 1, "stop_run": 2}
@@ -256,7 +261,7 @@ class ConversationMixin(OrchestratorBase):
         """Close one pending item with the user's words, without driving the run. Returns
         a reply only when the answer stopped the run; anything else the user should hear
         is added to ``notes``."""
-        if target.reason == "escalation" and text.strip().lower() == "stop":
+        if target.reason == ESCALATION and text.strip().lower() == "stop":
             await self.tasks.transition(target.id, TaskStatus.DONE, reason="user said stop")
             await self.stop(run.id, "the user stopped the run at an escalation")
             return Reply(kind="stopped", text="Stopped the run.", run_id=run.id)
@@ -265,12 +270,19 @@ class ConversationMixin(OrchestratorBase):
             if not APPROVE.match(text):
                 await self._comment(run, target.phase, text)
             return None
-        if target.reason in (GATE_QUESTION, RUN_QUESTION):
+        if target.reason == RUN_QUESTION:
             return await self._answer_audit_question(run, target, text)
         if target.reason == CONFIRM_CHANGE:
             await self._confirm_change(run, target, text, notes)
             return None
         parent = await self.tasks.get_task(target.parent_task_id) if target.parent_task_id else None
+        if (
+            parent is not None
+            and target.reason in (TASK_QUESTION, ESCALATION)
+            and APPROVE.match(text)
+            and await self._keep_as_is(run, target, parent)
+        ):
+            return None
         await self.feedback.add(
             run.id,
             Feedback(
@@ -285,9 +297,48 @@ class ConversationMixin(OrchestratorBase):
         await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
         return None
 
+    async def _keep_as_is(self, run: Run, target: Task, parent: Task) -> bool:
+        """The user approved work that failed its check: keep it as it is. A passing
+        verdict records the acceptance, so the phase can finish. Returns False when
+        there is nothing to keep, and the answer is taken as guidance instead."""
+        failed = await self.verdicts.latest_for_task(parent.id)
+        if parent.status is not TaskStatus.ESCALATED or not can_keep(parent, failed):
+            return False
+        assert failed is not None  # can_keep needs a failed verdict
+        blockers = "; ".join(f"{f.rule_id}: {f.message}" for f in failed.blockers)
+        await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
+        await self._save_verdict(
+            Verdict(
+                run_id=run.id,
+                scope=RuleScope.TASK,
+                task_id=parent.id,
+                phase=parent.phase,
+                passed=True,
+                summary=f"Accepted by the user despite: {blockers}"[:1000],
+                model="user",
+            )
+        )
+        await self._record(
+            Decision(
+                run_id=run.id,
+                task_id=parent.id,
+                kind=DecisionKind.ASK_USER,
+                inputs={"question": target.objective, "user_task": target.id},
+                choice="accept as is",
+                reason="the user kept work that failed its check",
+                made_by="code",
+                rule="audit_question",
+            )
+        )
+        parent = await self.tasks.get_task(parent.id)
+        parent.depends_on = [d for d in parent.depends_on if d != target.id]
+        await self.tasks.update_task(parent)
+        await self.tasks.transition(parent.id, TaskStatus.DONE, reason="accepted by the user")
+        return True
+
     async def _answer_audit_question(self, run: Run, target: Task, text: str) -> Reply | None:
-        """A failed gate or run audit asked the user. 'stop' stops, an approval accepts
-        the work as it is, and anything else is a comment that reopens the phase."""
+        """A failed run audit asked the user. 'stop' stops, an approval accepts the work
+        as it is, and anything else is a comment that reopens the last phase."""
         await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
         reply = text.strip()
         if reply.lower() == "stop":
@@ -306,15 +357,11 @@ class ConversationMixin(OrchestratorBase):
                 rule="audit_question",
             )
         )
-        if accepted and target.reason == RUN_QUESTION:
+        if accepted:
             await self._set_status(run.id, RunStatus.DONE)
             await self.bus.emit(
                 Event(name=EventName.RUN_FINISHED, run_id=run.id, data={"accepted": True})
             )
-        elif accepted:
-            history = await self.verdicts.for_gate(run.id, target.phase)
-            failed = history[-1] if history else None
-            await self._save_verdict(gates.accepted_gate(run, target.phase, failed))
         else:
             await self._comment(run, target.phase, reply)
         return None
@@ -322,7 +369,7 @@ class ConversationMixin(OrchestratorBase):
     async def _comment(self, run: Run, phase: Phase, text: str) -> None:
         """Send the user's comment to the phase's first tasks and re-run from there."""
         tasks = await self.tasks.list_tasks(run.id)
-        experts = gates.expert_tasks(tasks, phase)
+        experts = expert_tasks(tasks, phase)
         in_phase = {t.id for t in experts}
         roots = [t for t in experts if not any(d in in_phase for d in t.depends_on)]
         for t in roots:

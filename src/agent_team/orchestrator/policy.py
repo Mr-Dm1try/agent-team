@@ -4,12 +4,11 @@ passed in. It implements the VerdictPolicy Protocol:
 - pass -> no decisions (the orchestrator marks the task done)
 - fail with attempts left -> RETRY
 - fail with none left -> ESCALATE
-- a failed gate -> ASK_USER with the blockers
 """
 
 from __future__ import annotations
 
-from agent_team.core.models import Decision, DecisionKind, Phase, Run, Task, Verdict
+from agent_team.core.models import Decision, DecisionKind, Run, Task, Verdict
 
 
 class SimplePolicy:
@@ -45,22 +44,5 @@ class SimplePolicy:
                 reason=f"failed {', '.join(rules)} with no attempts left",
                 made_by="code",
                 rule="simple_policy.escalate",
-            )
-        ]
-
-    async def on_gate_verdict(self, run: Run, phase: Phase, verdict: Verdict) -> list[Decision]:
-        """Ask the user about a failed gate."""
-        if verdict.passed:
-            return []
-        lines = "; ".join(f"{f.rule_id} {f.item or ''}: {f.message}" for f in verdict.blockers)
-        return [
-            Decision(
-                run_id=run.id,
-                kind=DecisionKind.ASK_USER,
-                inputs={"question": f"The {phase.value} gate failed: {lines}. How to proceed?"},
-                choice="ask the user",
-                reason="gate failed and this policy has no automatic fix routing",
-                made_by="code",
-                rule="simple_policy.gate",
             )
         ]

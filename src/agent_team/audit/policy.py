@@ -2,19 +2,22 @@
 
 Code makes every choice here, so each Decision has ``made_by="code"`` and names the
 policy branch in ``rule``. The branches follow docs/DESIGN.md, "What a verdict
-triggers":
+triggers". Every check runs at the end of a task (there are no phase gates), so the
+policy first works out whose output each blocker is about:
 
 1. Pass: no decisions; the orchestrator marks the task done.
-2. Fail with attempts left: RETRY as a revision of the last output, findings attached.
-   If the retry fails the same rules on the same items as the attempt before, that is
-   NO_PROGRESS and it goes straight to escalation.
-3. Fail with no attempts left: ESCALATE. A finding that blames an upstream artifact
-   reopens the earliest one at fault (UPSTREAM_RERUN); a fault in the task's own
-   output gets one STRONGER_MODEL attempt before the user is asked.
-4. A phase gate fails: each blocker goes to the task that produced the item at fault
-   (GATE_FIX, a revision), and the tasks after it in the phase re-run too. QA's
-   blocking issues become Engineer fixes for the files named, then a fresh QA review.
-5. Still failing after an upstream re-run, or past a cap: ASK_USER.
+2. A blocker on an earlier phase's artifact reopens the earliest one at fault
+   (UPSTREAM_RERUN) right away, since retrying this task can't fix it.
+3. A blocker on another task's output in the same phase revises that task (FIX), and
+   the tasks after it re-run too. QA's blocking issues and failed criteria become
+   Engineer fixes for the files named, then a fresh QA review.
+4. Otherwise the fault is the task's own. With attempts left: RETRY as a revision of
+   the last output, findings attached. With none left: ESCALATE, with one
+   STRONGER_MODEL attempt before the user is asked.
+5. A failure that repeats the same rules on the same items as the verdict before it,
+   on this task or the one it was reopened from, is NO_PROGRESS: no more retries or
+   fixes; the user is asked.
+6. Still failing after an upstream re-run, or past a cap: ASK_USER.
 
 Two more come from the auditor section: a dangerous agent action (S5, S6, S7) STOPs
 the run and asks the user, since it already happened, and this wins over everything
@@ -23,8 +26,8 @@ fail-closed verdict (an ``AUDIT`` finding) escalates and asks, since the expert 
 at fault.
 
 Extra ``inputs`` keys beyond the contract's: ``finding_ids`` on most kinds,
-``previous_output`` on RETRY, ``phase``/``gate``/``producer_task_id`` on
-UPSTREAM_RERUN and ``rerun_after`` (task ids) on GATE_FIX.
+``previous_output`` on RETRY, ``phase``/``producer_task_id`` on UPSTREAM_RERUN and
+``rerun_after`` (task ids) on FIX.
 """
 
 from __future__ import annotations
@@ -33,11 +36,12 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent_team.audit.auditor import AUDIT_RULE
 from agent_team.audit.evidence import KIND_ORDER, KIND_PHASE
-from agent_team.core.artifacts import Artifact, ArtifactRef, CodeChange
+from agent_team.core.artifacts import Artifact, ArtifactRef, CodeChange, plain_kind
 from agent_team.core.interfaces import ArtifactStore, DecisionLog, TaskStore, VerdictStore
 from agent_team.core.models import (
+    AUDIT_RULE,
+    DANGEROUS_ACTION_RULES,
     AgentName,
     Decision,
     DecisionKind,
@@ -48,8 +52,6 @@ from agent_team.core.models import (
     TaskStatus,
     Verdict,
 )
-
-DANGEROUS_ACTION_RULES = frozenset({"S5", "S6", "S7"})
 
 
 @dataclass(frozen=True)
@@ -118,18 +120,6 @@ def _lineage(task: Task) -> set[str]:
     return {task.id} | ({task.parent_task_id} if task.parent_task_id else set())
 
 
-def _earliest_upstream(findings: Iterable[Finding], below: int) -> ArtifactRef | None:
-    """The most upstream artifact a finding blames, below a given kind rank."""
-    upstream = [
-        f.artifact
-        for f in findings
-        if f.artifact is not None and KIND_ORDER.get(f.artifact.kind, 99) < below
-    ]
-    if not upstream:
-        return None
-    return min(upstream, key=lambda r: (KIND_ORDER.get(r.kind, 99), r.version))
-
-
 def _producer(ref: ArtifactRef, tasks: Iterable[Task]) -> Task | None:
     """The task that produced an artifact version, else the latest of that kind."""
     exact = [t for t in tasks if t.output == ref]
@@ -137,6 +127,91 @@ def _producer(ref: ArtifactRef, tasks: Iterable[Task]) -> Task | None:
         return exact[-1]
     same_kind = [t for t in tasks if t.output is not None and t.output.kind == ref.kind]
     return max(same_kind, key=lambda t: t.created_at) if same_kind else None
+
+
+# --- whose fault a blocker is ------------------------------------------------------
+
+
+def _is_upstream(ref: ArtifactRef, task: Task) -> bool:
+    """Whether ``ref`` comes before ``task``'s own output: a kind ranked below it from
+    an earlier phase, or the plan, which every other task builds on. Work of the same
+    phase is fixed in place instead (see ``route``). A Researcher asked for research
+    during a later phase writes a brief, which is never upstream of itself."""
+    rank = KIND_ORDER.get(ref.kind, 99)
+    if rank >= KIND_ORDER.get(task.output_kind, 99):
+        return False
+    return ref.kind == "plan" or KIND_PHASE.get(ref.kind) is not task.phase
+
+
+def _earliest_upstream(findings: Iterable[Finding], task: Task) -> ArtifactRef | None:
+    """The most upstream artifact a finding blames, if any is upstream of ``task``."""
+    upstream = [f.artifact for f in findings if f.artifact and _is_upstream(f.artifact, task)]
+    if not upstream:
+        return None
+    return min(upstream, key=lambda r: (KIND_ORDER.get(r.kind, 99), r.version))
+
+
+def route(
+    finding: Finding, task: Task, phase_tasks: list[Task], outputs: Mapping[str, Artifact]
+) -> Task | None:
+    """The other task in ``task``'s phase whose output a finding is about, or None
+    when the fault is the task's own (or upstream)."""
+    others = [t for t in phase_tasks if t.id != task.id]
+    engineers = [t for t in others if t.agent is AgentName.ENGINEER]
+
+    def wrote(path: str) -> Task | None:
+        """The latest Engineer task whose code change wrote ``path``."""
+        hits = [
+            t
+            for t in engineers
+            if isinstance(outputs.get(t.id), CodeChange) and path in outputs[t.id].files_written  # type: ignore[union-attr]
+        ]
+        return hits[-1] if hits else None
+
+    ref = finding.artifact
+    item = (finding.item or "").strip()
+    by_file = wrote(item.split(":")[0]) if item else None
+    if task.agent is AgentName.QA:
+        # QA reviews the whole solution: the blocking issues in its report become
+        # Engineer fixes, and so does an unattributed finding on a file an Engineer
+        # wrote. Anything else unattributed (no report, a bad report) is QA's own.
+        if ref is not None and ref.kind == "qa_report" and finding.rule_id == "R7":
+            return by_file or (engineers[-1] if engineers else None)
+        if ref is None:
+            return by_file
+    if ref is None or ref == task.output or KIND_PHASE.get(ref.kind) is not task.phase:
+        return None
+    return _producer(ref, others)
+
+
+@dataclass
+class _Fix:
+    """The findings routed to one other task in the phase."""
+
+    task: Task
+    findings: list[Finding] = field(default_factory=list)
+
+
+def downstream(task: Task, phase_tasks: list[Task], exclude: set[str]) -> list[Task]:
+    """Tasks in the phase that build on ``task``, directly or not, plus a fresh QA
+    review after any Engineer fix."""
+    found: dict[str, Task] = {}
+    frontier = {task.id}
+    while frontier:
+        nxt = {
+            t.id
+            for t in phase_tasks
+            if t.id not in found and t.id != task.id and frontier & set(t.depends_on)
+        }
+        for t in phase_tasks:
+            if t.id in nxt:
+                found[t.id] = t
+        frontier = nxt
+    if task.agent is AgentName.ENGINEER:
+        for t in phase_tasks:
+            if t.agent is AgentName.QA:
+                found.setdefault(t.id, t)
+    return [t for t in phase_tasks if t.id in found and t.id not in exclude]
 
 
 # --- task verdicts -------------------------------------------------------------------
@@ -150,14 +225,16 @@ def decide_task(
     past: list[Decision],
     limits: PolicyLimits,
     tasks: list[Task] | None = None,
+    outputs: Mapping[str, Artifact] | None = None,
 ) -> list[Decision]:
-    """Decisions for one task verdict. ``history`` is the task's earlier verdicts,
-    oldest first; ``past`` is the run's decision log so far."""
+    """Decisions for one task's end check. ``history`` is the earlier verdicts of the
+    task and of the tasks it was reopened from, oldest first; ``past`` is the run's
+    decision log so far; ``tasks`` the run's tasks and ``outputs`` the loaded output of
+    each live task in the phase, by task id (for routing fixes)."""
     if verdict.passed and not verdict.blockers:
         return []
     blockers = verdict.blockers
     fids = _ids(blockers)
-    out: list[Decision] = []
 
     dangerous = [f for f in blockers if f.rule_id in DANGEROUS_ACTION_RULES]
     if dangerous:
@@ -175,7 +252,7 @@ def decide_task(
             _ask(
                 run,
                 task.id,
-                f"Task {task.id} ({task.agent.value}) did something unsafe: "
+                f"The {_who(task)} did something unsafe: "
                 f"{_summary(dangerous)}. The run is stopped. How should I proceed?",
                 "policy.dangerous_action",
                 _ids(dangerous),
@@ -197,28 +274,83 @@ def decide_task(
             _ask(
                 run,
                 task.id,
-                f"The audit of task {task.id} failed: {_summary(blockers)}. "
-                "Re-run the audit, or how should I proceed?",
+                f"The check of the {_who(task)}'s work couldn't be completed: "
+                f"{_summary(blockers)}. Re-run the check, or how should I proceed?",
                 "policy.fail_closed",
                 fids,
             ),
         ]
 
-    no_progress = False
+    live = [t for t in tasks or [] if t.status is not TaskStatus.SUPERSEDED]
+    lineage = _lineage(task)
     earlier = [v for v in history if v.id != verdict.id]
-    if earlier and not earlier[-1].passed and _blocker_keys(earlier[-1]) == _blocker_keys(verdict):
-        no_progress = True
+    no_progress = bool(
+        earlier and not earlier[-1].passed and _blocker_keys(earlier[-1]) == _blocker_keys(verdict)
+    )
+    upstream = _earliest_upstream(blockers, task)
+    phase_tasks = sorted(
+        (
+            t
+            for t in live
+            if t.phase is task.phase and t.agent not in (AgentName.USER, AgentName.AUDITOR)
+        ),
+        key=lambda t: t.created_at,
+    )
+    fixes: dict[str, _Fix] = {}
+    if upstream is None:
+        for finding in blockers:
+            target = route(finding, task, phase_tasks, outputs or {})
+            if target is not None:
+                fixes.setdefault(target.id, _Fix(target)).findings.append(finding)
+
+    out: list[Decision] = []
+    if no_progress:
         out.append(
             _decision(
                 run,
                 DecisionKind.NO_PROGRESS,
                 task_id=task.id,
                 choice="escalate now",
-                reason="the retry failed the same rules on the same items: " + _summary(blockers),
+                reason="it failed the same rules on the same items as before: "
+                + _summary(blockers),
                 rule="policy.no_progress",
                 finding_ids=fids,
             )
         )
+        if fixes:  # fixing the same items again won't help
+            out.append(
+                _ask(
+                    run,
+                    task.id,
+                    f"The {_who(task)}'s check keeps failing after fixes: "
+                    f"{_summary(blockers)}. How should I proceed?",
+                    "policy.no_progress",
+                    fids,
+                )
+            )
+            return out
+
+    if upstream is not None:
+        out.append(
+            _decision(
+                run,
+                DecisionKind.ESCALATE,
+                task_id=task.id,
+                choice="escalate",
+                reason=f"the fault is upstream, in {upstream}: " + _summary(blockers),
+                rule="policy.escalate",
+                finding_ids=fids,
+            )
+        )
+        out.append(
+            _upstream_or_ask(run, task.id, upstream, blockers, past, limits, live, lineage=lineage)
+        )
+        return out
+
+    if fixes:
+        routed = {f.id for fix in fixes.values() for f in fix.findings}
+        own = [f for f in blockers if f.id not in routed]
+        return _fix_decisions(run, task, fixes, phase_tasks, own)
 
     if not no_progress and task.attempt < task.max_attempts:
         out.append(
@@ -248,26 +380,6 @@ def decide_task(
             finding_ids=fids,
         )
     )
-
-    lineage = _lineage(task)
-    own_rank = KIND_ORDER.get(task.output_kind, 99)
-    upstream = _earliest_upstream(blockers, own_rank)
-    if upstream is not None:
-        out.append(
-            _upstream_or_ask(
-                run,
-                task.id,
-                upstream,
-                blockers,
-                past,
-                limits,
-                tasks or [],
-                lineage=lineage,
-                gate=None,
-            )
-        )
-        return out
-
     tried_stronger = task.model == limits.stronger_model or any(
         d.kind is DecisionKind.STRONGER_MODEL and d.task_id in lineage for d in past
     )
@@ -276,9 +388,8 @@ def decide_task(
             _ask(
                 run,
                 task.id,
-                f"Task {task.id} ({task.agent.value}) still fails after "
-                f"its attempts and the stronger model: {_summary(blockers)}. "
-                "How should I proceed?",
+                f"The {_who(task)} still fails its check after its attempts and the "
+                f"stronger model: {_summary(blockers)}. How should I proceed?",
                 "policy.ask_after_stronger_model",
                 fids,
             )
@@ -297,6 +408,70 @@ def decide_task(
             )
         )
     return out
+
+
+def _fix_decisions(
+    run: Run,
+    task: Task,
+    fixes: Mapping[str, _Fix],
+    phase_tasks: list[Task],
+    own: list[Finding],
+) -> list[Decision]:
+    """A FIX for each other task at fault, re-running the tasks after it and the task
+    whose check found it (a fresh check once the fix is in). The checking task's own
+    blockers ride on the first FIX, as feedback for its re-run. When any task at fault
+    has no attempts left, nothing is fixed and the user is asked, since the check
+    can't pass without that work."""
+    stuck = [
+        f
+        for fix in fixes.values()
+        if fix.task.attempt >= fix.task.max_attempts
+        for f in fix.findings
+    ]
+    if stuck:
+        return [
+            _ask(
+                run,
+                task.id,
+                f"The {_who(task)}'s check failed and the work at fault has no attempts "
+                f"left: {_summary(stuck)}. How should I proceed?",
+                "policy.fix_cap",
+                _ids(stuck),
+            )
+        ]
+    out: list[Decision] = []
+    for fix in fixes.values():
+        after = downstream(fix.task, phase_tasks, set(fixes))
+        if all(t.id != task.id for t in after):
+            after.append(task)
+        out.append(
+            _decision(
+                run,
+                DecisionKind.FIX,
+                task_id=fix.task.id,
+                choice=f"revise the {fix.task.agent.value} task {fix.task.id}"
+                + (f", then re-run {len(after)} later tasks" if after else ""),
+                reason=f"the {_who(task)}'s check found: {_summary(fix.findings)}",
+                rule="policy.fix",
+                finding_ids=_ids(fix.findings),
+                rerun_after=[t.id for t in after],
+                **(
+                    {"checker": task.id, "checker_finding_ids": _ids(own)}
+                    if own and not out
+                    else {}
+                ),
+            )
+        )
+    return out
+
+
+def _who(task: Task) -> str:
+    """The task's agent in plain words, for questions to the user."""
+    return {
+        AgentName.ORCHESTRATOR: "planner",
+        AgentName.PRODUCT: "product manager",
+        AgentName.QA: "QA reviewer",
+    }.get(task.agent, task.agent.value)
 
 
 def _ask(run: Run, task_id: str | None, question: str, rule: str, fids: list[str]) -> Decision:
@@ -318,7 +493,7 @@ def _ask(run: Run, task_id: str | None, question: str, rule: str, fids: list[str
 
 def _upstream_or_ask(
     run: Run,
-    task_id: str | None,
+    task_id: str,
     upstream: ArtifactRef,
     blockers: list[Finding],
     past: list[Decision],
@@ -326,25 +501,20 @@ def _upstream_or_ask(
     tasks: list[Task],
     *,
     lineage: set[str],
-    gate: Phase | None,
 ) -> Decision:
     """Reopen the upstream artifact, or ask the user when a cap or a repeat applies."""
     fids = _ids(blockers)
     already = [
         d
         for d in past
-        if d.kind is DecisionKind.UPSTREAM_RERUN
-        and (
-            (d.task_id is not None and d.task_id in lineage)
-            or (gate and d.inputs.get("gate") == gate.value)
-        )
+        if d.kind is DecisionKind.UPSTREAM_RERUN and d.task_id is not None and d.task_id in lineage
     ]
-    where = f"task {task_id}" if task_id else f"the {gate.value if gate else ''} gate"
+    name = plain_kind(upstream.kind)
     if already:
         return _ask(
             run,
             task_id,
-            f"{where} still fails after re-running {already[-1].inputs.get('artifact')}: "
+            f"The work still fails its check after redoing {name}: "
             f"{_summary(blockers)}. How should I proceed?",
             "policy.ask_after_upstream_rerun",
             fids,
@@ -353,8 +523,8 @@ def _upstream_or_ask(
         return _ask(
             run,
             task_id,
-            f"{where} needs {upstream} reopened, but the run already used "
-            f"its {limits.max_upstream_reruns} upstream re-runs: {_summary(blockers)}. "
+            f"The work needs {name} redone, but the run already used its "
+            f"{limits.max_upstream_reruns} redos of earlier work: {_summary(blockers)}. "
             "How should I proceed?",
             "policy.upstream_cap",
             fids,
@@ -365,201 +535,13 @@ def _upstream_or_ask(
         DecisionKind.UPSTREAM_RERUN,
         task_id=task_id,
         choice=f"reopen {upstream} and update everything built on it",
-        reason=f"{where} fails because of {upstream}: {_summary(blockers)}",
+        reason=f"task {task_id} fails because of {upstream}: {_summary(blockers)}",
         rule="policy.upstream_rerun",
         artifact=str(upstream),
         phase=KIND_PHASE.get(upstream.kind, Phase.PLANNING).value,
-        gate=gate.value if gate else None,
         producer_task_id=producer.id if producer else None,
         finding_ids=fids,
     )
-
-
-# --- gate verdicts -------------------------------------------------------------------
-
-
-@dataclass
-class _Fix:
-    """The findings routed to one task at a gate."""
-
-    task: Task
-    findings: list[Finding] = field(default_factory=list)
-
-
-def decide_gate(
-    run: Run,
-    phase: Phase,
-    verdict: Verdict,
-    previous: Verdict | None,
-    tasks: list[Task],
-    outputs: Mapping[str, Artifact],
-    past: list[Decision],
-    limits: PolicyLimits,
-) -> list[Decision]:
-    """Decisions for a phase gate verdict. ``tasks`` are the run's tasks, ``outputs``
-    the loaded output artifact of each task by task id, ``previous`` the gate's
-    last verdict for this phase."""
-    if verdict.passed and not verdict.blockers:
-        return []
-    blockers = verdict.blockers
-    fids = _ids(blockers)
-    live = [t for t in tasks if t.status is not TaskStatus.SUPERSEDED]
-    phase_tasks = sorted(
-        (
-            t
-            for t in live
-            if t.phase is phase and t.agent not in (AgentName.USER, AgentName.AUDITOR)
-        ),
-        key=lambda t: t.created_at,
-    )
-
-    if any(f.rule_id == AUDIT_RULE for f in blockers):
-        return [
-            _ask(
-                run,
-                None,
-                f"The {phase.value} gate audit failed: {_summary(blockers)}. "
-                "Re-run the audit, or how should I proceed?",
-                "policy.fail_closed",
-                fids,
-            )
-        ]
-
-    if (
-        previous is not None
-        and not previous.passed
-        and _blocker_keys(previous) == _blocker_keys(verdict)
-    ):
-        return [
-            _decision(
-                run,
-                DecisionKind.NO_PROGRESS,
-                task_id=None,
-                choice="stop fixing",
-                reason=f"the {phase.value} gate failed the same rules on the same items "
-                "after its fixes: " + _summary(blockers),
-                rule="policy.gate_no_progress",
-                finding_ids=fids,
-            ),
-            _ask(
-                run,
-                None,
-                f"The {phase.value} gate keeps failing: {_summary(blockers)}. "
-                "How should I proceed?",
-                "policy.gate_no_progress",
-                fids,
-            ),
-        ]
-
-    gate_rank = min((KIND_ORDER[k] for k, p in KIND_PHASE.items() if p is phase), default=99)
-    upstream = _earliest_upstream(blockers, gate_rank)
-    if upstream is not None:
-        return [
-            _upstream_or_ask(
-                run, None, upstream, blockers, past, limits, live, lineage=set(), gate=phase
-            )
-        ]
-
-    fixes: dict[str, _Fix] = {}
-    unrouted: list[Finding] = []
-    for finding in blockers:
-        target = route(finding, phase_tasks, outputs)
-        if target is None:
-            unrouted.append(finding)
-        else:
-            fixes.setdefault(target.id, _Fix(target)).findings.append(finding)
-
-    out: list[Decision] = []
-    stuck: list[Finding] = list(unrouted)
-    for fix in fixes.values():
-        if fix.task.attempt >= fix.task.max_attempts:
-            stuck += fix.findings
-            continue
-        after = downstream(fix.task, phase_tasks, set(fixes))
-        out.append(
-            _decision(
-                run,
-                DecisionKind.GATE_FIX,
-                task_id=fix.task.id,
-                choice=f"revise {fix.task.agent.value} task {fix.task.id}"
-                + (f", then re-run {len(after)} later tasks" if after else ""),
-                reason=f"the {phase.value} gate failed: {_summary(fix.findings)}",
-                rule="policy.gate_fix",
-                finding_ids=_ids(fix.findings),
-                rerun_after=[t.id for t in after],
-            )
-        )
-    if stuck:
-        why = (
-            "no task produced the item at fault" if unrouted else "its tasks have no attempts left"
-        )
-        out.append(
-            _ask(
-                run,
-                None,
-                f"The {phase.value} gate failed and {why}: {_summary(stuck)}. "
-                "How should I proceed?",
-                "policy.gate_cap",
-                _ids(stuck),
-            )
-        )
-    return out
-
-
-def route(
-    finding: Finding, phase_tasks: list[Task], outputs: Mapping[str, Artifact]
-) -> Task | None:
-    """The task in the phase that produced the item at fault."""
-    engineers = [t for t in phase_tasks if t.agent is AgentName.ENGINEER]
-
-    def wrote(path: str) -> Task | None:
-        """The latest Engineer task whose code change wrote ``path``."""
-        hits = [
-            t
-            for t in engineers
-            if isinstance(outputs.get(t.id), CodeChange) and path in outputs[t.id].files_written  # type: ignore[union-attr]
-        ]
-        return hits[-1] if hits else None
-
-    ref = finding.artifact
-    item = (finding.item or "").strip()
-    # QA's blocking issues and failed criteria become Engineer fixes.
-    if ref is not None and ref.kind == "qa_report" and finding.rule_id == "R7":
-        return (wrote(item) if item else None) or (engineers[-1] if engineers else None)
-    if ref is not None:
-        producer = _producer(ref, phase_tasks)
-        if producer is not None:
-            return producer
-    if item:
-        writer = wrote(item.split(":")[0])
-        if writer is not None:
-            return writer
-    if engineers and any(p is Phase.IMPLEMENTATION for p in {t.phase for t in phase_tasks}):
-        return engineers[-1]
-    producers = [t for t in phase_tasks if t.output is not None]
-    return producers[-1] if producers else (phase_tasks[-1] if phase_tasks else None)
-
-
-def downstream(task: Task, phase_tasks: list[Task], exclude: set[str]) -> list[Task]:
-    """Tasks in the phase that build on ``task``, directly or not, plus a fresh QA
-    review after any Engineer fix."""
-    found: dict[str, Task] = {}
-    frontier = {task.id}
-    while frontier:
-        nxt = {
-            t.id
-            for t in phase_tasks
-            if t.id not in found and t.id != task.id and frontier & set(t.depends_on)
-        }
-        for t in phase_tasks:
-            if t.id in nxt:
-                found[t.id] = t
-        frontier = nxt
-    if task.agent is AgentName.ENGINEER:
-        for t in phase_tasks:
-            if t.agent is AgentName.QA:
-                found.setdefault(t.id, t)
-    return [t for t in phase_tasks if t.id in found and t.id not in exclude]
 
 
 # --- the VerdictPolicy implementation ------------------------------------------------
@@ -587,21 +569,18 @@ class CodeVerdictPolicy:
     async def on_task_verdict(
         self, run: Run, task: Task, verdict: Verdict, history: list[Verdict]
     ) -> list[Decision]:
-        """Decisions for a task verdict; see ``decide_task``."""
+        """Decisions for a task verdict; see ``decide_task``. The outputs of the live
+        tasks in the task's phase are loaded so fixes can be routed by file."""
+        if verdict.passed and not verdict.blockers:
+            return []
         past = await self.decisions.list(run.id)
-        tasks = await self.tasks.list_tasks(run.id)
-        return decide_task(run, task, verdict, history, past, self.limits, tasks)
-
-    async def on_gate_verdict(self, run: Run, phase: Phase, verdict: Verdict) -> list[Decision]:
-        """Decisions for a gate verdict; see ``decide_gate``. The gate's previous verdict
-        comes from ``VerdictStore.for_gate``, so the no-progress check survives a resume;
-        ``verdict`` itself is skipped whether or not it was saved before this call."""
         tasks = await self.tasks.list_tasks(run.id)
         outputs: dict[str, Artifact] = {}
         for t in tasks:
-            if t.phase is phase and t.output is not None and t.status is not TaskStatus.SUPERSEDED:
+            if (
+                t.phase is task.phase
+                and t.output is not None
+                and t.status is not TaskStatus.SUPERSEDED
+            ):
                 outputs[t.id] = await self.artifacts.load(run.id, t.output)
-        past = await self.decisions.list(run.id)
-        earlier = [v for v in await self.verdicts.for_gate(run.id, phase) if v.id != verdict.id]
-        previous = earlier[-1] if earlier else None
-        return decide_gate(run, phase, verdict, previous, tasks, outputs, past, self.limits)
+        return decide_task(run, task, verdict, history, past, self.limits, tasks, outputs)

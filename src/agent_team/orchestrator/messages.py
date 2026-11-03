@@ -19,6 +19,7 @@ from pydantic import Field
 
 from agent_team.agents.loop import LoopSettings, ToolLoop
 from agent_team.agents.prompts import MESSAGES
+from agent_team.core.artifacts import PLAIN_KINDS, plain_kind
 from agent_team.core.base import Contract
 from agent_team.core.errors import ToolError
 from agent_team.core.interfaces import (
@@ -42,9 +43,9 @@ from agent_team.core.models import (
     new_id,
 )
 from agent_team.llm.types import LLMClient, Message, ToolSpec
-from agent_team.orchestrator.base import GATE_QUESTION, RUN_QUESTION
+from agent_team.orchestrator.base import ESCALATION, RUN_QUESTION
 from agent_team.orchestrator.control import read_tools, required_str
-from agent_team.orchestrator.replies import PLAIN_KINDS, plain_agent, plain_kind
+from agent_team.orchestrator.replies import plain_agent
 
 #: The reason on a user task that confirms a proposed change before anything reopens.
 CONFIRM_CHANGE = "confirm_change"
@@ -96,9 +97,9 @@ def describe_pending(task: Task, parent: Task | None) -> str:
         return "confirming your change"
     if task.origin is TaskOrigin.REVIEW:
         return f"a review of the {task.phase.value} phase"
-    if task.reason in (GATE_QUESTION, RUN_QUESTION):
+    if task.reason == RUN_QUESTION:
         return "the auditor"
-    if task.reason == "escalation":
+    if task.reason == ESCALATION:
         return "a stuck step"
     if parent is not None:
         return plain_agent(parent.agent)

@@ -37,6 +37,25 @@ def downstream(tasks: list[Task], root: Task) -> set[str]:
     return found
 
 
+def ancestry(task: Task, tasks: list[Task]) -> list[Task]:
+    """The tasks ``task`` was reopened from, oldest first, ending with ``task``: the
+    chain of ``parent_task_id`` links through tasks of the same agent and output."""
+    by_id = {t.id: t for t in tasks}
+    chain = [task]
+    seen = {task.id}
+    parent = by_id.get(task.parent_task_id or "")
+    while (
+        parent is not None
+        and parent.id not in seen
+        and parent.agent is task.agent
+        and parent.output_kind == task.output_kind
+    ):
+        chain.append(parent)
+        seen.add(parent.id)
+        parent = by_id.get(parent.parent_task_id or "")
+    return chain[::-1]
+
+
 def _rebuilt_by_pipeline(root: Task, task: Task) -> bool:
     """Tasks that code recreates anyway after the reopen, so reopen mustn't copy them too."""
     if task.id == root.id:

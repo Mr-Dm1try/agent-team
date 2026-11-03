@@ -2,7 +2,7 @@
 
 - Build: one Researcher task (research_brief) per research question in Planning, then
   Product (PRD) and Architect (Spec). The Engineer and QA tasks are created when the
-  Spec gate passes, from the spec's work packages: one Engineer task per package (or
+  spec task is done, from the spec's work packages: one Engineer task per package (or
   one for the whole spec), run one after another, and QA after all of them.
 - Research question: one Researcher task per research question, then one Researcher
   task that writes the research_answer.

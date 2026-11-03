@@ -16,7 +16,13 @@ from agent_team.core.models import (
     TaskOrigin,
     TaskStatus,
 )
-from agent_team.orchestrator.base import CHILD_ORIGINS, OrchestratorBase
+from agent_team.orchestrator.base import (
+    CHILD_ORIGINS,
+    ESCALATION,
+    KEEP_HINT,
+    OrchestratorBase,
+    can_keep,
+)
 from agent_team.orchestrator.control import create_user_task
 from agent_team.orchestrator.replies import plain_agent, upper_first
 
@@ -171,18 +177,20 @@ class SettleMixin(OrchestratorBase):
 
     async def _ask_about_escalation(self, run: Run, task: Task) -> None:
         """Ask the user how to get an escalated task unstuck."""
-        why = task.last_error or "it failed its audit with no attempts left"
+        why = task.last_error or "it failed its check with no attempts left"
+        failed = await self.verdicts.latest_for_task(task.id)
+        keep = KEEP_HINT if can_keep(task, failed) else ""
         child = await create_user_task(
             self.tasks,
             run,
             phase=task.phase,
             question=(
                 f"{upper_first(plain_agent(task.agent))} is stuck on: {task.objective} "
-                f"({why}). Reply with guidance to retry it, or 'stop'."
+                f"({why}). Reply with guidance to retry it, or 'stop'.{keep}"
             ),
             origin=TaskOrigin.QUESTION,
             parent=task,
-            reason="escalation",
+            reason=ESCALATION,
         )
         task = await self.tasks.get_task(task.id)
         task.depends_on = [*task.depends_on, child.id]

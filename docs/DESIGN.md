@@ -45,18 +45,18 @@ flowchart LR
 
 The auditor's verdict goes back to the orchestrator, which moves the work on, retries it or re-runs an earlier phase.
 
-The four phases run in order, and each ends at a gate where the auditor checks that phase's rules:
+The four phases run in order. There are no phase gates: every rule runs in the check at the end of the task that already sees what the rule is about, and a phase is finished once all of its tasks have passed their checks:
 
 1. **Planning:** the Orchestrator reads the request, decides whether it is a build or a research question, splits it into numbered asks and lists the research questions. These go into a small plan, which is audited, reviewed and versioned like any other artifact, and each research question becomes a Researcher task. The order of the phases is fixed in code, so the model never writes a task graph.
 2. **PRD:** Product writes numbered requirements and acceptance criteria.
 3. **Spec:** the Architect writes the design, the file plan and the test plan.
 4. **Implementation:** the Engineer writes the code and its unit tests, as one task unless the Architect splits the spec into independent work packages. Then QA reviews the whole solution and runs it end to end in the sandbox.
 
-The phase order and the gates are fixed in code. The model makes the judgment calls inside them, such as how to split the work, which phase a change request reopens, and how to answer you.
+The phase order and which rules each task's check runs are fixed in code. The model makes the judgment calls inside them, such as how to split the work, which phase a change request reopens, and how to answer you.
 
 **Questions as well as builds.** The orchestrator first sorts each message: a new task to build, a change to the current run, a question about the run, or a research question. A research question runs only Planning with the Researcher and gets an answer with its sources, checked by the research rules, with no PRD or code. A question about the run, such as why the spec retried, is answered from the task store and the trace. This covers the question-answering part of the live demo.
 
-**One chain of ids.** The plan numbers the request's asks (ASK-1), the PRD numbers requirements (REQ-1) and acceptance criteria (AC-1.1) and cites the asks they cover, the spec maps each requirement to components and files, and QA reports evidence for each criterion. Rules P1, R3, R4 and R9 check these links with code, so every ask in your request traces to a passing check, or the gate fails.
+**One chain of ids.** The plan numbers the request's asks (ASK-1), the PRD numbers requirements (REQ-1) and acceptance criteria (AC-1.1) and cites the asks they cover, the spec maps each requirement to components and files, and QA reports evidence for each criterion. Rules P1, R3, R4 and R9 check these links with code, so every ask in your request traces to a passing check, or the task that broke the chain fails its check.
 
 ## Tech stack
 
@@ -207,32 +207,32 @@ Every agent action leaves a structured log line tied to a trace, and every error
 
 ## Validation rules and the auditor
 
-The auditor is a model agent that sweeps every step for two things: process errors, and anything dangerous in the code or in what the agents did. It never runs code, since running and testing belong to the Engineer and QA. It sweeps after every task, at every phase gate and once over the whole run, and its verdict decides whether work moves on, retries or re-runs.
+The auditor is a model agent that sweeps every step for two things: process errors, and anything dangerous in the code or in what the agents did. It never runs code, since running and testing belong to the Engineer and QA. It sweeps at the end of every task and once over the whole run, and its verdict decides whether work moves on, retries or re-runs. QA's check covers every live output of the Implementation phase, so the rules about code see every code change.
 
-Each rule has an id, a scope (task, phase or run), a severity (blocker or warning), and a plain-language statement that the auditor applies. Rules are stored in a rules table in SQLite, seeded from a catalog file in the repo so the defaults stay versioned. Each sweep loads only the rules for its scope, phase and agent, so auditing a research task brings in about six rules, not all twenty-one.
+Each rule has an id, a scope (task or run), the agents whose tasks it applies to, a severity (blocker or warning), and a plain-language statement that the auditor applies. Rules are stored in a rules table in SQLite, seeded from a catalog file in the repo so the defaults stay versioned. Each sweep loads only the rules for its scope, phase and agent, so auditing a research task brings in about six rules, not all twenty-one.
 
 **Evidence helpers.** The model judges every rule. Where a rule has an exact answer, a few lines of Python gather the evidence first and hand it to the auditor, such as requirements with no acceptance criterion, URLs cited but never fetched, secret-like strings, or tool calls that touched paths outside the workspace. A helper hit on a blocker rule fails the step even if the model misses it, because a model can overlook one item in a long list. The verdict and its explanation always come from the model.
 
 | Rule | Scope | Checks that | Evidence from helpers | Severity |
 | --- | --- | --- | --- | --- |
-| P1 Valid plan | Planning gate | The asks cover everything the request says and invent nothing, they have unique ids, the request type is right, and every research question names the ask it serves | Ask ids and research questions | Blocker |
+| P1 Valid plan | The plan task | The asks cover everything the request says and invent nothing, they have unique ids, the request type is right, and every research question names the ask it serves | Ask ids and research questions | Blocker |
 | R1 Schema | Every task | The artifact parses into its schema | Schema validation | Blocker |
 | R2 Real sources | Research tasks | Every finding cites a file or URL the Researcher actually opened | Cited sources against the tool-call log | Blocker |
 | P2 Brief complete | Research tasks | The brief answers each research question it was given, or says why it couldn't | Questions without an answer | Blocker |
-| R3 Testable PRD | PRD gate | Every requirement has at least one acceptance criterion | Requirements without criteria | Blocker |
-| R4 Spec coverage | Spec gate | Every requirement maps to a component, and every acceptance criterion to a planned check | Unmapped ids | Blocker |
-| R5 Files exist | Implementation gate | Every planned file exists, and nothing was written outside the workspace | File list | Blocker |
-| R6 Tests ran | Implementation gate | The Engineer's unit tests ran and passed, according to the run log | Test result in the log | Blocker |
-| R7 QA clean | Implementation gate | QA's review has no blocking issues | QA report | Blocker |
+| R3 Testable PRD | Product's task | Every requirement has at least one acceptance criterion | Requirements without criteria | Blocker |
+| R4 Spec coverage | The Architect's task | Every requirement maps to a component, and every acceptance criterion to a planned check | Unmapped ids | Blocker |
+| R5 Files exist | QA's task, over every code change | Every planned file exists, and nothing was written outside the workspace | File list | Blocker |
+| R6 Tests ran | Each Engineer task | The Engineer's unit tests ran and passed, according to the run log | Test result in the log | Blocker |
+| R7 QA clean | QA's task | QA's review has no blocking issues | QA report | Blocker |
 | R8 Process trail | Whole run | Every task has start and end events, a verdict and attempts within the limit, and every decision has a reason | Task store | Blocker |
-| R9 Coverage and scope | PRD and Spec gates | Every ask maps to a requirement, and nothing was added that the request didn't ask for | Asks without requirements | Blocker for a missed ask, warning for additions |
-| R10 Consistency | Implementation gate | The code matches the spec's interfaces | Function and route names | Warning |
-| R11 Questions resolved | Every gate | Every question is answered or recorded as an assumption | Open questions | Blocker |
+| R9 Coverage and scope | Product's and the Architect's tasks | Every ask maps to a requirement, and nothing was added that the request didn't ask for | Asks without requirements | Blocker for a missed ask, warning for additions |
+| R10 Consistency | QA's task, over every code change | The code matches the spec's interfaces | Function and route names | Warning |
+| R11 Questions resolved | Every task, on its final output | Every question the task's output raises is answered or recorded as an assumption | Open questions | Blocker |
 | R12 Minimal revision | Revisions | Only what the upstream diff requires was changed | Changed sections against the diff | Warning |
 | S1 Secrets | Every task | No keys, tokens or passwords in code, logs or artifacts | Secret pattern scan | Blocker |
-| S2 Dangerous code | Implementation gate | No eval or exec on input, no shell commands or SQL built from input, no unsafe deserialization, no disabled TLS checks | Pattern scan of the diff | Blocker |
-| S3 Unexpected reach | Implementation gate | Code only uses the network hosts and file paths the spec allows | Hosts and paths found in the code | Blocker |
-| S4 Risky dependencies | Pre-check before any install, and the implementation gate | Dependencies are known packages with pinned versions, not lookalike names | Dependency list | Warning |
+| S2 Dangerous code | QA's task, over every code change | No eval or exec on input, no shell commands or SQL built from input, no unsafe deserialization, no disabled TLS checks | Pattern scan of the diff | Blocker |
+| S3 Unexpected reach | QA's task, over every code change | Code only uses the network hosts and file paths the spec allows | Hosts and paths found in the code | Blocker |
+| S4 Risky dependencies | Pre-check before any install, and QA's task | Dependencies are known packages with pinned versions, not lookalike names | Dependency list | Warning |
 | S5 Dangerous actions | Every task | No agent ran destructive commands, piped a download into a shell, or read credential files such as \~/.ssh | Tool-call log | Blocker |
 | S6 Injected instructions | Every task | No agent acted on instructions found inside fetched pages or files | Fetched text next to the actions that followed | Blocker |
 | S7 Data leaving | Every task | No tool call sent workspace content or secrets to an outside address | Outgoing requests in the log | Blocker |
@@ -246,10 +246,11 @@ Each rule has an id, a scope (task, phase or run), a severity (blocker or warnin
 **What a verdict triggers:**
 
 1. **Pass:** the task is done and the tasks that depend on it become ready.
-2. **Fail with attempts left:** the task goes back to Ready as a revision of its last output, with the findings added. If a retry fails the same rules on the same items as the one before, it counts as no progress and goes straight to escalation.
+2. **Fail with attempts left:** the task goes back to Ready as a revision of its last output, with the findings added. If a retry or fix fails the same rules on the same items as the one before, counting the tasks it was reopened from, it counts as no progress and goes straight to escalation.
 3. **Fail with no attempts left:** the task is escalated. If a finding blames an upstream artifact, the orchestrator reopens the earliest one at fault, marks everything built on it stale and updates it from there; a spec gap found during implementation reopens the Spec, for example. If the fault is in the task's own output, it gets one last attempt on the stronger model before you're asked.
-4. **A phase gate fails:** each finding goes to the task that produced the item at fault, which re-runs as a revision, and the tasks after it re-run too. QA's blocking issues, for example, become Engineer revisions for the files named, followed by a fresh QA review.
-5. **Still failing after an upstream re-run:** the orchestrator stops and asks you, showing the findings.
+4. **A check finds a fault in other work of the same phase:** the finding goes to the task that produced the item at fault, which re-runs as a fix, and the tasks after it re-run too. QA's blocking issues, for example, become Engineer fixes for the files named, followed by a fresh QA review. A finding on an earlier phase's artifact reopens its producer right away, as in step 3.
+5. **The user keeps work as it is:** when you are asked about work that failed its check, 'approve' keeps it, and a passing verdict records that you accepted it despite the findings. The plan can't be kept this way, since the pipeline is built from it.
+6. **Still failing after an upstream re-run:** the orchestrator stops and asks you, showing the findings.
 
 Each run is capped at 3 attempts per task and 2 upstream re-runs, plus token, cost and time budgets, so it always ends.
 
@@ -258,7 +259,7 @@ Each run is capped at 3 attempts per task and 2 upstream re-runs, plus token, co
 You can steer every phase: agents ask you questions when they need to, and you can comment on each phase's output before the next phase starts.
 
 - **Agent questions.** Every artifact has a questions field. When an agent can't proceed safely, such as the Researcher not knowing which database you want, it returns questions instead of guessing. The orchestrator asks you, and your answers go back to that agent on its next attempt.
-- **Phase reviews.** After the auditor passes a phase, the orchestrator shows you a short summary and the artifact, and you approve it or comment. A comment on the PRD goes to Product, a comment on the spec goes to the Architect, and so on.
+- **Phase reviews.** Once every task in a phase has passed its check, the orchestrator shows you a short summary and the artifact, and you approve it or comment. A comment on the PRD goes to Product, a comment on the spec goes to the Architect, and so on.
 - **What each agent reads.** On every attempt an agent receives its previous version, your answers and comments on it, and the auditor's findings. Feedback is stored per artifact version in a feedback table, so nothing is lost between attempts.
 - **You are a task assignee.** A review is a task assigned to you in the tracker, with its own waiting state, logs and trace, so reviews appear in the run history like any other step.
 - **Revisions flow down.** Your comment creates a new version of that artifact, and everything built from the old version is updated to match, the same as a change request.
@@ -274,7 +275,7 @@ Memory is a SQLite store with embedding and keyword search that the harness quer
 | Kind | Example | Proposed by | Saved when |
 | --- | --- | --- | --- |
 | Run summary | Built an inventory API; 12 tests; Spec retried twice | The memory writer, with one model call over the run's artifacts and trace | At the end of each run |
-| Decision | Chose SQLite over Postgres for the mock database | The Architect, in the decisions field of its spec | When the spec passes its gate |
+| Decision | Chose SQLite over Postgres for the mock database | The Architect, in the decisions field of its spec | When the spec passes its check |
 | Lesson | FastAPI tests need httpx installed | The auditor, from the earlier finding and the fix, when it passes a task that failed before | When that verdict is recorded |
 | Preference | You want type hints and pytest | The orchestrator, when your answer or comment states a preference | When your answer or comment is recorded |
 | Research fact | A fact with its source URL | The Researcher, in its brief | When the finding passes rule R2 |
@@ -412,7 +413,7 @@ agent-team/
 | 1 | This design doc | 2 | You approve it |
 | 2a | Task store, events and hooks, errors, tracing, LLM layer with the fake model, gateway with fault injection, decision log | 4.5 | Unit tests pass |
 | 2b | Base agent, the five experts and their schemas, the dispatcher, attempt checkpoints, orchestrator control tools, question answering, context compaction | 5 | A run with the fake model completes all four phases |
-| 2c | Auditor with process and safety rules, planning rules, retry, escalation, the gate fix loop and upstream re-runs | 3 | Fault-injection tests show each recovery path |
+| 2c | Auditor with process and safety rules, planning rules, retry, escalation, fixes routed to the work at fault and upstream re-runs | 3 | Fault-injection tests show each recovery path |
 | 3a | Docker sandbox and the Engineer and QA tools | 2 | Generated code and tests run in the container |
 | 3b | Streaming CLI, agent questions, phase reviews and change requests | 3.5 | A change request re-runs from the right phase |
 | 3c | Memory store with embedding search, automatic fetch and lessons | 2.5 | A second run shows fetched lessons in its trace |
@@ -426,7 +427,7 @@ The total is now 27 hours, seven over the target, after adding gateway control, 
 
 These are ideas we're keeping for later, not plans for this build.
 
-- **Read-only tools for the auditor.** Today the auditor model makes one call with no tools. It sees the evidence helpers' results and a clipped prompt: at most 20 files, the last tool calls, and artifacts trimmed to a size limit. Task and gate audits could get a few read-only tools: read an artifact, read a workspace file, and read a task's events and tool calls. They would be capped at about 5 tool turns and reuse the agents' tool loop. The helpers stay the deterministic floor for blocker rules, and the pre-check stays tool-free. The costs are several model calls per audit, verdicts that are harder to repeat, and untrusted material steering the tool calls.
+- **Read-only tools for the auditor.** Today the auditor model makes one call with no tools. It sees the evidence helpers' results and a clipped prompt: at most 20 files, the last tool calls, and artifacts trimmed to a size limit. Task audits could get a few read-only tools: read an artifact, read a workspace file, and read a task's events and tool calls. They would be capped at about 5 tool turns and reuse the agents' tool loop. The helpers stay the deterministic floor for blocker rules, and the pre-check stays tool-free. The costs are several model calls per audit, verdicts that are harder to repeat, and untrusted material steering the tool calls.
 - **Dynamic rules.** These are rules the auditor proposes or tunes at run time, beyond the catalog in `config/rules.yaml`. They depend on read-only tools, because those would let the auditor check rules that have no evidence helper.
 - **Remember approved pre-check calls.** Today any tool call that code can't classify goes to the auditor model every time, even when a call of the same kind was approved a minute earlier. Each approval would be stored under a normalized shape of the call: the tool, the command name and its flags (without file contents), the host for web calls, and the path prefix for files. A later call with the same shape is then allowed by code, with no model call. The cache is per run by default, and an entry moves into the rule store only after it has been approved across several runs. Blocks are never generalized. The cache is cleared when the rule catalog or the spec's allowed hosts change. The risk is that one approval of a crafted call widens into a standing allow, so matching stays narrow and every cache hit is logged.
 
