@@ -1,0 +1,197 @@
+"""Failure paths: restarts, failed gates, budget stops during audits, re-opened plans
+and questions left open by a re-open."""
+
+from __future__ import annotations
+
+import json
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+from agents.scenario import PRD, team_script
+
+from agent_team.core.artifacts import Artifact
+from agent_team.core.errors import BudgetExceeded
+from agent_team.core.models import (
+    AgentName,
+    Finding,
+    Phase,
+    ReviewMode,
+    RuleScope,
+    Run,
+    RunStatus,
+    Severity,
+    Task,
+    TaskOrigin,
+    TaskStatus,
+    Verdict,
+)
+from agent_team.llm.types import LLMRequest
+from agent_team.orchestrator import Orchestrator, OrchestratorConfig
+from agent_team.orchestrator.gates import passed_gates
+from orchestrator.harness import Team, make_team
+
+
+def _fresh_orchestrator(team: Team, tmp_path: Path) -> Orchestrator:
+    """A new process over the same stores: nothing carried over in memory."""
+    return Orchestrator(
+        tasks=team.tasks,
+        artifacts=team.artifacts,
+        checkpoints=team.checkpoints,
+        decisions=team.decisions,
+        feedback=team.feedback,
+        verdicts=team.verdicts,
+        bus=team.bus,
+        llm=team.llm,
+        auditor=team.auditor,
+        dispatcher=team.dispatcher,
+        config=OrchestratorConfig(runs_dir=tmp_path / "runs"),
+    )
+
+
+def _failed_gate(run: Run, phase: Phase) -> Verdict:
+    return Verdict(
+        run_id=run.id,
+        scope=RuleScope.PHASE,
+        phase=phase,
+        passed=False,
+        findings=[Finding(rule_id="R7", severity=Severity.BLOCKER, message="no NFRs")],
+    )
+
+
+def _live(tasks: list[Task]) -> Counter[str]:
+    return Counter(t.output_kind for t in tasks if t.status is not TaskStatus.SUPERSEDED)
+
+
+async def test_passed_gates_survive_a_restart(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    from orchestrator.test_flows import failing
+
+    team.auditor.fail_next["spec"] += [failing("R4", "REQ-1")] * 3
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "waiting" and reply.run_id
+    tasks = await team.tasks.list_tasks(reply.run_id)
+    assert await passed_gates(team.verdicts, reply.run_id, tasks) == {Phase.PLANNING, Phase.PRD}
+
+    team.auditor.gates.clear()
+    reply = await _fresh_orchestrator(team, tmp_path).answer(reply.run_id, "Use one module")
+    assert reply.kind == "done", reply.text
+    # The earlier gates were not audited again.
+    assert team.auditor.gates == [Phase.SPEC, Phase.IMPLEMENTATION]
+
+
+async def test_failed_gate_accepted_by_the_user(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    passing = team.auditor.audit_gate
+
+    async def gate(run: Run, phase: Phase) -> Verdict:
+        if phase is Phase.PRD and Phase.PRD not in team.auditor.gates:
+            team.auditor.gates.append(phase)
+            return _failed_gate(run, phase)
+        return await passing(run, phase)
+
+    team.auditor.audit_gate = gate  # type: ignore[method-assign]
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "waiting" and reply.run_id
+    assert (await team.tasks.get_task(reply.pending[0].task_id)).phase is Phase.PRD
+    reply = await team.orch.answer(reply.run_id, "approve")
+    assert reply.kind == "done", reply.text
+    assert team.auditor.gates.count(Phase.PRD) == 1
+    accepted = (await team.verdicts.for_gate(reply.run_id, Phase.PRD))[-1]
+    assert accepted.passed and accepted.summary and "R7" in accepted.summary
+    assert (
+        len([t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd"]) == 1
+    )
+
+
+async def test_failed_gate_comment_reopens_the_phase(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    passing = team.auditor.audit_gate
+
+    async def gate(run: Run, phase: Phase) -> Verdict:
+        if phase is Phase.PRD and Phase.PRD not in team.auditor.gates:
+            team.auditor.gates.append(phase)
+            return _failed_gate(run, phase)
+        return await passing(run, phase)
+
+    team.auditor.audit_gate = gate  # type: ignore[method-assign]
+    reply = await team.orch.handle("Build a books API")
+    assert reply.run_id
+    reply = await team.orch.answer(reply.run_id, "Add a latency target")
+    assert reply.kind == "done", reply.text
+    assert team.auditor.gates.count(Phase.PRD) == 2
+    prds = [t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd"]
+    assert [t.status for t in prds] == [TaskStatus.SUPERSEDED, TaskStatus.DONE]
+    assert any(f.text == "Add a latency target" for _, f in team.feedback.items)
+
+
+async def test_budget_during_an_audit_pauses_and_resumes(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    passing = team.auditor.audit_task
+    calls: list[str] = []
+
+    async def audit(task: Task, artifact: Artifact | None, run: Run) -> Verdict:
+        calls.append(task.output_kind)
+        if task.output_kind == "prd" and calls.count("prd") == 1:
+            raise BudgetExceeded("judge budget", limit="max_usd_per_run")
+        return await passing(task, artifact, run)
+
+    team.auditor.audit_task = audit  # type: ignore[method-assign]
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "stopped" and reply.run_id
+    assert (await team.tasks.get_run(reply.run_id)).status is RunStatus.PAUSED
+    prd = next(t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd")
+    assert prd.status is TaskStatus.AUDITING  # nothing passed while the budget was out
+    reply = await team.orch.resume(reply.run_id)
+    assert reply.kind == "done", reply.text
+    assert (await team.tasks.get_task(prd.id)).attempt == 1
+
+
+async def test_reopening_the_plan_rebuilds_the_pipeline_once(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    reply = await team.orch.handle("Build a books API")
+    assert reply.run_id
+    before = _live(await team.tasks.list_tasks(reply.run_id))
+    reply = await team.orch.request_change(reply.run_id, "Also list authors", target="plan")
+    assert reply.kind == "done", reply.text
+    tasks = await team.tasks.list_tasks(reply.run_id)
+    assert _live(tasks) == before
+    plans = [t for t in tasks if t.output_kind == "plan"]
+    assert [t.status for t in plans] == [TaskStatus.SUPERSEDED, TaskStatus.DONE]
+
+
+async def test_reopen_supersedes_open_questions(tmp_path: Path) -> None:
+    script = team_script()
+    asked = dict(PRD, questions=[{"id": "Q-1", "text": "Paginate?", "why": "list size"}])
+    script[AgentName.PRODUCT] = lambda r: json.dumps(asked)
+    team = make_team(tmp_path, script=script, review_mode=ReviewMode.QUESTIONS_ONLY)
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "waiting" and reply.run_id
+    run = await team.tasks.get_run(reply.run_id)
+    waiting = await team.tasks.list_tasks(run.id, status=TaskStatus.WAITING)
+    user = next(t for t in waiting if t.agent is AgentName.USER)
+    prd = next(t for t in waiting if t.output_kind == "prd")
+    revision = await team.orch.reopen(run, prd, origin=TaskOrigin.REVISION, reason="test")
+    assert revision is not None and user.id not in revision.depends_on
+    assert (await team.tasks.get_task(user.id)).status is TaskStatus.SUPERSEDED
+
+
+async def test_answer_to_an_escalation_without_output_reaches_the_agent(tmp_path: Path) -> None:
+    script = team_script()
+    calls: list[LLMRequest] = []
+
+    def flaky(request: LLMRequest) -> Any:
+        calls.append(request)
+        if len(calls) <= 3:
+            raise RuntimeError("provider is down")
+        return json.dumps(PRD)
+
+    script[AgentName.PRODUCT] = flaky
+    team = make_team(tmp_path, script=script)
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "waiting" and reply.run_id
+    reply = await team.orch.answer(reply.run_id, "Keep it to one endpoint")
+    assert reply.kind == "done", reply.text
+    refs = [f.artifact for _, f in team.feedback.items if f.text == "Keep it to one endpoint"]
+    assert refs and refs[0] is not None and refs[0].kind == "prd"
+    assert "Keep it to one endpoint" in calls[-1].messages[0].content[0].text  # type: ignore[union-attr]

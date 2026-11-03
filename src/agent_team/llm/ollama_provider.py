@@ -6,11 +6,21 @@ models in ``reasoning_models``, such as gpt-oss; Ollama rejects it for other mod
 Claude's thinking blocks are dropped: Ollama can't read them and has no way to take
 reasoning back in the history, so it thinks afresh on every call. The SDK's own retries
 are off; the gateway retries and falls back.
+
+Ollama cuts the start of a prompt that overflows ``num_ctx`` without an error, so the
+reply is capped before sending to leave the prompt room. The prompt's size is anchored
+on what Ollama reported for the same task's previous call, with only the messages
+appended since estimated, at a chars-per-token ratio learned per model. A count too
+low for the characters sent (one that left out what Ollama had cached) is not used. A
+reported prompt within 2% of ``num_ctx`` and past the room the cap leaves is logged as
+a warning (it was probably cut) and not learned from.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -19,6 +29,14 @@ import openai
 from agent_team.core.config import OllamaConfig
 from agent_team.core.errors import ContextTooLong, TransientLLMError
 from agent_team.core.models import Effort, Usage
+from agent_team.llm.tokens import (
+    CHARS_PER_TOKEN,
+    Anchor,
+    Calibration,
+    estimate_json_tokens,
+    fingerprint,
+    to_json,
+)
 from agent_team.llm.types import (
     ContentBlock,
     LLMRequest,
@@ -28,6 +46,13 @@ from agent_team.llm.types import (
     TextBlock,
     ToolUseBlock,
 )
+
+log = logging.getLogger(__name__)
+
+#: A reported prompt this close to ``num_ctx`` was probably cut by Ollama.
+NEAR_FULL = 0.98
+#: Anchors kept, one per task, model and agent; the oldest go first.
+MAX_ANCHORS = 256
 
 _STOP: dict[str, Any] = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}
 _REASONING_EFFORT: dict[Effort, str] = {
@@ -70,13 +95,12 @@ def to_chat_messages(system: str, messages: list[Message]) -> list[dict[str, Any
     return out
 
 
-def prompt_tokens(params: dict[str, Any], chars_per_token: int = 3) -> int:
+def prompt_tokens(params: dict[str, Any], chars_per_token: float = CHARS_PER_TOKEN) -> int:
     """A high estimate of the prompt's tokens over the JSON that is sent, with
     non-ASCII text kept as is. High on purpose: running over is silent truncation."""
-    sent = json.dumps(params["messages"], ensure_ascii=False) + json.dumps(
-        params.get("tools", []), ensure_ascii=False
+    return estimate_json_tokens(
+        params["messages"], params.get("tools", []), chars_per_token=chars_per_token
     )
-    return -(-len(sent) // chars_per_token)
 
 
 def parse_arguments(raw: str | None) -> dict[str, Any]:
@@ -113,6 +137,8 @@ class OllamaProvider:
         """Use ``config``; ``client`` replaces the SDK client in tests."""
         self.config = config or OllamaConfig()
         self._client = client
+        self.calibration = Calibration(self.config.chars_per_token)
+        self._anchors: OrderedDict[str, Anchor] = OrderedDict()
 
     @property
     def client(self) -> Any:
@@ -147,14 +173,77 @@ class OllamaProvider:
                 }
                 for t in request.tools
             ]
-        params["max_tokens"] = self._max_tokens(params, request.max_tokens)
+        prompt = self._prompt_tokens(request, model, params)
+        params["max_tokens"] = self._max_tokens(prompt, request.max_tokens)
         return params
 
-    def _max_tokens(self, params: dict[str, Any], wanted: int) -> int:
-        """``wanted`` cut down so prompt plus reply fit ``num_ctx``. Ollama would
-        otherwise drop the start of the prompt (the system prompt and the task)
-        without an error. Raises ContextTooLong when even the minimum reply won't fit."""
-        prompt = prompt_tokens(params, self.config.chars_per_token)
+    @staticmethod
+    def _key(request: LLMRequest, model: str) -> str:
+        """Whose anchor a request uses: one per task (or run), agent and model."""
+        return f"{request.run_id}:{request.task_id}:{request.agent.value}:{model}"
+
+    @staticmethod
+    def _prefix(request: LLMRequest, params: dict[str, Any], sent: int) -> str:
+        """The fingerprint of the system prompt, tools and first ``sent`` messages."""
+        head = [m.model_dump(mode="json") for m in request.messages[:sent]]
+        return fingerprint(request.system, params.get("tools", []), head)
+
+    def _prompt_tokens(self, request: LLMRequest, model: str, params: dict[str, Any]) -> int:
+        """The prompt's size: Ollama's count for the same task's last call plus an
+        estimate of the messages appended since, or a full estimate when there is no
+        anchor or the history it counted was rewritten (compaction)."""
+        ratio = self.calibration.ratio(model)
+        anchor = self._anchors.get(self._key(request, model))
+        if (
+            anchor is not None
+            and anchor.sent <= len(request.messages)
+            and anchor.prefix == self._prefix(request, params, anchor.sent)
+        ):
+            appended = to_chat_messages("", request.messages[anchor.sent :])
+            return anchor.tokens + estimate_json_tokens(appended, chars_per_token=ratio)
+        return prompt_tokens(params, ratio)
+
+    def _observe(
+        self, request: LLMRequest, model: str, params: dict[str, Any], usage: Usage
+    ) -> None:
+        """Learn from Ollama's count of a prompt: warn (and learn nothing) when the
+        prompt filled num_ctx past the cap's room, since it was probably cut; otherwise,
+        if the count is plausible, calibrate the model's ratio and anchor the task's
+        next call on it."""
+        tokens = usage.input_tokens
+        key = self._key(request, model)
+        if tokens <= 0:
+            return
+        room = self.config.num_ctx - self.config.min_output_tokens
+        if tokens >= NEAR_FULL * self.config.num_ctx and tokens > room:
+            self._anchors.pop(key, None)  # a cut prompt's count is no measure of it
+            log.warning(
+                "ollama %s: prompt of %d tokens is within %d%% of num_ctx %d; "
+                "its start was probably cut",
+                model,
+                tokens,
+                round((1 - NEAR_FULL) * 100),
+                self.config.num_ctx,
+            )
+            return
+        chars = len(to_json(params["messages"], params.get("tools", [])))
+        if not self.calibration.observe(model, chars, tokens):
+            self._anchors.pop(key, None)  # a partial count: estimate the next call in full
+            return
+        self._anchors[key] = Anchor(
+            sent=len(request.messages),
+            tokens=tokens,
+            prefix=self._prefix(request, params, len(request.messages)),
+        )
+        self._anchors.move_to_end(key)
+        while len(self._anchors) > MAX_ANCHORS:
+            self._anchors.popitem(last=False)
+
+    def _max_tokens(self, prompt: int, wanted: int) -> int:
+        """``wanted`` cut down so a prompt of ``prompt`` tokens plus the reply fit
+        ``num_ctx``. Ollama would otherwise drop the start of the prompt (the system
+        prompt and the task) without an error. Raises ContextTooLong when even the
+        minimum reply won't fit."""
         room = self.config.num_ctx - prompt
         if room < self.config.min_output_tokens:
             raise ContextTooLong(
@@ -168,8 +257,9 @@ class OllamaProvider:
         self, request: LLMRequest, *, model: str, effort: Effort | None = None
     ) -> LLMResponse:
         """One chat completion call."""
+        params = self._params(request, model, effort)
         try:
-            resp = await self.client.chat.completions.create(**self._params(request, model, effort))
+            resp = await self.client.chat.completions.create(**params)
         except openai.OpenAIError as exc:
             raise translate_error(exc, self.name) from exc
         choice = resp.choices[0]
@@ -184,14 +274,15 @@ class OllamaProvider:
                     arguments=parse_arguments(call.function.arguments),
                 )
             )
-        usage = resp.usage
+        usage = Usage(
+            input_tokens=resp.usage.prompt_tokens if resp.usage else 0,
+            output_tokens=resp.usage.completion_tokens if resp.usage else 0,
+        )
+        self._observe(request, model, params, usage)
         return LLMResponse(
             content=content,
             stop_reason=_STOP.get(choice.finish_reason or "", "other"),
-            usage=Usage(
-                input_tokens=usage.prompt_tokens if usage else 0,
-                output_tokens=usage.completion_tokens if usage else 0,
-            ),
+            usage=usage,
             provider=self.name,
             model=resp.model or model,
         )
@@ -245,6 +336,7 @@ class OllamaProvider:
                     arguments=parse_arguments(c["arguments"]),
                 )
             )
+        self._observe(request, model, params, usage)
         yield StreamChunk(
             done=True,
             response=LLMResponse(
