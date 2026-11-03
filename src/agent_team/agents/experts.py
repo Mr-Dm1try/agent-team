@@ -23,6 +23,7 @@ from agent_team.tools.base import resolve_path
 
 
 def _input[T](envelope: TaskEnvelope, kind: type[T]) -> list[T]:
+    """The envelope's input artifacts of one type, such as every PRD it was given."""
     return [a for a in envelope.inputs if isinstance(a, kind)]
 
 

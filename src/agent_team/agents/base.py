@@ -93,6 +93,7 @@ def render_envelope(envelope: TaskEnvelope, tools: dict[str, Tool]) -> str:
 
 
 def _review_rule(mode: ReviewMode) -> str:
+    """The prompt line for the run's review mode: assume and go on, or leave the question open."""
     if mode is ReviewMode.AUTO_ASSUMPTIONS:
         return (
             "Review mode is auto_assumptions: don't wait for the user. For every open "
@@ -116,6 +117,7 @@ class BaseAgent:
         settings: LoopSettings | None = None,
         compactor: Compactor | None = None,
     ) -> None:
+        """Loop limits and the compactor are injectable so tests can force small budgets."""
         self.settings = settings or LoopSettings()
         self.compactor = compactor or Compactor()
 
@@ -153,6 +155,7 @@ class BaseAgent:
         tools = {n: ctx.tools[n] for n in self.tool_names if n in ctx.tools}
 
         async def check(value: Any) -> list[str]:
+            """Adapts the agent's typed check to the loop's untyped hook."""
             return await self.check(cast(ArtifactBase, value), envelope)
 
         loop = ToolLoop(

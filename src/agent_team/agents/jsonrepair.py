@@ -48,6 +48,7 @@ def _outermost_object(text: str) -> str | None:
 
 
 def _candidates(text: str) -> list[str]:
+    """Strings that might hold the JSON: the whole reply, each fenced block, the outer object."""
     out = [text.strip()]
     out += [m.group(1).strip() for m in _FENCE.finditer(text)]
     obj = _outermost_object(text)

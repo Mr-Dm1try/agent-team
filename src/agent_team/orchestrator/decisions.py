@@ -28,6 +28,7 @@ class DecisionsMixin(OrchestratorBase):
     """Turns each Decision into task moves, feedback and re-opened work."""
 
     async def _apply(self, run: Run, d: Decision, verdict: Verdict | None = None) -> None:
+        """Record the decision, then carry it out on the task store."""
         await self._record(d)
         task_id = d.inputs.get("task_id") or d.task_id
         task = await self.tasks.get_task(task_id) if isinstance(task_id, str) else None
@@ -90,6 +91,8 @@ class DecisionsMixin(OrchestratorBase):
             await self._set_status(run.id, RunStatus.STOPPED)
 
     async def _upstream_rerun(self, run: Run, d: Decision, task: Task | None) -> None:
+        """Reopen the producer of a faulty upstream artifact, with the finding as feedback, and
+        count the re-run."""
         if task is not None and task.status is TaskStatus.AUDITING:
             await self.tasks.transition(task.id, TaskStatus.ESCALATED, reason=d.reason)
         raw = d.inputs.get("artifact")
@@ -133,6 +136,7 @@ class DecisionsMixin(OrchestratorBase):
                 await self.tasks.update_task(copy)
 
     async def _findings_to_feedback(self, run: Run, task: Task, findings: list[Finding]) -> None:
+        """Turn audit findings into feedback the task's next attempt will read."""
         for f in findings:
             fix = f" Suggested fix: {f.suggested_fix}" if f.suggested_fix else ""
             await self.feedback.add(

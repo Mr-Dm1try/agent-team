@@ -25,6 +25,7 @@ class PhaseMachine:
     """The phases a kind of run goes through, and where a run currently is."""
 
     def __init__(self, kind: RequestKind) -> None:
+        """The phases come from the request kind; a research question stops after planning."""
         self.kind = kind
         self.phases = PHASES_BY_KIND[kind]
 

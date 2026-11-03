@@ -145,6 +145,8 @@ class Dispatcher:
     # --- envelope ----------------------------------------------------------------
 
     async def _resolve_inputs(self, task: Task) -> list[ArtifactRef]:
+        """The task's inputs plus its dependencies' outputs and the kinds its agent reads, newest
+        version per kind."""
         refs: list[ArtifactRef] = list(task.inputs)
         all_tasks = await self.tasks.list_tasks(task.run_id)
         by_id = {t.id: t for t in all_tasks}
@@ -243,6 +245,8 @@ class Dispatcher:
     async def _finish(
         self, task: Task, result: AgentResult, envelope: TaskEnvelope | None
     ) -> AgentResult:
+        """Save the artifact and move the task to auditing, waiting, retry, escalated or ready
+        (paused)."""
         task = await self.tasks.get_task(task.id)
         if task.status is TaskStatus.SUPERSEDED:
             # Reopened while it ran: its inputs are stale, so the result is dropped.
@@ -335,6 +339,7 @@ class Dispatcher:
         *,
         level: str = "info",
     ) -> None:
+        """Emit an event about one task attempt."""
         await self.bus.emit(
             Event(
                 name=name,

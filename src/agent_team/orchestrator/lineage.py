@@ -38,6 +38,7 @@ def downstream(tasks: list[Task], root: Task) -> set[str]:
 
 
 def _rebuilt_by_pipeline(root: Task, task: Task) -> bool:
+    """Tasks that code recreates anyway after the reopen, so reopen mustn't copy them too."""
     if task.id == root.id:
         return False
     if root.agent is AgentName.ORCHESTRATOR and root.output_kind == "plan":

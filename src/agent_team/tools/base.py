@@ -19,6 +19,7 @@ MAX_INLINE_CHARS = 12_000
 
 
 def _inside(path: Path, root: Path) -> bool:
+    """True when ``path`` is ``root`` or under it."""
     return path == root or root in path.parents
 
 

@@ -95,6 +95,7 @@ class ToolLoop[M: BaseModel]:
     # --- checkpoints ---------------------------------------------------------------
 
     async def _save(self, messages: list[Message]) -> None:
+        """Checkpoint the history as the next step, so a crash resumes from here."""
         self._step += 1
         await self.checkpoints.save_step(self.task_id, self.attempt, self._step, messages)
         await self._emit(
@@ -104,9 +105,11 @@ class ToolLoop[M: BaseModel]:
         )
 
     async def _emit(self, name: EventName, data: dict[str, Any], *, level: Level = "info") -> None:
+        """Emit a loop event tagged with this task, attempt and trace."""
         await self.bus.emit(self._event(name, data, level=level))
 
     def _event(self, name: EventName, data: dict[str, Any], *, level: Level = "info") -> Event:
+        """Build an event tagged with this task, attempt and trace."""
         return Event(
             name=name,
             run_id=self.run.id,
@@ -122,6 +125,8 @@ class ToolLoop[M: BaseModel]:
     # --- tools ---------------------------------------------------------------------
 
     async def _call_tool(self, call: ToolUseBlock, *, resumed: bool = False) -> ToolResultBlock:
+        """Run one tool call through the pre-call hooks; every failure becomes an error result for
+        the model."""
         tool = self.tools.get(call.name)
         if tool is None:
             known = ", ".join(sorted(self.tools)) or "none"
@@ -195,12 +200,14 @@ class ToolLoop[M: BaseModel]:
         )
 
     async def _run_tools(self, calls: list[ToolUseBlock], *, resumed: bool = False) -> Message:
+        """Run a turn's tool calls in order and return their results as one user turn."""
         results: list[ContentBlock] = [await self._call_tool(c, resumed=resumed) for c in calls]
         return Message(role="user", content=results)
 
     # --- the loop ------------------------------------------------------------------
 
     async def _complete(self, messages: list[Message]) -> LLMResponse:
+        """One model call with the loop's system prompt, tools and output cap."""
         request = LLMRequest(
             agent=self.agent,
             system=self.system,
@@ -217,6 +224,7 @@ class ToolLoop[M: BaseModel]:
         return response
 
     async def _validate(self, text: str) -> tuple[M | None, list[str]]:
+        """Parse the reply into the output model, then run the agent's own checks on it."""
         value, errors = parse_output(text, self.output_model)
         if value is not None and self.check is not None:
             errors = await self.check(value)
@@ -225,9 +233,11 @@ class ToolLoop[M: BaseModel]:
         return value, errors
 
     def _specs(self) -> list[ToolSpec]:
+        """The tool specs sent with every call, also counted by compaction."""
         return [t.spec for t in self.tools.values()]
 
     async def _maybe_compact(self, messages: list[Message]) -> list[Message]:
+        """Compact the history when it nears the budget, and checkpoint the compacted version."""
         budget = self.llm.context_budget(self.agent)
         specs = self._specs()
         if not self.compactor.needs_compaction(self.system, messages, budget, specs):
@@ -325,6 +335,7 @@ class ToolLoop[M: BaseModel]:
     def _outcome(
         self, value: M | None, messages: list[Message], *, error: Exception | None = None
     ) -> LoopOutcome[M]:
+        """Wrap the loop's result with its usage, model and transcript."""
         return LoopOutcome(
             output=value,
             usage=self._usage,
@@ -336,6 +347,7 @@ class ToolLoop[M: BaseModel]:
 
 
 def _repair_prompt(errors: list[str], model: type[BaseModel]) -> str:
+    """The message that sends validation errors back to the model for another try."""
     listed = "\n".join(f"- {e}" for e in errors[:20])
     return (
         f"Your final answer did not validate as {model.__name__}:\n{listed}\n"

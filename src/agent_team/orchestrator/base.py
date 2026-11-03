@@ -80,6 +80,7 @@ class OrchestratorBase:
         config: OrchestratorConfig,
         policy: VerdictPolicy | None = None,
     ) -> None:
+        """Keep the stores and collaborators the mixins share."""
         self.tasks = tasks
         self.artifacts = artifacts
         self.checkpoints = checkpoints
@@ -95,6 +96,7 @@ class OrchestratorBase:
         self._started: dict[str, set[Phase]] = {}  # only to emit phase_started once
 
     async def _audit(self, run: Run, task: Task, artifact: Artifact | None) -> None:
+        """The task sweep; the mixins call it and Orchestrator implements it."""
         raise NotImplementedError  # the task sweep lives in Orchestrator
 
     async def reopen(
@@ -118,16 +120,20 @@ class OrchestratorBase:
         )
 
     async def _record(self, decision: Decision) -> None:
+        """Add a decision to the run's decision log."""
         await self.decisions.record(decision)
 
     async def _set_status(self, run_id: str, status: RunStatus) -> Run:
         # Re-read first, so fields others keep up to date (usage) aren't overwritten.
+        """Change the run's status, re-reading it first so fields others keep up to date (usage)
+        aren't overwritten."""
         run = await self.tasks.get_run(run_id)
         if run.status is status:
             return run
         return await self.tasks.update_run(run.model_copy(update={"status": status}))
 
     async def _pause(self, run_id: str, exc: Exception) -> None:
+        """Stop on RunStopped, pause on BudgetExceeded; either way the run can resume."""
         status = RunStatus.STOPPED if isinstance(exc, RunStopped) else RunStatus.PAUSED
         await self._set_status(run_id, status)
 
@@ -140,6 +146,7 @@ class OrchestratorBase:
         return ArtifactRef(kind=task.output_kind, version=latest.version if latest else 1)
 
     async def _emit_task(self, name: EventName, task: Task, data: dict[str, object]) -> None:
+        """Emit an event about one task."""
         await self.bus.emit(
             Event(
                 name=name,

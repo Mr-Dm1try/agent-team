@@ -68,6 +68,7 @@ async def create_user_task(
 
 
 def _str(args: dict[str, Any], key: str, tool: str, *, required: bool = True) -> str | None:
+    """A required (or optional) non-empty string argument, stripped."""
     value = args.get(key)
     if value is None and not required:
         return None
@@ -77,6 +78,7 @@ def _str(args: dict[str, Any], key: str, tool: str, *, required: bool = True) ->
 
 
 def _task_line(t: Task) -> str:
+    """One task as a single line for list_tasks."""
     out = f" -> {t.output}" if t.output else ""
     err = f" error={t.last_error}" if t.last_error else ""
     return (
@@ -89,6 +91,7 @@ class ListTasks:
     """Tool: the run's tasks, one line each."""
 
     def __init__(self, tasks: TaskStore) -> None:
+        """Read-only, so it is safe to repeat on resume."""
         self.tasks = tasks
         self.safe_to_repeat = True
         self.spec = ToolSpec(
@@ -104,6 +107,7 @@ class ListTasks:
         )
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """The run's tasks, filtered by phase and status."""
         try:
             phase = Phase(args["phase"]) if args.get("phase") else None
             status = TaskStatus(args["status"]) if args.get("status") else None
@@ -118,6 +122,7 @@ class GetTask:
     """Tool: one task in full."""
 
     def __init__(self, tasks: TaskStore) -> None:
+        """Read-only, so it is safe to repeat on resume."""
         self.tasks = tasks
         self.safe_to_repeat = True
         self.spec = ToolSpec(
@@ -131,6 +136,7 @@ class GetTask:
         )
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """The full task record, refusing tasks of other runs."""
         task_id = _str(args, "task_id", self.spec.name)
         try:
             task = await self.tasks.get_task(task_id or "")
@@ -145,6 +151,7 @@ class GetArtifact:
     """Tool: one artifact version as JSON."""
 
     def __init__(self, artifacts: ArtifactStore) -> None:
+        """Read-only, so it is safe to repeat on resume."""
         self.artifacts = artifacts
         self.safe_to_repeat = True
         self.spec = ToolSpec(
@@ -158,6 +165,7 @@ class GetArtifact:
         )
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """Load ``kind@vN`` exactly, or the latest version of a bare kind."""
         raw = _str(args, "ref", self.spec.name) or ""
         try:
             if "@" in raw:
@@ -178,6 +186,7 @@ class GetVerdicts:
     """Tool: the audit verdicts on a task."""
 
     def __init__(self, verdicts: VerdictStore) -> None:
+        """Read-only, so it is safe to repeat on resume."""
         self.verdicts = verdicts
         self.safe_to_repeat = True
         self.spec = ToolSpec(
@@ -191,6 +200,7 @@ class GetVerdicts:
         )
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """Every verdict on the task as JSON lines."""
         task_id = _str(args, "task_id", self.spec.name) or ""
         found = await self.verdicts.for_task(task_id)
         if not found:
@@ -202,6 +212,7 @@ class ListDecisions:
     """Tool: the run's decision log."""
 
     def __init__(self, decisions: DecisionLog) -> None:
+        """Read-only, so it is safe to repeat on resume."""
         self.decisions = decisions
         self.safe_to_repeat = True
         self.spec = ToolSpec(
@@ -214,6 +225,7 @@ class ListDecisions:
         )
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """The decision log, optionally for one task, one line each."""
         task_id = args.get("task_id")
         found = [
             d for d in await self.decisions.list(ctx.run.id) if not task_id or d.task_id == task_id
@@ -230,6 +242,7 @@ class ReadTrace:
     """Reads runs/<run_id>/logs/events.jsonl, written by the tracer hook."""
 
     def __init__(self) -> None:
+        """Read-only, so it is safe to repeat on resume."""
         self.safe_to_repeat = True
         self.spec = ToolSpec(
             name="read_trace",
@@ -244,6 +257,7 @@ class ReadTrace:
         )
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """The last events from the run's events.jsonl, optionally for one task."""
         path = Path(ctx.run.workspace).parent / "logs" / "events.jsonl"
         if not path.is_file():
             return ToolResult(content="no trace file yet", is_error=True)
@@ -267,6 +281,7 @@ class CreateTask:
     """Tool: add a task, checked against the agent's phase and output kinds."""
 
     def __init__(self, tasks: TaskStore, max_attempts: int = 3) -> None:
+        """Creates rows, so it is not repeated on resume."""
         self.tasks = tasks
         self.max_attempts = max_attempts
         self.safe_to_repeat = False
@@ -292,6 +307,7 @@ class CreateTask:
         )
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """Validate the agent, phase and output kind, then create the task."""
         name = self.spec.name
         try:
             agent = AgentName(str(args.get("agent")))
@@ -343,6 +359,7 @@ class AskUser:
     """Tool: put a question to the user as a waiting user task."""
 
     def __init__(self, tasks: TaskStore) -> None:
+        """Creates a user task, so it is not repeated on resume."""
         self.tasks = tasks
         self.safe_to_repeat = False
         self.spec = ToolSpec(
@@ -359,6 +376,7 @@ class AskUser:
         )
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """Create a waiting user task with the question, in the given or current phase."""
         question = _str(args, "question", self.spec.name) or ""
         try:
             phase = Phase(args["phase"]) if args.get("phase") else ctx.task.phase

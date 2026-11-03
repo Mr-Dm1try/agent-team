@@ -66,6 +66,7 @@ class ProgressNote(BaseModel):
         """The note as the plain-text message that replaces summarized turns."""
 
         def section(title: str, items: list[str]) -> str:
+            """One titled bullet list, with a placeholder when it's empty."""
             body = "\n".join(f"- {i}" for i in items) or "- (none)"
             return f"{title}:\n{body}"
 
@@ -98,10 +99,12 @@ class CompactionResult:
 
 
 def _tool_names(messages: list[Message]) -> dict[str, ToolUseBlock]:
+    """Tool calls by id, so a stub can say which call a result came from."""
     return {b.id: b for m in messages for b in m.content if isinstance(b, ToolUseBlock)}
 
 
 def _stub_line(result: ToolResultBlock, call: ToolUseBlock | None) -> str:
+    """The one-line note that replaces an old tool result: call, status, first line, file."""
     first = result.content.strip().splitlines()[0][:100] if result.content.strip() else ""
     if call is None:
         label = "tool result"
@@ -117,6 +120,7 @@ class Compactor:
     """Keeps a tool loop's context under budget: trim, then stub, then summarize."""
 
     def __init__(self, *, keep_last: int = 4, trigger_ratio: float = TRIGGER_RATIO) -> None:
+        """``keep_last`` turns are never compacted; compaction starts at ``trigger_ratio``."""
         self.keep_last = keep_last
         self.trigger_ratio = trigger_ratio
 
@@ -159,6 +163,7 @@ class Compactor:
         tail = self._protected_tail_start(messages)
 
         def fits() -> bool:
+            """Re-estimate the compacted history and say whether it is under the limit."""
             result.after = estimate_tokens(system, result.messages, tools)
             return result.after <= limit
 
@@ -250,6 +255,8 @@ class Compactor:
         agent: AgentName,
         task_id: str,
     ) -> tuple[ProgressNote, Usage]:
+        """One model call that turns the dropped turns into a checked progress note, with a
+        mechanical fallback."""
         lines: list[str] = []
         for msg in middle:
             for b in msg.content:

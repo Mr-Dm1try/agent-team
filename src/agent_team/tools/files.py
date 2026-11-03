@@ -21,6 +21,7 @@ _SKIP_DIRS = frozenset({".git", "__pycache__", ".venv", "node_modules", ".mypy_c
 
 
 def _str_arg(args: dict[str, Any], key: str, tool: str, default: str | None = None) -> str:
+    """A string argument, or a ToolError the model can read."""
     value = args.get(key, default)
     if not isinstance(value, str):
         raise ToolError(f"argument {key!r} must be a string", tool=tool)
@@ -28,6 +29,7 @@ def _str_arg(args: dict[str, Any], key: str, tool: str, default: str | None = No
 
 
 def _int_arg(args: dict[str, Any], key: str, tool: str, default: int) -> int:
+    """A non-negative integer argument, or a ToolError the model can read."""
     value = args.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ToolError(f"argument {key!r} must be a non-negative integer", tool=tool)
@@ -45,6 +47,8 @@ def _allowed(path: Path, run: Run) -> bool:
 
 
 def _walk(root: Path, run: Run) -> list[Path]:
+    """Every allowed path under ``root``, skipping .git, caches, virtualenvs and
+    symlinks that escape."""
     out: list[Path] = []
     for path in sorted(root.rglob("*")):
         if any(part in _SKIP_DIRS for part in path.relative_to(root).parts):
@@ -76,6 +80,7 @@ class ReadFileTool:
     safe_to_repeat: bool = True
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """Numbered lines from ``offset``, ``limit`` at a time."""
         name = self.spec.name
         path = resolve_path(_str_arg(args, "path", name), ctx.run, write=False, tool=name)
         offset = max(_int_arg(args, "offset", name, 1), 1)
@@ -115,6 +120,7 @@ class ListDirTool:
     max_entries: ClassVar[int] = 500
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """The folder's files, recursively by default."""
         name = self.spec.name
         root = resolve_path(_str_arg(args, "path", name, "."), ctx.run, write=False, tool=name)
         if not root.is_dir():
@@ -162,6 +168,7 @@ class GrepTool:
     max_matches: ClassVar[int] = 200
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """Matching lines as ``path:line: text``, optionally limited by a glob."""
         name = self.spec.name
         try:
             regex = re.compile(_str_arg(args, "pattern", name))
@@ -208,6 +215,7 @@ class WriteFileTool:
     safe_to_repeat: bool = False
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """Write the file, creating folders as needed, and say how many lines it has."""
         name = self.spec.name
         path = resolve_path(_str_arg(args, "path", name), ctx.run, write=True, tool=name)
         content = _str_arg(args, "content", name)

@@ -207,12 +207,14 @@ class Orchestrator(SettleMixin, DecisionsMixin):
         return Reply(kind="error", text="Stopped: too many orchestration steps.", run_id=run_id)
 
     async def _ready(self, run_id: str, phase: Phase) -> list[Task]:
+        """Agent tasks in ``phase`` that can run now."""
         found = {t.id: t for t in await self.tasks.ready_tasks(run_id)}
         for t in await self.tasks.list_tasks(run_id, status=TaskStatus.READY):
             found.setdefault(t.id, t)
         return [t for t in found.values() if t.phase is phase and t.agent is not AgentName.USER]
 
     async def _pending(self, run_id: str) -> list[Task]:
+        """User tasks waiting on an answer or review."""
         return [
             t
             for t in await self.tasks.list_tasks(run_id, status=TaskStatus.WAITING)
@@ -220,12 +222,14 @@ class Orchestrator(SettleMixin, DecisionsMixin):
         ]
 
     def _kind(self, tasks: list[Task]) -> RequestKind:
+        """The run's request kind, read back from the planning task's objective."""
         for t in tasks:
             if t.agent is AgentName.ORCHESTRATOR and t.output_kind == "plan":
                 return kind_from_objective(t.objective) or RequestKind.BUILD
         return RequestKind.BUILD
 
     async def _phase_started(self, run: Run, phase: Phase) -> None:
+        """Emit phase_started once per phase in this process."""
         started = self._started.setdefault(run.id, set())
         if phase not in started:
             started.add(phase)
@@ -236,6 +240,8 @@ class Orchestrator(SettleMixin, DecisionsMixin):
     # --- one task: dispatch, audit, apply --------------------------------------------
 
     async def _run_task(self, run: Run, task: Task) -> None:
+        """Log the delegation, dispatch the task, and audit the output unless the run paused or the
+        task was reopened."""
         await self._record(
             Decision(
                 run_id=run.id,
@@ -258,6 +264,8 @@ class Orchestrator(SettleMixin, DecisionsMixin):
             await self._audit(run, task, result.artifact)
 
     async def _audit(self, run: Run, task: Task, artifact: Artifact | None) -> None:
+        """Audit one output and apply the policy's decisions; fails closed and pauses on budget or
+        stop."""
         try:
             verdict = await self.auditor.audit_task(task, artifact, run)
         except PAUSING as exc:
@@ -286,6 +294,7 @@ class Orchestrator(SettleMixin, DecisionsMixin):
             await self._apply(run, decision, verdict)
 
     async def _after_plan(self, run: Run, task: Task, plan: Plan) -> None:
+        """Expand a passed plan into the fixed pipeline of tasks."""
         assert task.output is not None
         new_tasks = expand_plan(plan, task.output, run, task, max_attempts=self.config.max_attempts)
         for t in new_tasks:
@@ -348,6 +357,7 @@ class Orchestrator(SettleMixin, DecisionsMixin):
         inputs: dict[str, object],
         reason: str,
     ) -> None:
+        """Log a code-made pipeline expansion as a PLAN decision."""
         await self._record(
             Decision(
                 run_id=run.id,
@@ -363,6 +373,7 @@ class Orchestrator(SettleMixin, DecisionsMixin):
         )
 
     async def _save_verdict(self, verdict: Verdict) -> None:
+        """Store a verdict and emit audit_verdict for it."""
         await self.verdicts.save(verdict)
         await self.bus.emit(
             Event(
@@ -384,6 +395,8 @@ class Orchestrator(SettleMixin, DecisionsMixin):
     # --- gates and the end of a run -------------------------------------------------
 
     async def _gate(self, run: Run, phase: Phase, machine: PhaseMachine, tasks: list[Task]) -> None:
+        """Audit a finished phase; on a pass start the next phase's work and ask for a review if the
+        mode wants one."""
         try:
             verdict = await self.auditor.audit_gate(run, phase)
         except PAUSING as exc:
@@ -415,6 +428,7 @@ class Orchestrator(SettleMixin, DecisionsMixin):
     async def _request_review(
         self, run: Run, phase: Phase, tasks: list[Task], gate: Verdict
     ) -> None:
+        """Ask the user to review a phase, with the audit summary, warnings and outputs."""
         experts = gates.expert_tasks(tasks, phase)
         outputs = [str(t.output) for t in experts if t.output]
         summaries = [f"Audit: {gate.summary}"] if gate.summary else []
@@ -447,6 +461,7 @@ class Orchestrator(SettleMixin, DecisionsMixin):
         )
 
     async def _finish_run(self, run: Run) -> Reply:
+        """Run the whole-run audit: finish the run on a pass, or ask the user how to proceed."""
         try:
             verdict = await self.auditor.audit_run(run)
         except PAUSING as exc:
@@ -614,6 +629,7 @@ class Orchestrator(SettleMixin, DecisionsMixin):
 def _prepare_workspace(
     runs_dir: Path, run_id: str, context_dirs: list[str]
 ) -> tuple[Path, list[str]]:
+    """Create the run's workspace and resolve the context folders to absolute paths."""
     workspace = (runs_dir / run_id / "workspace").resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     return workspace, [str(Path(d).resolve()) for d in context_dirs]

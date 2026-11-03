@@ -64,6 +64,8 @@ def heuristic(text: str, has_run: bool) -> Classification:
 
 
 def _sanitize(c: Classification, has_run: bool) -> Classification:
+    """Fix kinds that can't apply: no run to change or ask about, or a change target that isn't prd,
+    spec or code_change."""
     if not has_run and c.kind is RequestKind.CHANGE:
         return c.model_copy(
             update={"kind": RequestKind.BUILD, "reason": c.reason + " (no run to change)"}

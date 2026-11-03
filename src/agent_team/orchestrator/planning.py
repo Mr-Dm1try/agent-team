@@ -25,6 +25,7 @@ RULE = "pipeline"
 
 
 def _asks(plan: Plan) -> str:
+    """The plan's asks as one line, for task objectives."""
     return "; ".join(f"{a.id} {a.text}" for a in plan.asks)
 
 
@@ -46,6 +47,7 @@ def expand_plan(
         deps: list[str],
         reason: str,
     ) -> Task:
+        """A new ready-to-schedule task that depends on the planning task and ``deps``."""
         return Task(
             id=new_id("task"),
             run_id=run.id,

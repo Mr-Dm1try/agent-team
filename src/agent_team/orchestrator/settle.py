@@ -60,6 +60,7 @@ class SettleMixin(OrchestratorBase):
         return changed
 
     async def _unblock(self, task: Task, children: list[Task]) -> None:
+        """Feed the children's answers back as inputs and make the task ready again."""
         ids = {c.id for c in children}
         task.depends_on = [d for d in task.depends_on if d not in ids]
         for c in children:
@@ -168,6 +169,7 @@ class SettleMixin(OrchestratorBase):
         return True
 
     async def _ask_about_escalation(self, run: Run, task: Task) -> None:
+        """Ask the user how to get an escalated task unstuck."""
         why = task.last_error or "it failed its audit with no attempts left"
         child = await create_user_task(
             self.tasks,
