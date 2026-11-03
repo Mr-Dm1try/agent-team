@@ -21,10 +21,18 @@ from agent_team.core.models import (
     Run,
     Task,
     TaskEnvelope,
+    Usage,
 )
-from agent_team.llm.types import Message, TextBlock, ToolResultBlock, ToolUseBlock
+from agent_team.llm.types import (
+    LLMRequest,
+    LLMResponse,
+    Message,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from agent_team.tools import file_tools
-from agents.fakes import FakeBus, FakeCheckpoints, FakeLLM, tool_call
+from agents.fakes import FakeBus, FakeCheckpoints, FakeLLM, prompt_tokens, tool_call
 from agents.scenario import CODE, PRD
 
 
@@ -74,7 +82,7 @@ async def test_tool_loop_writes_file_and_checkpoints_each_step(tmp_path: Path) -
     assert [s for s, _ in steps] == [1, 2, 3, 4]
     assert EventName.TOOL_CALL_BEFORE not in bus.names()  # before events go to check(), not emit
     assert bus.names().count(EventName.TOOL_CALL_AFTER) == 1
-    assert result.usage.input_tokens == 20
+    assert result.usage.input_tokens == sum(prompt_tokens(r) for r in llm.requests)
     # The tool specs went to the model.
     assert {t.name for t in llm.requests[0].tools} >= {"write_file", "read_file"}
 
@@ -206,7 +214,7 @@ async def test_compaction_runs_inside_the_loop(tmp_path: Path) -> None:
                 else script.pop(0)
             )
         },
-        budget=5000,
+        budget=3000,
     )
     bus = FakeBus()
     agent = Engineer(settings=LoopSettings(max_steps=60), compactor=Compactor(keep_last=2))
@@ -395,3 +403,77 @@ def test_tool_specs_count_toward_the_estimate() -> None:
     msgs = [Message.user("hi")]
     specs = [t.spec for t in file_tools().values()]
     assert estimate_tokens("s", msgs, specs) > estimate_tokens("s", msgs) + 100
+
+
+class CountingLLM(FakeLLM):
+    """A fake whose calls report the prompt sizes in ``reported`` (the last one
+    repeats) and are served by ``providers`` in a cycle."""
+
+    def __init__(
+        self, script: dict[AgentName, Any], *, reported: list[int], providers: list[str]
+    ) -> None:
+        super().__init__(script, budget=10_000)
+        self.reported = reported
+        self.providers = providers
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        response = await super().complete(request)
+        n = len(self.requests) - 1
+        return response.model_copy(
+            update={
+                "usage": Usage(input_tokens=self.reported[min(n, len(self.reported) - 1)]),
+                "provider": self.providers[n % len(self.providers)],
+            }
+        )
+
+
+def _reads(n: int) -> list[Any]:
+    """``n`` small tool calls, then the final output."""
+    calls: list[Any] = [tool_call("list_dir", {"path": "."}, call_id=f"c{i}") for i in range(n)]
+    return [*calls, json.dumps(CODE)]
+
+
+async def test_compaction_anchors_on_the_reported_prompt_size(tmp_path: Path) -> None:
+    # The history is tiny by estimate, but the provider says it is near the budget.
+    env = envelope(tmp_path, AgentName.ENGINEER, "code_change")
+    script = _reads(3)
+    llm = CountingLLM(
+        {
+            AgentName.ENGINEER: lambda r: (
+                _summary(r) or (script.pop(0) if script else json.dumps(CODE))
+            )
+        },
+        reported=[9_000],
+        providers=["p"],
+    )
+    bus = FakeBus()
+    await Engineer(compactor=Compactor(keep_last=2)).run(env, ctx(llm, bus))
+    compactions = [e for e in bus.events if e.name is EventName.CONTEXT_COMPACTED]
+    assert compactions and compactions[0].data["tokens_before"] > 9_000
+
+
+async def test_a_provider_switch_drops_the_anchor(tmp_path: Path) -> None:
+    # After the first call every call is served by another provider than the one
+    # before it (fallbacks), so their large counts are not anchored on and the small
+    # history is estimated in full.
+    env = envelope(tmp_path, AgentName.ENGINEER, "code_change")
+    script = _reads(3)
+    llm = CountingLLM(
+        {
+            AgentName.ENGINEER: lambda r: (
+                _summary(r) or (script.pop(0) if script else json.dumps(CODE))
+            )
+        },
+        reported=[100, 9_000],
+        providers=["p", "q"],
+    )
+    bus = FakeBus()
+    await Engineer(compactor=Compactor(keep_last=2)).run(env, ctx(llm, bus))
+    assert EventName.CONTEXT_COMPACTED not in bus.names()
+
+
+def _summary(request: LLMRequest) -> str | None:
+    """The summarize step's reply, for compaction requests."""
+    if request.system.startswith("You compress"):
+        return '{"done": [], "decisions": [], "remaining": []}'
+    return None

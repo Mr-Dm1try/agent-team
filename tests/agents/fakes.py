@@ -8,6 +8,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+from agent_team.agents.compaction import sent_json
 from agent_team.core.artifacts import Artifact, ArtifactRef
 from agent_team.core.errors import InvalidTransition
 from agent_team.core.interfaces import AfterHook, BeforeHook
@@ -274,6 +275,11 @@ def tool_call(name: str, args: dict[str, Any], call_id: str = "call_1") -> list[
     return [ToolUseBlock(id=call_id, name=name, arguments=args)]
 
 
+def prompt_tokens(request: LLMRequest) -> int:
+    """A provider-like prompt count: four characters of the sent JSON per token."""
+    return max(1, len(sent_json(request.system, request.messages, request.tools)) // 4)
+
+
 class FakeLLM:
     """Scripted model. ``script`` maps an agent to a queue of replies, or a responder
     function that gets the request. Records every request."""
@@ -305,7 +311,7 @@ class FakeLLM:
         return LLMResponse(
             content=blocks,
             stop_reason=stop,
-            usage=Usage(input_tokens=10, output_tokens=5),
+            usage=Usage(input_tokens=prompt_tokens(request), output_tokens=5),
             provider="fake",
             model="fake-1",
         )

@@ -16,6 +16,7 @@ rewritten point (docs/DESIGN.md, "Context compaction") and reports it as
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -24,13 +25,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent_team.agents.jsonrepair import parse_output
 from agent_team.core.interfaces import EventBus
 from agent_team.core.models import AgentName, Event, EventName, Run, Usage
-from agent_team.llm.tokens import estimate_json_tokens
+from agent_team.llm.tokens import CHARS_PER_TOKEN, Anchor, estimate_json_tokens, to_json
 from agent_team.llm.types import (
     ContentBlock,
     LLMClient,
     LLMRequest,
     Message,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolSpec,
     ToolUseBlock,
@@ -44,14 +46,52 @@ TRIM_CHARS = 2_000
 PREVIEW_CHARS = 400
 
 
-def estimate_tokens(system: str, messages: list[Message], tools: Sequence[ToolSpec] = ()) -> int:
+def sent_json(
+    system: str, messages: list[Message], tools: Sequence[ToolSpec] = (), *, thinking: bool = True
+) -> str:
+    """Everything a call sends, as the JSON the estimate counts: the system prompt, the
+    messages and the tool specs. ``thinking=False`` leaves thinking blocks out, which
+    providers don't count (or don't get) the way they are stored."""
+    dumped = [
+        m.model_dump(mode="json")
+        if thinking
+        else {
+            **m.model_dump(mode="json"),
+            "content": [
+                b.model_dump(mode="json") for b in m.content if not isinstance(b, ThinkingBlock)
+            ],
+        }
+        for m in messages
+    ]
+    return to_json(system, dumped, [t.model_dump(mode="json") for t in tools])
+
+
+def estimate_tokens(
+    system: str,
+    messages: list[Message],
+    tools: Sequence[ToolSpec] = (),
+    chars_per_token: float = CHARS_PER_TOKEN,
+) -> int:
     """The shared high estimate over everything a call sends: the system prompt, the
     messages and the tool specs as JSON. Thinking blocks count at their full raw size."""
-    return estimate_json_tokens(
-        system,
-        [m.model_dump(mode="json") for m in messages],
-        [t.model_dump(mode="json") for t in tools],
-    )
+    return estimate_json_tokens(sent_json(system, messages, tools), chars_per_token=chars_per_token)
+
+
+def context_tokens(
+    system: str,
+    messages: list[Message],
+    tools: Sequence[ToolSpec] = (),
+    *,
+    anchor: Anchor | None = None,
+    chars_per_token: float = CHARS_PER_TOKEN,
+) -> int:
+    """The prompt's size: the provider's count for the messages the anchor covers plus
+    an estimate of those appended since, or a full estimate when there is no anchor
+    (before the first call, after compaction or a provider switch)."""
+    if anchor is None or anchor.sent > len(messages):
+        return estimate_tokens(system, messages, tools, chars_per_token)
+    appended = [m.model_dump(mode="json") for m in messages[anchor.sent :]]
+    return anchor.tokens + estimate_json_tokens(appended, chars_per_token=chars_per_token)
 
 
 class ProgressNote(BaseModel):
@@ -130,9 +170,16 @@ class Compactor:
         messages: list[Message],
         budget: int,
         tools: Sequence[ToolSpec] = (),
+        *,
+        anchor: Anchor | None = None,
+        chars_per_token: float = CHARS_PER_TOKEN,
     ) -> bool:
-        """True when the estimated context is over the trigger share of ``budget``."""
-        return estimate_tokens(system, messages, tools) > int(budget * self.trigger_ratio)
+        """True when the context (anchored on the provider's last count when there is
+        one) is over the trigger share of ``budget``."""
+        size = context_tokens(
+            system, messages, tools, anchor=anchor, chars_per_token=chars_per_token
+        )
+        return size > int(budget * self.trigger_ratio)
 
     def _protected_tail_start(self, messages: list[Message]) -> int:
         """Index of the first message in the protected tail. It always starts on an
@@ -155,16 +202,27 @@ class Compactor:
         task_id: str,
         attempt: int,
         tools: Sequence[ToolSpec] = (),
+        anchor: Anchor | None = None,
+        chars_per_token: float = CHARS_PER_TOKEN,
     ) -> CompactionResult:
-        """Shrink ``messages`` stage by stage until they fit; emits a compaction event."""
+        """Shrink ``messages`` stage by stage until they fit; emits a compaction event.
+        The size before is anchored like ``needs_compaction``. The rewritten history has
+        no provider count, so it is estimated in full and scaled by how far the anchored
+        size was from the full estimate of the history before, keeping both in the
+        provider's units."""
         limit = int(budget * self.trigger_ratio)
-        before = estimate_tokens(system, messages, tools)
+        estimated = estimate_tokens(system, messages, tools, chars_per_token)
+        before = context_tokens(
+            system, messages, tools, anchor=anchor, chars_per_token=chars_per_token
+        )
+        scale = before / estimated if estimated else 1.0
         result = CompactionResult(messages=list(messages), before=before, after=before)
         tail = self._protected_tail_start(messages)
 
         def fits() -> bool:
             """Re-estimate the compacted history and say whether it is under the limit."""
-            result.after = estimate_tokens(system, result.messages, tools)
+            size = estimate_tokens(system, result.messages, tools, chars_per_token)
+            result.after = math.ceil(size * scale)
             return result.after <= limit
 
         # 1. Trim large tool results outside the tail.

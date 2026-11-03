@@ -15,11 +15,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from agent_team.agents.compaction import Compactor
+from agent_team.agents.compaction import Compactor, sent_json
 from agent_team.agents.jsonrepair import parse_output
 from agent_team.core.errors import OutputValidationError, ToolError
 from agent_team.core.interfaces import CheckpointStore, EventBus, Tool, ToolContext
 from agent_team.core.models import AgentName, Event, EventName, Run, ToolResult, Usage
+from agent_team.llm.tokens import Anchor, Calibration
 from agent_team.llm.types import (
     ContentBlock,
     LLMClient,
@@ -84,6 +85,8 @@ class ToolLoop[M: BaseModel]:
     attempt: int
     settings: LoopSettings = field(default_factory=LoopSettings)
     compactor: Compactor = field(default_factory=Compactor)
+    #: Chars per token per model, learned from this loop's calls (or shared, if given).
+    calibration: Calibration = field(default_factory=Calibration)
     check: Check | None = None
     trace_id: str | None = None
     span_id: str | None = None
@@ -91,6 +94,10 @@ class ToolLoop[M: BaseModel]:
     _step: int = 0
     _usage: Usage = field(default_factory=Usage)
     _model: str | None = None
+    #: The provider's prompt count for the last call, which compaction anchors on.
+    _anchor: Anchor | None = None
+    #: The provider and model that served the last call.
+    _served: tuple[str, str] | None = None
 
     # --- checkpoints ---------------------------------------------------------------
 
@@ -221,7 +228,29 @@ class ToolLoop[M: BaseModel]:
         response = await self.llm.complete(request)
         self._usage = self._usage + response.usage
         self._model = response.model
+        self._learn(request, response)
         return response
+
+    def _learn(self, request: LLMRequest, response: LLMResponse) -> None:
+        """Anchor on the provider's count of this call's prompt and calibrate the model's
+        chars per token from it, measured without thinking blocks (which the provider
+        doesn't count as stored). A response with no plausible count leaves no anchor,
+        and so does one from another provider or model than the call before (a
+        fallback): the next call may go back, and the two count differently, so it is
+        estimated in full."""
+        tokens = response.usage.input_tokens
+        served = (response.provider, response.model)
+        switched = self._served is not None and served != self._served
+        self._served = served
+        if tokens <= 0:
+            self._anchor = None
+            return
+        chars = len(sent_json(request.system, request.messages, request.tools, thinking=False))
+        plausible = self.calibration.observe(response.model, chars, tokens)
+        if switched or not plausible:
+            self._anchor = None
+            return
+        self._anchor = Anchor(sent=len(request.messages), tokens=tokens)
 
     async def _validate(self, text: str) -> tuple[M | None, list[str]]:
         """Parse the reply into the output model, then run the agent's own checks on it."""
@@ -240,7 +269,12 @@ class ToolLoop[M: BaseModel]:
         """Compact the history when it nears the budget, and checkpoint the compacted version."""
         budget = self.llm.context_budget(self.agent)
         specs = self._specs()
-        if not self.compactor.needs_compaction(self.system, messages, budget, specs):
+        # The lowest ratio over the models seen: after a fallback the next call may go
+        # to either, so estimate for the one that counts more tokens.
+        ratio = self.calibration.ratio(None)
+        if not self.compactor.needs_compaction(
+            self.system, messages, budget, specs, anchor=self._anchor, chars_per_token=ratio
+        ):
             return messages
         result = await self.compactor.compact(
             system=self.system,
@@ -253,9 +287,12 @@ class ToolLoop[M: BaseModel]:
             task_id=self.task_id,
             attempt=self.attempt,
             tools=specs,
+            anchor=self._anchor,
+            chars_per_token=ratio,
         )
         self._usage = self._usage + result.usage
         if result.steps:
+            self._anchor = None  # the provider never counted the rewritten history
             # The checkpoint keeps the compacted history, so a resume continues from it.
             await self._save(result.messages)
         return result.messages

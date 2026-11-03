@@ -13,6 +13,7 @@ from agent_team.core.config import AnthropicConfig, OllamaConfig
 from agent_team.core.errors import ContextTooLong, TransientLLMError
 from agent_team.llm import anthropic_provider as ap
 from agent_team.llm import ollama_provider as op
+from agent_team.llm.tokens import SAFETY, estimate_json_tokens, to_json
 from agent_team.llm.types import (
     Message,
     TextBlock,
@@ -429,7 +430,8 @@ async def test_ollama_translates_request_and_response() -> None:
 
 
 async def test_ollama_fits_prompt_and_reply_into_num_ctx() -> None:
-    comps = StubCompletions(chat_completion())
+    # No usage reported, so nothing is anchored or learned: the plain estimate caps.
+    comps = StubCompletions(chat_completion(usage=None))
     provider = op.OllamaProvider(
         OllamaConfig(num_ctx=4000, min_output_tokens=500),
         client=SimpleNamespace(chat=SimpleNamespace(completions=comps)),
@@ -493,3 +495,72 @@ def test_build_providers_needs_no_credentials() -> None:
 
     gw = build_gateway(load_config())
     assert set(gw.providers) == {"anthropic", "ollama"}
+
+
+def _counted(prompt_tokens: int) -> openai.types.chat.ChatCompletion:
+    """A completion whose usage reports ``prompt_tokens``."""
+    return chat_completion(
+        usage={"prompt_tokens": prompt_tokens, "completion_tokens": 4, "total_tokens": 0}
+    )
+
+
+async def test_ollama_anchors_the_cap_on_the_last_reported_prompt() -> None:
+    comps = StubCompletions(_counted(100))
+    provider = op.OllamaProvider(
+        OllamaConfig(num_ctx=8_000, min_output_tokens=500),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=comps)),
+    )
+    first = [Message.user("hello " * 50)]
+    await provider.complete(request(messages=first), model="gpt-oss:20b")
+    sent = comps.calls[0]
+    chars = len(to_json(sent["messages"], sent.get("tools", [])))
+    assert provider.calibration.ratio("gpt-oss:20b") == chars / 100 * SAFETY
+
+    # The next call extends the same history: Ollama's 100 plus the new messages only.
+    later = [*first, Message(role="assistant", content=[TextBlock(text="ok")]), Message.user("go")]
+    await provider.complete(request(messages=later, max_tokens=16_000), model="gpt-oss:20b")
+    ratio = provider.calibration.ratio("gpt-oss:20b")
+    appended = estimate_json_tokens(op.to_chat_messages("", later[1:]), chars_per_token=ratio)
+    assert comps.calls[1]["max_tokens"] == 8_000 - (100 + appended)
+
+    # A rewritten history (compaction) isn't anchored on: it is estimated in full.
+    rewritten = [Message.user("summary"), *later[1:]]
+    ratio = provider.calibration.ratio("gpt-oss:20b")
+    await provider.complete(request(messages=rewritten, max_tokens=16_000), model="gpt-oss:20b")
+    full = op.prompt_tokens(comps.calls[2], ratio)
+    assert comps.calls[2]["max_tokens"] == 8_000 - full
+
+
+async def test_ollama_warns_when_the_prompt_nearly_filled_num_ctx(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    comps = StubCompletions(_counted(3_950))
+    provider = op.OllamaProvider(
+        OllamaConfig(num_ctx=4_000, min_output_tokens=500),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=comps)),
+    )
+    with caplog.at_level("WARNING", logger=op.__name__):
+        await provider.complete(request(), model="gpt-oss:20b")
+    assert "within 2% of num_ctx 4000" in caplog.text
+    # A count from a prompt that was probably cut teaches nothing.
+    assert provider.calibration.ratio("gpt-oss:20b") == provider.config.chars_per_token
+    assert not provider._anchors
+    caplog.clear()
+    comps.result = _counted(3_000)
+    with caplog.at_level("WARNING", logger=op.__name__):
+        await provider.complete(request(messages=[Message.user("other")]), model="gpt-oss:20b")
+    assert not caplog.text
+
+
+async def test_ollama_does_not_warn_about_a_full_prompt_the_cap_left_room_for(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Within 2% of num_ctx, but inside the room the cap leaves: nothing was cut.
+    comps = StubCompletions(_counted(98_500))
+    provider = op.OllamaProvider(
+        OllamaConfig(num_ctx=100_000, min_output_tokens=1_024),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=comps)),
+    )
+    with caplog.at_level("WARNING", logger=op.__name__):
+        await provider.complete(request(), model="gpt-oss:20b")
+    assert not caplog.text

@@ -164,8 +164,9 @@ class Config(_Cfg):
     @model_validator(mode="after")
     def _ollama_routes_fit(self) -> Config:
         """Check agents routed to Ollama (or its stronger model) leave reply room in num_ctx."""
-        # Compaction keeps a budget in the shared estimate (llm.tokens); Ollama may be
-        # set to count more cautiously, so scale to its count before comparing.
+        # Before any usage is observed, compaction estimates at the shared starting ratio
+        # (llm.tokens) and Ollama at its own, which may be more cautious; scale to
+        # Ollama's so the first call of an attempt at the budget still leaves reply room.
         ollama = self.providers.ollama
         for agent in AgentName:
             route = self.route_for(agent)
