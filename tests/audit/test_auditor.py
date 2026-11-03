@@ -5,12 +5,27 @@ from pathlib import Path
 
 import pytest
 
-from agent_team.audit.auditor import AUDIT_RULE, LLMAuditor
+from agent_team.audit.auditor import LLMAuditor
 from agent_team.audit.rule_store import SqliteRuleStore
 from agent_team.audit.toollog import InMemoryToolCallLog
-from agent_team.core.artifacts import PRD, AcceptanceCriterion, CodeChange, Requirement
+from agent_team.core.artifacts import (
+    PRD,
+    AcceptanceCriterion,
+    Ask,
+    CodeChange,
+    Plan,
+    Requirement,
+)
 from agent_team.core.errors import BudgetExceeded, TransientLLMError
-from agent_team.core.models import AgentName, Phase, RuleScope, Run, Severity, TaskStatus
+from agent_team.core.models import (
+    AUDIT_RULE,
+    AgentName,
+    Phase,
+    RuleScope,
+    Run,
+    Severity,
+    TaskStatus,
+)
 from agent_team.llm.types import TextBlock
 
 from .fakes import (
@@ -36,8 +51,12 @@ class Rig:
 
 
 @pytest.fixture
-def rig(rule_store: SqliteRuleStore, tool_log: InMemoryToolCallLog) -> Rig:
+async def rig(rule_store: SqliteRuleStore, tool_log: InMemoryToolCallLog, run: Run) -> Rig:
+    """An auditor over fakes, with the run's plan saved so PRD coverage can be checked."""
     llm, tasks, artifacts = FakeLLM(), FakeTaskStore(), FakeArtifactStore()
+    await artifacts.save(
+        Plan(summary="s", run_id=run.id, request_kind="build", asks=[Ask(id="ASK-1", text="x")])
+    )
     auditor = LLMAuditor(
         llm=llm,
         rules=rule_store,
@@ -67,7 +86,8 @@ async def test_task_pass(rig: Rig, run: Run) -> None:
     assert verdict.passed and verdict.findings == []
     assert verdict.summary == "fine"
     assert verdict.scope is RuleScope.TASK and verdict.model == "fake-auditor"
-    assert set(verdict.rules_checked) == {"R1", "S1", "S5", "S6", "S7"}  # no R12: not a revision
+    assert set(verdict.rules_checked) == {"R1", "R3", "R9", "R11", "S1", "S5", "S6", "S7"}
+    assert "R12" not in verdict.rules_checked  # not a revision
     assert rig.llm.requests[0].agent is AgentName.AUDITOR
 
 
@@ -76,7 +96,7 @@ async def test_helper_hit_fails_even_if_model_misses_it(rig: Rig, run: Run) -> N
     rig.llm.push(PASS)
     verdict = await rig.auditor.audit_task(task, None, run)  # no artifact: R1 hit
     assert not verdict.passed
-    assert [(f.rule_id, f.from_helper) for f in verdict.blockers] == [("R1", True)]
+    assert ("R1", True) in [(f.rule_id, f.from_helper) for f in verdict.blockers]
 
 
 async def test_model_finding_backed_by_helper_needs_no_second_check(rig: Rig, run: Run) -> None:
@@ -84,7 +104,8 @@ async def test_model_finding_backed_by_helper_needs_no_second_check(rig: Rig, ru
     rig.llm.push({"findings": [{"rule_id": "R1", "item": task.id, "message": "nothing came back"}]})
     verdict = await rig.auditor.audit_task(task, None, run)
     assert len(rig.llm.requests) == 1
-    assert [(f.message, f.from_helper) for f in verdict.blockers] == [("nothing came back", True)]
+    r1 = [(f.message, f.from_helper) for f in verdict.blockers if f.rule_id == "R1"]
+    assert r1 == [("nothing came back", True)]
 
 
 async def test_unsupported_blocker_downgraded_when_second_check_disagrees(
@@ -151,7 +172,7 @@ async def test_fails_closed_when_the_model_errors(rig: Rig, run: Run) -> None:
     rig.llm.push(TransientLLMError("down", provider="fake"))
     verdict = await rig.auditor.audit_task(task, None, run)
     assert not verdict.passed
-    assert {f.rule_id for f in verdict.blockers} == {AUDIT_RULE, "R1"}  # helper hits kept
+    assert {f.rule_id for f in verdict.blockers} >= {AUDIT_RULE, "R1"}  # helper hits kept
 
 
 async def test_budget_exceeded_propagates(rig: Rig, run: Run) -> None:
@@ -170,26 +191,33 @@ async def test_revision_brings_in_r12_and_previous_version(rig: Rig, run: Run) -
     assert "Previous version prd@v1" in str(rig.llm.requests[0].messages[0].content[0])
 
 
-async def test_gate_sweep_reads_phase_outputs(rig: Rig, run: Run) -> None:
-    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd", status=TaskStatus.DONE)
+async def test_prd_check_flags_untestable_requirements(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd")
     untestable = PRD(
         summary="s",
         title="t",
         run_id=run.id,
         requirements=[Requirement(id="REQ-1", text="x", asks=["ASK-1"], acceptance_criteria=[])],
     )
-    task.output = await rig.artifacts.save(untestable)
-    await rig.tasks.create_task(task)
     rig.llm.push(PASS)
-    verdict = await rig.auditor.audit_gate(run, Phase.PRD)
-    assert verdict.scope is RuleScope.PHASE and verdict.phase is Phase.PRD
+    verdict = await rig.auditor.audit_task(task, untestable, run)
+    assert verdict.scope is RuleScope.TASK
     assert {(f.rule_id, f.item) for f in verdict.blockers} >= {("R3", "REQ-1")}
     assert "HIT: REQ-1 has no acceptance criterion" in str(
         rig.llm.requests[0].messages[0].content[0]
     )
 
 
-async def test_implementation_gate_with_code(rig: Rig, run: Run) -> None:
+async def test_engineer_check_needs_tests_run(rig: Rig, run: Run) -> None:
+    eng = make_task(run, AgentName.ENGINEER, Phase.IMPLEMENTATION, "code_change")
+    Path(run.workspace, "app.py").write_text("x = 1\n")  # noqa: ASYNC240
+    rig.llm.push(PASS)
+    change = CodeChange(summary="s", run_id=run.id, files_written=["app.py"])
+    verdict = await rig.auditor.audit_task(eng, change, run)
+    assert "R6" in {f.rule_id for f in verdict.blockers}
+
+
+async def test_qa_check_covers_every_code_change_in_its_phase(rig: Rig, run: Run) -> None:
     Path(run.workspace, "app.py").write_text("import os\nos.system(cmd)\n")  # noqa: ASYNC240
     eng = make_task(
         run, AgentName.ENGINEER, Phase.IMPLEMENTATION, "code_change", status=TaskStatus.DONE
@@ -197,12 +225,25 @@ async def test_implementation_gate_with_code(rig: Rig, run: Run) -> None:
     eng.output = await rig.artifacts.save(
         CodeChange(summary="s", run_id=run.id, files_written=["app.py"])
     )
-    await rig.tasks.create_task(eng)
-    rig.tool_log.record(call(run, eng, "run_command", "ok", command="pytest -q"))
+    old = make_task(
+        run, AgentName.ENGINEER, Phase.IMPLEMENTATION, "code_change", status=TaskStatus.SUPERSEDED
+    )
+    qa = make_task(run, AgentName.QA, Phase.IMPLEMENTATION, "qa_report")
+    old.output = await rig.artifacts.save(
+        CodeChange(summary="s", run_id=run.id, version=2, files_written=["old.py"])
+    )
+    for t in (eng, old, qa):
+        await rig.tasks.create_task(t)
+    # The engineer's own check judged its actions; QA's check must not blame QA for them.
+    rig.tool_log.record(call(run, eng, "run_command", "", command="rm -rf ~/x"))
     rig.llm.push(PASS)
-    verdict = await rig.auditor.audit_gate(run, Phase.IMPLEMENTATION)
+    verdict = await rig.auditor.audit_task(qa, None, run)
     rules = {f.rule_id for f in verdict.blockers}
-    assert {"S2", "R6", "R5", "R7"} <= rules  # dangerous code, no tests, no spec, no QA report
+    assert {"S2", "R5", "R7"} <= rules  # the engineer's dangerous code, no spec, no QA report
+    assert "S5" not in rules
+    assert "R6" not in verdict.rules_checked  # the engineer's own check covers tests
+    prompt = str(rig.llm.requests[0].messages[0].content[0])
+    assert "app.py" in prompt and "old.py" not in prompt  # superseded work is out
 
 
 async def test_run_sweep(rig: Rig, run: Run) -> None:
@@ -222,14 +263,11 @@ async def test_no_rules_means_no_model_call(
     assert verdict.passed and rig.llm.requests == []
 
 
-async def test_planning_gate_shows_the_full_request_and_the_plan(rig: Rig, run: Run) -> None:
-    from agent_team.core.artifacts import Ask, Plan
-
-    await rig.artifacts.save(
-        Plan(summary="s", run_id=run.id, request_kind="build", asks=[Ask(id="ASK-1", text="x")])
-    )
+async def test_plan_check_shows_the_full_request_and_the_plan(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.ORCHESTRATOR, Phase.PLANNING, "plan")
+    plan = await rig.artifacts.latest(run.id, "plan")
     rig.llm.push(PASS)
-    verdict = await rig.auditor.audit_gate(run, Phase.PLANNING)
+    verdict = await rig.auditor.audit_task(task, plan, run)
     block = rig.llm.requests[0].messages[0].content[0]
     assert isinstance(block, TextBlock)
     prompt = block.text

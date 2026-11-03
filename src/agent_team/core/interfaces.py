@@ -201,11 +201,6 @@ class VerdictStore(Protocol):
         """Every verdict on this task, oldest first: one per audited attempt."""
         ...
 
-    async def for_gate(self, run_id: str, phase: Phase) -> list[Verdict]:
-        """Every phase-gate verdict for ``phase`` in this run, oldest first, so gate
-        no-progress detection survives a resume."""
-        ...
-
 
 # --- tools and agents --------------------------------------------------------------
 
@@ -273,7 +268,7 @@ class RuleStore(Protocol):
     async def for_scope(
         self, scope: str, *, phase: Phase | None, agent: AgentName | None
     ) -> list[Rule]:
-        """The enabled rules that apply to one audit: ``scope`` is task, phase or run,
+        """The enabled rules that apply to one audit: ``scope`` is task or run,
         and a rule with no phases or agents listed applies to all of them. ``None``
         skips that filter."""
         ...
@@ -284,16 +279,14 @@ class Auditor(Protocol):
     the model judges each rule. It never runs code and never changes artifacts."""
 
     async def audit_task(self, task: Task, artifact: Artifact | None, run: Run) -> Verdict:
-        """Task sweep. Fails closed: if no valid verdict can be produced, return a
-        failing verdict with an ``AUDIT`` finding rather than raising. The one
-        exception is BudgetExceeded and RunStopped, which propagate so the run stops
-        cleanly; nothing is passed in that case."""
-        ...
-
-    async def audit_gate(self, run: Run, phase: Phase) -> Verdict:
-        """Phase-gate sweep once every task in ``phase`` is done: checks the phase's
-        artifacts together, e.g. that every requirement has a planned check. Fails
-        closed like ``audit_task``."""
+        """The check at the end of a task, against the rules for its phase and agent.
+        It sees the task's output with the latest artifact of every kind, so a rule
+        that needs upstream inputs (every requirement has a planned check) runs here;
+        a QA task's check covers every live output of its phase. Fails closed: if no
+        valid verdict can be produced, return a failing verdict with an ``AUDIT``
+        finding rather than raising. The one exception is BudgetExceeded and
+        RunStopped, which propagate so the run stops cleanly; nothing is passed in
+        that case."""
         ...
 
     async def audit_run(self, run: Run) -> Verdict:
@@ -315,13 +308,13 @@ class VerdictPolicy(Protocol):
     """Turns verdicts into Decisions (agent_team.audit); the orchestrator applies them.
 
     The orchestrator, not the auditor, saves verdicts to VerdictStore and emits
-    ``audit_verdict``. Each Decision's ``inputs`` carries ``task_id`` (None on gate-level
+    ``audit_verdict``. Each Decision's ``inputs`` carries ``task_id`` (None on run-level
     decisions) and usually ``finding_ids``, plus, by kind:
 
     - RETRY: "previous_output"
     - STRONGER_MODEL: "model"
-    - UPSTREAM_RERUN: "artifact" (e.g. "spec@v1"), "phase", "gate", "producer_task_id"
-    - GATE_FIX: "rerun_after" (ids of later tasks to re-run after the fix)
+    - UPSTREAM_RERUN: "artifact" (e.g. "spec@v1"), "phase", "producer_task_id"
+    - FIX: "rerun_after" (ids of later tasks to re-run after the fix)
     - ASK_USER: "question"
     - ESCALATE, NO_PROGRESS, STOP: nothing extra
 
@@ -331,13 +324,11 @@ class VerdictPolicy(Protocol):
     async def on_task_verdict(
         self, run: Run, task: Task, verdict: Verdict, history: list[Verdict]
     ) -> list[Decision]:
-        """What to do after a task audit. ``history`` is the task's earlier verdicts,
-        used to spot a retry that failed the same rules on the same items."""
-        ...
-
-    async def on_gate_verdict(self, run: Run, phase: Phase, verdict: Verdict) -> list[Decision]:
-        """What to do after a phase-gate audit: usually a GATE_FIX for each task whose
-        artifact is at fault, or ASK_USER once fixes stop making progress."""
+        """What to do after a task's end check. ``history`` is the earlier verdicts of
+        the task and of the tasks it was reopened from, oldest first, used to spot a
+        retry or a fix that failed the same rules on the same items. A fault in an
+        earlier phase's artifact reopens it (UPSTREAM_RERUN); one in another task's
+        output in the same phase revises that task (FIX)."""
         ...
 
 

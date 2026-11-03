@@ -226,13 +226,6 @@ class FakeVerdicts:
     async def for_task(self, task_id: str) -> list[Verdict]:
         return [v for v in self.items if v.task_id == task_id]
 
-    async def for_gate(self, run_id: str, phase: Phase) -> list[Verdict]:
-        return [
-            v
-            for v in self.items
-            if v.run_id == run_id and v.scope is RuleScope.PHASE and v.phase is phase
-        ]
-
 
 class PassAuditor:
     """Always passes, unless a test sets ``fail_tasks`` to fail some task sweeps."""
@@ -240,7 +233,6 @@ class PassAuditor:
     def __init__(self) -> None:
         self.fail_next: dict[str, list[Verdict]] = defaultdict(list)  # by output kind
         self.task_calls: list[str] = []
-        self.gates: list[Phase] = []
         self.runs = 0
 
     async def audit_task(self, task: Task, artifact: Artifact | None, run: Run) -> Verdict:
@@ -249,10 +241,6 @@ class PassAuditor:
         if queued:
             return queued.pop(0).model_copy(update={"task_id": task.id, "run_id": run.id})
         return Verdict(run_id=run.id, scope=RuleScope.TASK, task_id=task.id, passed=True)
-
-    async def audit_gate(self, run: Run, phase: Phase) -> Verdict:
-        self.gates.append(phase)
-        return Verdict(run_id=run.id, scope=RuleScope.PHASE, phase=phase, passed=True)
 
     async def audit_run(self, run: Run) -> Verdict:
         self.runs += 1

@@ -292,3 +292,19 @@ Artifact = Annotated[
 ARTIFACT_TYPES: dict[str, type[ArtifactBase]] = {
     cls.model_fields["kind"].default: cls for cls in get_args(get_args(Artifact)[0])
 }
+
+#: Each artifact kind as the user would say it.
+PLAIN_KINDS = {
+    "plan": "the plan",
+    "research_brief": "the research",
+    "research_answer": "the answer",
+    "prd": "the requirements",
+    "spec": "the design",
+    "code_change": "the code",
+    "qa_report": "the QA check",
+}
+
+
+def plain_kind(kind: str) -> str:
+    """An artifact kind as the user would say it."""
+    return PLAIN_KINDS.get(kind, kind.replace("_", " "))

@@ -22,6 +22,8 @@ from agent_team.core.interfaces import (
     VerdictStore,
 )
 from agent_team.core.models import (
+    AUDIT_RULE,
+    DANGEROUS_ACTION_RULES,
     AgentName,
     Decision,
     Event,
@@ -48,9 +50,15 @@ APPROVE = re.compile(
     r"^\s*(approve[ds]?|ok(ay)?|yes|lgtm|looks good|accept(ed)?|ship it)[\s.!]*$", re.I
 )
 CHILD_ORIGINS = frozenset({TaskOrigin.QUESTION, TaskOrigin.RESEARCH_REQUEST})
-#: User-task reasons for questions that aren't tied to one task.
-GATE_QUESTION = "gate"
+#: The user-task reason for a question about the whole-run audit, which isn't tied to
+#: one task.
 RUN_QUESTION = "run_audit"
+#: The user-task reason for a question the verdict policy asks about one task's check.
+TASK_QUESTION = "policy"
+#: The user-task reason for a question about a task that is stuck.
+ESCALATION = "escalation"
+#: Added to questions about work the user may keep as it is.
+KEEP_HINT = " Reply 'approve' to keep the work as it is."
 PAUSING = (BudgetExceeded, RunStopped)
 
 
@@ -98,6 +106,8 @@ class OrchestratorBase:
         self.config = config
         self.policy: VerdictPolicy = policy or SimplePolicy()
         self._started: dict[str, set[Phase]] = {}  # only to emit phase_started once
+        #: (phase, newest task id) pairs already reported finished, per run.
+        self._finished: dict[str, set[tuple[Phase, str]]] = {}
 
     async def _audit(self, run: Run, task: Task, artifact: Artifact | None) -> None:
         """The task sweep; the mixins call it and Orchestrator implements it."""
@@ -211,16 +221,25 @@ class OrchestratorBase:
         )
 
 
-def failed_verdict(
-    run: Run, message: str, *, task_id: str | None = None, phase: Phase | None = None
-) -> Verdict:
+def can_keep(task: Task, verdict: Verdict | None) -> bool:
+    """Whether the user may keep this task's output although ``verdict`` failed it: the
+    output exists and isn't the plan (the pipeline is built from it), and the check
+    didn't fail closed or find a dangerous action, which are never waved through."""
+    if task.output is None or task.output_kind == "plan":
+        return False
+    if verdict is None or verdict.passed:
+        return False
+    return not any(
+        f.rule_id == AUDIT_RULE or f.rule_id in DANGEROUS_ACTION_RULES for f in verdict.blockers
+    )
+
+
+def failed_verdict(run: Run, message: str, *, task_id: str | None = None) -> Verdict:
     """A failing verdict with one AUDIT blocker, used when no real verdict can be had."""
-    scope = RuleScope.TASK if task_id else RuleScope.PHASE if phase else RuleScope.RUN
     return Verdict(
         run_id=run.id,
-        scope=scope,
+        scope=RuleScope.TASK if task_id else RuleScope.RUN,
         task_id=task_id,
-        phase=phase,
         passed=False,
-        findings=[Finding(rule_id="AUDIT", severity=Severity.BLOCKER, message=message)],
+        findings=[Finding(rule_id=AUDIT_RULE, severity=Severity.BLOCKER, message=message)],
     )

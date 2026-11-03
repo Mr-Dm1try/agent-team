@@ -36,8 +36,9 @@ async def test_build_runs_all_four_phases(tmp_path: Path) -> None:
     assert all(t.status is TaskStatus.DONE for t in tasks)
     assert {t.phase for t in tasks} == set(PHASE_ORDER)
 
-    # Every gate and the run were audited, in phase order.
-    assert team.auditor.gates == list(PHASE_ORDER)
+    # Every phase finished, in order, and the run was audited once.
+    finished = [e.data["phase"] for e in team.bus.events if e.name is EventName.PHASE_FINISHED]
+    assert finished == [p.value for p in PHASE_ORDER]
     assert team.auditor.runs == 1
     started = [e.data["phase"] for e in team.bus.events if e.name is EventName.PHASE_STARTED]
     assert started == [p.value for p in PHASE_ORDER]
@@ -73,7 +74,8 @@ async def test_research_question_gets_an_answer_and_no_code(tmp_path: Path) -> N
     assert answer.depends_on == [planner.id, brief.id]
     assert reply.artifact is not None and reply.artifact.kind == "research_answer"
     assert "Starlette" in reply.text
-    assert team.auditor.gates == [Phase.PLANNING]
+    finished = [e.data["phase"] for e in team.bus.events if e.name is EventName.PHASE_FINISHED]
+    assert finished == [Phase.PLANNING.value]
     agents = {t.agent for t in await team.tasks.list_tasks(reply.run_id)}
     assert agents == {AgentName.ORCHESTRATOR, AgentName.RESEARCHER}
 

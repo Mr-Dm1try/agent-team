@@ -563,7 +563,7 @@ def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
     return res
 
 
-# --- PRD and spec gates --------------------------------------------------------------
+# --- PRD and spec ------------------------------------------------------------------
 
 
 @helper("testable_prd")
@@ -640,8 +640,9 @@ def spec_coverage(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("coverage_scope")
 def coverage_scope(ctx: AuditContext, rule: Rule) -> HelperResult:
-    """R9: at the PRD gate every ask has a requirement (blocker) and requirements
-    cite only real asks (warning); at the spec gate components serve real requirements."""
+    """R9: at the end of the PRD every ask has a requirement (blocker) and requirements
+    cite only real asks (warning); at the end of the spec components serve real
+    requirements."""
     res = HelperResult()
     plan, prd, spec = ctx.find("plan"), ctx.find("prd"), ctx.find("spec")
     if ctx.phase is Phase.PRD:
@@ -690,7 +691,7 @@ def coverage_scope(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("open_questions")
 def open_questions(ctx: AuditContext, rule: Rule) -> HelperResult:
-    """R11: questions in the phase's outputs that are neither answered nor assumed."""
+    """R11: questions in the checked outputs that are neither answered nor assumed."""
     res = HelperResult()
     for _, artifact in ctx.outputs:
         for q in artifact.questions:
@@ -708,7 +709,7 @@ def open_questions(ctx: AuditContext, rule: Rule) -> HelperResult:
     return res
 
 
-# --- implementation gate -------------------------------------------------------------
+# --- implementation -----------------------------------------------------------------
 
 
 @helper("files_exist")

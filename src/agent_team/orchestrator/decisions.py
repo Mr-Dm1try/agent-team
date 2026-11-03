@@ -1,5 +1,5 @@
 """Applying the verdict policy's decisions: retry, escalate, the stronger model,
-upstream re-runs, gate fixes, questions for the user and stop."""
+upstream re-runs, fixes, questions for the user and stop."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from agent_team.core.models import (
     FeedbackSource,
     Finding,
     Phase,
-    RuleScope,
     Run,
     RunStatus,
     Task,
@@ -20,7 +19,13 @@ from agent_team.core.models import (
     TaskStatus,
     Verdict,
 )
-from agent_team.orchestrator.base import GATE_QUESTION, RUN_QUESTION, OrchestratorBase
+from agent_team.orchestrator.base import (
+    KEEP_HINT,
+    RUN_QUESTION,
+    TASK_QUESTION,
+    OrchestratorBase,
+    can_keep,
+)
 from agent_team.orchestrator.control import create_user_task
 
 
@@ -53,14 +58,23 @@ class DecisionsMixin(OrchestratorBase):
                 await self.tasks.transition(task.id, TaskStatus.READY, reason=d.reason)
         elif d.kind is DecisionKind.UPSTREAM_RERUN:
             await self._upstream_rerun(run, d, task)
-        elif d.kind is DecisionKind.GATE_FIX and task is not None:
+        elif d.kind is DecisionKind.FIX and task is not None:
             ids = d.inputs.get("finding_ids") or []
             findings = [f for f in (verdict.findings if verdict else []) if f.id in ids]
             await self._findings_to_feedback(run, task, findings)
-            root = await self.reopen(run, task, origin=TaskOrigin.GATE_FIX, finding_ids=list(ids))
+            root = await self.reopen(run, task, origin=TaskOrigin.FIX, finding_ids=list(ids))
             await self._rerun_after(run, root, d.inputs.get("rerun_after") or [])
+            checker_id = d.inputs.get("checker")
+            if isinstance(checker_id, str):
+                # The checking task's own blockers, for its fresh run after the fix.
+                own = d.inputs.get("checker_finding_ids") or []
+                checker = await self.tasks.get_task(checker_id)
+                found = [f for f in (verdict.findings if verdict else []) if f.id in own]
+                await self._findings_to_feedback(run, checker, found)
         elif d.kind is DecisionKind.ASK_USER:
             question = str(d.inputs.get("question") or d.reason)
+            if task is not None and can_keep(task, verdict):
+                question += KEEP_HINT
             if task is not None and task.status is TaskStatus.AUDITING:
                 await self.tasks.transition(task.id, TaskStatus.ESCALATED, reason=d.reason)
             phase = (
@@ -68,12 +82,7 @@ class DecisionsMixin(OrchestratorBase):
                 if task
                 else (verdict.phase if verdict and verdict.phase else Phase.PLANNING)
             )
-            if task is not None:
-                why = "policy"
-            elif verdict is not None and verdict.scope is RuleScope.RUN:
-                why = RUN_QUESTION
-            else:
-                why = GATE_QUESTION
+            why = TASK_QUESTION if task is not None else RUN_QUESTION
             child = await create_user_task(
                 self.tasks,
                 run,
@@ -119,8 +128,8 @@ class DecisionsMixin(OrchestratorBase):
         await self.reopen(run, producer, origin=TaskOrigin.REVISION, reason=d.reason)
 
     async def _rerun_after(self, run: Run, root: Task | None, ids: list[str]) -> None:
-        """Tasks the policy wants re-run once a gate fix passes, such as a fresh QA
-        review after Engineer fixes. Those not already reopened as downstream of the fix
+        """Tasks the policy wants re-run once a fix passes, such as a fresh QA review
+        after Engineer fixes. Those not already reopened as downstream of the fix
         are reopened here and wait for the fix."""
         if root is None:
             return
@@ -129,7 +138,7 @@ class DecisionsMixin(OrchestratorBase):
             if other.status is TaskStatus.SUPERSEDED:
                 continue
             copy = await self.reopen(
-                run, other, origin=TaskOrigin.REVISION, reason=f"re-run after gate fix {root.id}"
+                run, other, origin=TaskOrigin.REVISION, reason=f"re-run after fix {root.id}"
             )
             if copy is not None and root.id not in copy.depends_on:
                 copy.depends_on = [*copy.depends_on, root.id]

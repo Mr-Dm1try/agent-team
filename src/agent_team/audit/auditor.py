@@ -1,4 +1,4 @@
-"""The auditor: sweeps a task, a phase gate or a whole run and returns a verdict.
+"""The auditor: checks a task at its end, or the whole run, and returns a verdict.
 
 The model judges every rule; evidence helpers hand it exact answers first. The code
 then decides ``passed``:
@@ -39,6 +39,8 @@ from agent_team.core.interfaces import (
     VerdictStore,
 )
 from agent_team.core.models import (
+    AUDIT_RULE,
+    AgentName,
     Finding,
     Phase,
     PrecheckResult,
@@ -51,8 +53,6 @@ from agent_team.core.models import (
     Verdict,
 )
 from agent_team.llm.types import LLMClient
-
-AUDIT_RULE = "AUDIT"  # rule id of the fail-closed finding
 
 _REQUEST_CHARS = 12_000  # P1 judges the asks against the full request
 _ARTIFACT_CHARS = 16_000
@@ -145,8 +145,11 @@ class LLMAuditor:
     # --- Auditor protocol ---
 
     async def audit_task(self, task: Task, artifact: Artifact | None, run: Run) -> Verdict:
-        """Sweep one finished task: its output, the version before it on a revision, and
-        its tool calls, against the task rules for its phase and agent."""
+        """Check one finished task: its output, the version before it on a revision, and
+        its tool calls, against the task rules for its phase and agent. A QA task's
+        check also covers the phase's other live outputs, since QA reviews the whole
+        solution (every code change). Their tool calls stay out: each task's own check
+        already judged those, and QA must not be blamed for what another agent did."""
         base = Verdict(
             run_id=run.id, scope=RuleScope.TASK, task_id=task.id, phase=task.phase, passed=False
         )
@@ -162,6 +165,8 @@ class LLMAuditor:
             ctx.tasks = await self.tasks.list_tasks(run.id)
             ctx.latest = await self._latest(run.id)
             ctx.tool_calls = await self.tool_log.for_task(run.id, task.id)
+            if task.agent is AgentName.QA:
+                await self._cover_phase(ctx, run, task)
             rules = await self.rules.for_scope("task", phase=task.phase, agent=task.agent)
             if ctx.previous is None:  # R12 and any other revision-only rule
                 rules = [r for r in rules if r.helper != "minimal_revision"]
@@ -169,26 +174,18 @@ class LLMAuditor:
 
         return await self._sweep(base, build)
 
-    async def audit_gate(self, run: Run, phase: Phase) -> Verdict:
-        """Sweep a phase gate: every live task output of the phase and their tool calls,
-        against the phase rules."""
-        base = Verdict(run_id=run.id, scope=RuleScope.PHASE, phase=phase, passed=False)
-
-        async def build() -> tuple[AuditContext, list[Rule]]:
-            """Gather what this sweep can see and the rules it applies."""
-            ctx = AuditContext(run=run, scope=RuleScope.PHASE, phase=phase)
-            ctx.tasks = await self.tasks.list_tasks(run.id)
-            ctx.latest = await self._latest(run.id)
-            for t in ctx.tasks:
-                if t.phase is not phase or t.status is TaskStatus.SUPERSEDED:
-                    continue
-                if t.output is not None:
-                    ctx.outputs.append((t, await self.artifacts.load(run.id, t.output)))
-                ctx.tool_calls += await self.tool_log.for_task(run.id, t.id)
-            rules = await self.rules.for_scope("phase", phase=phase, agent=None)
-            return ctx, rules
-
-        return await self._sweep(base, build)
+    async def _cover_phase(self, ctx: AuditContext, run: Run, task: Task) -> None:
+        """Add the live outputs of the other agent tasks in ``task``'s phase."""
+        for t in ctx.tasks:
+            if (
+                t.id == task.id
+                or t.phase is not task.phase
+                or t.status is TaskStatus.SUPERSEDED
+                or t.agent in (AgentName.USER, AgentName.AUDITOR)
+            ):
+                continue
+            if t.output is not None:
+                ctx.outputs.append((t, await self.artifacts.load(run.id, t.output)))
 
     async def audit_run(self, run: Run) -> Verdict:
         """Sweep the whole run: tasks, decisions and verdicts, against the run rules."""

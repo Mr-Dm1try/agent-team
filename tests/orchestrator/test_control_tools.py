@@ -111,12 +111,25 @@ def test_phase_machine() -> None:
     assert (
         build.next(Phase.SPEC) is Phase.IMPLEMENTATION and build.next(Phase.IMPLEMENTATION) is None
     )
-    gates = {Phase.PLANNING, Phase.PRD}
-    assert build.current([], gates) is Phase.SPEC
-    assert build.current([], set(Phase)) is None
-    open_prd = Task(
-        run_id="r", phase=Phase.PRD, agent=AgentName.PRODUCT, objective="o", output_kind="prd"
-    )
-    # Open work in an earlier phase wins over a later unpassed gate.
-    assert build.current([open_prd], set(Phase)) is Phase.PRD
+
+    def task(phase: Phase, agent: AgentName, status: TaskStatus) -> Task:
+        """One task in ``phase`` with ``status``."""
+        t = Task(run_id="r", phase=phase, agent=agent, objective="o", output_kind="x")
+        return t.model_copy(update={"status": status})
+
+    plan = task(Phase.PLANNING, AgentName.ORCHESTRATOR, TaskStatus.DONE)
+    prd = task(Phase.PRD, AgentName.PRODUCT, TaskStatus.DONE)
+    assert build.current([]) is Phase.PLANNING  # nothing created yet
+    assert build.current([plan, prd]) is Phase.SPEC  # no spec task yet
+    assert build.finished([plan, prd], Phase.PRD) and not build.finished([plan], Phase.PRD)
+    done = [task(p, AgentName.ENGINEER, TaskStatus.DONE) for p in Phase]
+    assert build.current(done) is None
+    # Open work in an earlier phase wins, even when later phases are done.
+    open_prd = task(Phase.PRD, AgentName.PRODUCT, TaskStatus.RUNNING)
+    assert build.current([*done, open_prd]) is Phase.PRD
+    # A superseded task doesn't count as work, and a waiting question keeps the phase open.
+    gone = task(Phase.SPEC, AgentName.ARCHITECT, TaskStatus.SUPERSEDED)
+    assert build.current([plan, prd, gone]) is Phase.SPEC
+    question = task(Phase.PRD, AgentName.USER, TaskStatus.WAITING)
+    assert build.current([plan, prd, question]) is Phase.PRD
     assert PhaseMachine(RequestKind.RESEARCH_QUESTION).phases == (Phase.PLANNING,)

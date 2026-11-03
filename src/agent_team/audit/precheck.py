@@ -32,6 +32,7 @@ from agent_team.core.models import (
     PrecheckDecision,
     PrecheckResult,
     Rule,
+    RuleScope,
     Run,
     Task,
 )
@@ -93,7 +94,7 @@ class ToolPrecheck:
     async def _precheck_rules(self) -> dict[str, Rule]:
         """Enabled rules marked precheck, by id."""
         found: dict[str, Rule] = {}
-        for scope in ("task", "phase", "run"):
+        for scope in RuleScope:
             for rule in await self.rules.for_scope(scope, phase=None, agent=None):
                 if rule.precheck:
                     found[rule.id] = rule

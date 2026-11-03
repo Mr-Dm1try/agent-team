@@ -99,7 +99,7 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     ),
     TaskStatus.RETRY: frozenset({TaskStatus.READY, TaskStatus.SUPERSEDED}),
     TaskStatus.WAITING: frozenset({TaskStatus.READY, TaskStatus.DONE, TaskStatus.SUPERSEDED}),
-    TaskStatus.ESCALATED: frozenset({TaskStatus.READY, TaskStatus.SUPERSEDED}),
+    TaskStatus.ESCALATED: frozenset({TaskStatus.READY, TaskStatus.DONE, TaskStatus.SUPERSEDED}),
     TaskStatus.DONE: frozenset({TaskStatus.SUPERSEDED}),
     TaskStatus.SUPERSEDED: frozenset(),
 }
@@ -112,7 +112,7 @@ def can_transition(src: TaskStatus, dst: TaskStatus) -> bool:
 
 class TaskOrigin(StrEnum):
     """Why a task exists: planned by the pipeline, or created later by a retry,
-    revision, research request, review, question, change request or gate fix."""
+    revision, research request, review, question, change request or fix."""
 
     PLAN = "plan"
     RETRY = "retry"
@@ -121,7 +121,7 @@ class TaskOrigin(StrEnum):
     REVIEW = "review"
     QUESTION = "question"
     CHANGE_REQUEST = "change_request"
-    GATE_FIX = "gate_fix"  # a failed phase gate routed a finding back to this task
+    FIX = "fix"  # a later task's end-of-task check found the fault in this task's output
     USER_RERUN = "user_rerun"
 
 
@@ -162,12 +162,16 @@ class Severity(StrEnum):
 
 
 class RuleScope(StrEnum):
-    """What an audit covers: one task's output, a whole phase at its gate, or the
-    whole run at the end."""
+    """What an audit covers: one task's output at its end, or the whole run at the end."""
 
     TASK = "task"
-    PHASE = "phase"
     RUN = "run"
+
+
+#: The rule id of the finding a check fails closed with, when it can't be completed.
+AUDIT_RULE = "AUDIT"
+#: Rules about agent actions that already happened, which stop the run.
+DANGEROUS_ACTION_RULES = frozenset({"S5", "S6", "S7"})
 
 
 # --- runs and tasks ----------------------------------------------------------------
@@ -415,7 +419,7 @@ class DecisionKind(StrEnum):
     ESCALATE = "escalate"
     STRONGER_MODEL = "stronger_model"
     UPSTREAM_RERUN = "upstream_rerun"
-    GATE_FIX = "gate_fix"
+    FIX = "fix"
     REOPEN_PHASE = "reopen_phase"
     ASK_USER = "ask_user"
     NO_PROGRESS = "no_progress"

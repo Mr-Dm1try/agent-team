@@ -70,7 +70,7 @@ async def test_spans_nest_in_the_event_log_and_rebuild_as_a_tree(tmp_path: Path)
             call.add("input_tokens", 10)
             call.add("input_tokens", 5)
             call.set(cost_usd=0.01)
-        async with tracer.span("r1", "gate", "audit"):
+        async with tracer.span("r1", "check", "audit"):
             pass
     assert current_span() is None
 
@@ -83,23 +83,23 @@ async def test_spans_nest_in_the_event_log_and_rebuild_as_a_tree(tmp_path: Path)
     assert {e.data["name"] for e in read_events(tmp_path, "r1", agent="product")} == {
         "prd",
         "call",
-        "gate",
+        "check",
     }
 
     spans = load_spans(tmp_path, "r1")
     by_name = {s.name: s for s in spans}
-    assert [s.name for s in spans] == ["run", "prd", "call", "gate"]
+    assert [s.name for s in spans] == ["run", "prd", "call", "check"]
     assert len({s.trace_id for s in spans}) == 1
     assert all(s.status == "ok" and s.end is not None for s in spans)
     assert by_name["prd"].parent_span_id == run_span.span_id
     assert by_name["call"].parent_span_id == task.span_id
     assert by_name["call"].task_id == "t1" and by_name["call"].agent is AgentName.PRODUCT
     assert by_name["call"].attrs == {"input_tokens": 15, "cost_usd": 0.01}
-    assert by_name["gate"].kind == "audit"
+    assert by_name["check"].kind == "audit"
 
     roots = span_tree(spans)
     assert len(roots) == 1 and [c.span.name for c in roots[0].children] == ["prd"]
-    assert [c.span.name for c in roots[0].children[0].children] == ["call", "gate"]
+    assert [c.span.name for c in roots[0].children[0].children] == ["call", "check"]
     lines = render_tree(roots)
     assert lines[0].startswith("run:run [ok]")
     assert any("input_tokens=15" in line for line in lines)

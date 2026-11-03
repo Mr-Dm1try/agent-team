@@ -33,17 +33,18 @@ def test_catalog_rejects_duplicates(tmp_path: Path) -> None:
 
 async def test_store_filters_by_scope_phase_and_agent(rule_store: SqliteRuleStore) -> None:
     research = await rule_store.for_scope("task", phase=Phase.PLANNING, agent=AgentName.RESEARCHER)
-    assert {r.id for r in research} == {"R1", "R2", "P2", "R12", "S1", "S5", "S6", "S7"}
+    assert {r.id for r in research} == {"R1", "R2", "P2", "R11", "R12", "S1", "S5", "S6", "S7"}
     engineer = await rule_store.for_scope(
         "task", phase=Phase.IMPLEMENTATION, agent=AgentName.ENGINEER
     )
-    assert {r.id for r in engineer} == {"R1", "R12", "S1", "S5", "S6", "S7"}
-    prd_gate = await rule_store.for_scope("phase", phase=Phase.PRD, agent=None)
-    assert {r.id for r in prd_gate} == {"R3", "R9", "R11"}
-    impl_gate = await rule_store.for_scope("phase", phase=Phase.IMPLEMENTATION, agent=None)
-    assert {r.id for r in impl_gate} == {"R5", "R6", "R7", "R10", "R11", "S2", "S3", "S4"}
+    assert {r.id for r in engineer} == {"R1", "R6", "R11", "R12", "S1", "S5", "S6", "S7"}
+    product = await rule_store.for_scope("task", phase=Phase.PRD, agent=AgentName.PRODUCT)
+    assert {"R3", "R9", "R11"} <= {r.id for r in product}
+    qa = await rule_store.for_scope("task", phase=Phase.IMPLEMENTATION, agent=AgentName.QA)
+    assert {"R5", "R7", "R10", "R11", "S2", "S3", "S4"} <= {r.id for r in qa}
+    assert "R6" not in {r.id for r in qa}
     assert [r.id for r in await rule_store.for_scope("run", phase=None, agent=None)] == ["R8"]
-    assert all(r.scope is RuleScope.PHASE for r in impl_gate)
+    assert {r.scope for r in await rule_store.all()} == {RuleScope.TASK, RuleScope.RUN}
 
 
 async def test_reseed_keeps_disabled_rules_off(tmp_path: Path) -> None:

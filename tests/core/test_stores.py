@@ -363,16 +363,3 @@ async def test_failed_transaction_rolls_back_and_db_stays_usable(db: Database) -
     assert await db.fetchone("SELECT id FROM runs WHERE id = 'x'") is None
     await db.execute("INSERT INTO runs (id, status, created_at, data) VALUES ('y', 'a', 't', '{}')")
     assert await db.fetchone("SELECT id FROM runs WHERE id = 'y'") is not None
-
-
-async def test_gate_verdicts_by_phase_oldest_first(db: Database) -> None:
-    store = SqliteVerdictStore(db)
-    g1 = Verdict(run_id="r", scope=RuleScope.PHASE, phase=Phase.PRD, passed=False)
-    task_v = Verdict(run_id="r", scope=RuleScope.TASK, task_id="t", phase=Phase.PRD, passed=True)
-    other_phase = Verdict(run_id="r", scope=RuleScope.PHASE, phase=Phase.SPEC, passed=True)
-    other_run = Verdict(run_id="r2", scope=RuleScope.PHASE, phase=Phase.PRD, passed=True)
-    g2 = Verdict(run_id="r", scope=RuleScope.PHASE, phase=Phase.PRD, passed=True)
-    for v in (g1, task_v, other_phase, other_run, g2):
-        await store.save(v)
-    assert [v.id for v in await store.for_gate("r", Phase.PRD)] == [g1.id, g2.id]
-    assert await store.for_gate("r", Phase.IMPLEMENTATION) == []

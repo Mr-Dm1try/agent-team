@@ -27,7 +27,6 @@ from agent_team.core.models import (
     EventName,
     Feedback,
     Phase,
-    RuleScope,
     Run,
     Task,
     TaskStatus,
@@ -472,7 +471,7 @@ class SqliteFeedbackStore:
 
 
 class SqliteVerdictStore:
-    """Audit verdicts per task and per phase gate. Implements ``VerdictStore``."""
+    """Audit verdicts per task and for the whole run. Implements ``VerdictStore``."""
 
     def __init__(self, db: Database) -> None:
         """Use ``db`` for verdict rows."""
@@ -504,13 +503,5 @@ class SqliteVerdictStore:
         """Every verdict for the task, oldest first."""
         rows = await self.db.fetchall(
             "SELECT data FROM verdicts WHERE task_id = ? ORDER BY seq", (task_id,)
-        )
-        return [Verdict.model_validate_json(r["data"]) for r in rows]
-
-    async def for_gate(self, run_id: str, phase: Phase) -> list[Verdict]:
-        """Every phase-gate verdict for ``phase`` in the run, oldest first."""
-        rows = await self.db.fetchall(
-            "SELECT data FROM verdicts WHERE run_id = ? AND scope = ? AND phase = ? ORDER BY seq",
-            (run_id, RuleScope.PHASE.value, phase.value),
         )
         return [Verdict.model_validate_json(r["data"]) for r in rows]

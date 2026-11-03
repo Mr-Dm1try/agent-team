@@ -167,9 +167,6 @@ class UpstreamPolicy:
             ]
         return []
 
-    async def on_gate_verdict(self, run: Run, phase: Phase, verdict: Verdict) -> list[Decision]:
-        return []
-
 
 async def test_upstream_rerun_supersedes_and_rebuilds_downstream(tmp_path: Path) -> None:
     team = make_team(tmp_path, policy=UpstreamPolicy())
@@ -191,62 +188,62 @@ async def test_upstream_rerun_supersedes_and_rebuilds_downstream(tmp_path: Path)
     assert "Your previous output spec@v1" in arch[1].messages[0].content[0].text  # type: ignore[union-attr]
 
 
-class GatePolicy(UpstreamPolicy):
+class FixPolicy:
+    """Sends QA's first finding back to the Engineer, and re-runs QA after the fix."""
+
+    def __init__(self) -> None:
+        self.fired = False
+        self.tasks = FakeTaskStore()  # the team's store, set once the team is built
+
     async def on_task_verdict(
         self, run: Run, task: Task, verdict: Verdict, history: list[Verdict]
     ) -> list[Decision]:
-        return []
-
-    async def on_gate_verdict(self, run: Run, phase: Phase, verdict: Verdict) -> list[Decision]:
-        if phase is not Phase.PRD or self.fired:
+        if task.output_kind != "qa_report" or self.fired or verdict.passed:
             return []
         self.fired = True
+        engineer = (await _tasks(self.tasks, run.id, "code_change"))[0]
         return [
             Decision(
                 run_id=run.id,
-                kind=DecisionKind.GATE_FIX,
-                inputs={"task_id": self.prd_task_id, "finding_ids": ["f1"]},
-                choice="send R3 back to product",
-                reason="gate failed",
+                task_id=task.id,
+                kind=DecisionKind.FIX,
+                inputs={
+                    "task_id": engineer.id,
+                    "finding_ids": [f.id for f in verdict.findings],
+                    "rerun_after": [task.id],
+                },
+                choice="send the finding back to the engineer",
+                reason="QA found a fault in the code",
                 made_by="code",
             )
         ]
 
 
-async def test_gate_fix_routes_findings_back(tmp_path: Path) -> None:
-    policy = GatePolicy()
+async def test_fix_routes_findings_back_and_reruns_the_check(tmp_path: Path) -> None:
+    policy = FixPolicy()
     team = make_team(tmp_path, policy=policy)
-    orig_gate = team.auditor.audit_gate
-
-    async def gate(run: Run, phase: Phase) -> Verdict:
-        if phase is Phase.PRD and not policy.fired:
-            prd = (await _tasks(team.tasks, run.id, "prd"))[0]
-            policy.prd_task_id = prd.id  # type: ignore[attr-defined]
-            return Verdict(
-                run_id=run.id,
-                scope=RuleScope.PHASE,
-                phase=phase,
-                passed=False,
-                findings=[
-                    Finding(
-                        id="f1",
-                        rule_id="R3",
-                        severity=Severity.BLOCKER,
-                        item="REQ-1",
-                        message="untestable",
-                    )
-                ],
-            )
-        return await orig_gate(run, phase)
-
-    team.auditor.audit_gate = gate  # type: ignore[method-assign]
+    policy.tasks = team.tasks
+    finding = Finding(
+        id="f1", rule_id="S2", severity=Severity.BLOCKER, item="app.py", message="eval on input"
+    )
+    team.auditor.fail_next["qa_report"].append(
+        Verdict(run_id="x", scope=RuleScope.TASK, passed=False, findings=[finding])
+    )
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "done", reply.text
     assert reply.run_id
-    prds = await _tasks(team.tasks, reply.run_id, "prd")
-    assert prds[1].origin is TaskOrigin.GATE_FIX and prds[1].parent_task_id == prds[0].id
-    product = [r for r in team.llm.requests if r.agent is AgentName.PRODUCT]
-    assert "R3 on REQ-1: untestable" in product[1].messages[0].content[0].text  # type: ignore[union-attr]
+    code = await _tasks(team.tasks, reply.run_id, "code_change")
+    assert [t.status for t in code] == [TaskStatus.SUPERSEDED, TaskStatus.DONE]
+    assert code[1].origin is TaskOrigin.FIX and code[1].parent_task_id == code[0].id
+    qa = await _tasks(team.tasks, reply.run_id, "qa_report")
+    assert [t.status for t in qa] == [TaskStatus.SUPERSEDED, TaskStatus.DONE]
+    assert code[1].id in qa[1].depends_on  # the check runs again after the fix
+    fixes = [
+        str(r.messages[0].content[0])
+        for r in team.llm.requests
+        if r.agent is AgentName.ENGINEER and "origin fix" in str(r.messages[0].content[0])
+    ]
+    assert fixes and "S2 on app.py: eval on input" in fixes[0]
 
 
 async def test_resume_continues_an_interrupted_attempt(tmp_path: Path) -> None:
