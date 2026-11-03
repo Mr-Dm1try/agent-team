@@ -18,6 +18,7 @@ from agent_team.core.models import (
 )
 from agent_team.orchestrator.base import CHILD_ORIGINS, OrchestratorBase
 from agent_team.orchestrator.control import create_user_task
+from agent_team.orchestrator.replies import plain_agent, upper_first
 
 
 class SettleMixin(OrchestratorBase):
@@ -176,8 +177,8 @@ class SettleMixin(OrchestratorBase):
             run,
             phase=task.phase,
             question=(
-                f"Task {task.id} ({task.agent.value}: {task.objective}) is stuck: {why}. "
-                "Reply with guidance to retry it, or 'stop'."
+                f"{upper_first(plain_agent(task.agent))} is stuck on: {task.objective} "
+                f"({why}). Reply with guidance to retry it, or 'stop'."
             ),
             origin=TaskOrigin.QUESTION,
             parent=task,

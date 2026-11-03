@@ -3,12 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from agents.fakes import FakeBus, FakeLLM
+from agents.fakes import FakeBus
 
 from agent_team.core.errors import ToolError
 from agent_team.core.interfaces import ToolContext
-from agent_team.core.models import AgentName, Phase, RequestKind, Run, Task, TaskStatus
-from agent_team.orchestrator.classify import classify, heuristic
+from agent_team.core.models import AgentName, Phase, RequestKind, Task, TaskStatus
 from agent_team.orchestrator.control import control_tools
 from agent_team.orchestrator.phases import PhaseMachine
 from orchestrator.harness import make_team
@@ -105,25 +104,6 @@ async def test_ask_user_creates_a_waiting_user_task(tmp_path: Path) -> None:
     out = await tools["ask_user"]({"question": "Which port?"}, ctx)
     task = await team.tasks.get_task(out.data["task_id"])  # type: ignore[index]
     assert task.agent is AgentName.USER and task.status is TaskStatus.WAITING
-
-
-async def test_classifier_uses_the_model_and_sanitizes() -> None:
-    llm = FakeLLM({AgentName.ORCHESTRATOR: ['{"kind": "change", "reason": "tweak"}']})
-    result, made_by, _ = await classify(llm, "add auth", None)
-    assert made_by == "model" and result.kind is RequestKind.BUILD  # no run to change
-
-
-async def test_classifier_falls_back_to_keywords(tmp_path: Path) -> None:
-    llm = FakeLLM({AgentName.ORCHESTRATOR: ["no idea", "still no"]})
-    run = Run(title="t", request="r", workspace=str(tmp_path))
-    result, made_by, _ = await classify(llm, "Why did the spec retry?", run)
-    assert made_by == "code" and result.kind is RequestKind.RUN_QUESTION
-
-
-def test_heuristic() -> None:
-    assert heuristic("Build a todo API", False).kind is RequestKind.BUILD
-    assert heuristic("What is MCP?", False).kind is RequestKind.RESEARCH_QUESTION
-    assert heuristic("Add a delete endpoint", True).kind is RequestKind.CHANGE
 
 
 def test_phase_machine() -> None:

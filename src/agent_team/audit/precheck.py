@@ -229,17 +229,28 @@ def make_precheck_hook(auditor: Prechecker, tasks: TaskStore) -> BeforeHook:
     """A ``tool_call_before`` hook that runs ``auditor.precheck``.
 
     Reads ``tool`` (or ``name``) and ``args`` (or ``arguments``) from the event data.
-    A call with no task is allowed only for the orchestrator's control tools, which
-    code validates; any other call without context is blocked.
+    A call with no stored task is allowed only for the orchestrator's control tools,
+    which code validates (the message loop runs under a task id that is never stored);
+    any other call without context is blocked.
     """
+
+    async def stored(task_id: str | None) -> bool:
+        """Whether the task store has this task."""
+        if task_id is None:
+            return False
+        try:
+            await tasks.get_task(task_id)
+        except KeyError:
+            return False
+        return True
 
     async def hook(event: Event) -> HookOutcome:
         """Map the pre-check result to a hook outcome; any failure blocks."""
         tool = event.data.get("tool", event.data.get("name"))
         args = event.data.get("args", event.data.get("arguments", {}))
+        if event.agent is AgentName.ORCHESTRATOR and not await stored(event.task_id):
+            return HookOutcome(allow=True)
         if event.task_id is None:
-            if event.agent is AgentName.ORCHESTRATOR:
-                return HookOutcome(allow=True)
             return HookOutcome(allow=False, reason="tool call without a task", rule_id="AUDIT")
         if not isinstance(tool, str) or not isinstance(args, dict):
             return HookOutcome(allow=False, reason="malformed tool call event", rule_id="AUDIT")

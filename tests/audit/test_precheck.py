@@ -197,6 +197,8 @@ async def test_hook_fails_closed_without_context(run: Run) -> None:
         data={"tool": "create_task", "args": {}},
     )
     assert (await hook(orchestrator)).allow
+    # The message loop's task id is never stored; its tools are validated by code.
+    assert (await hook(orchestrator.model_copy(update={"task_id": "msg_0123456789abcdef"}))).allow
     stray = orchestrator.model_copy(update={"agent": AgentName.ENGINEER})
     assert not (await hook(stray)).allow
     unknown_task = stray.model_copy(update={"task_id": "task_missing"})

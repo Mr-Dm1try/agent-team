@@ -67,7 +67,7 @@ async def create_user_task(
     return task
 
 
-def _str(args: dict[str, Any], key: str, tool: str, *, required: bool = True) -> str | None:
+def str_arg(args: dict[str, Any], key: str, tool: str, *, required: bool = True) -> str | None:
     """A required (or optional) non-empty string argument, stripped."""
     value = args.get(key)
     if value is None and not required:
@@ -75,6 +75,13 @@ def _str(args: dict[str, Any], key: str, tool: str, *, required: bool = True) ->
     if not isinstance(value, str) or not value.strip():
         raise ToolError(f"argument {key!r} must be a non-empty string", tool=tool)
     return value.strip()
+
+
+def required_str(args: dict[str, Any], key: str, tool: str) -> str:
+    """A required non-empty string argument, stripped."""
+    value = str_arg(args, key, tool)
+    assert value is not None  # str_arg raises for a missing required argument
+    return value
 
 
 def _task_line(t: Task) -> str:
@@ -137,9 +144,9 @@ class GetTask:
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         """The full task record, refusing tasks of other runs."""
-        task_id = _str(args, "task_id", self.spec.name)
+        task_id = required_str(args, "task_id", self.spec.name)
         try:
-            task = await self.tasks.get_task(task_id or "")
+            task = await self.tasks.get_task(task_id)
         except Exception as exc:
             raise ToolError(f"no task {task_id!r}", tool=self.spec.name) from exc
         if task.run_id != ctx.run.id:
@@ -166,7 +173,7 @@ class GetArtifact:
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         """Load ``kind@vN`` exactly, or the latest version of a bare kind."""
-        raw = _str(args, "ref", self.spec.name) or ""
+        raw = required_str(args, "ref", self.spec.name)
         try:
             if "@" in raw:
                 art = await self.artifacts.load(ctx.run.id, ArtifactRef.parse(raw))
@@ -201,7 +208,7 @@ class GetVerdicts:
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         """Every verdict on the task as JSON lines."""
-        task_id = _str(args, "task_id", self.spec.name) or ""
+        task_id = required_str(args, "task_id", self.spec.name)
         found = await self.verdicts.for_task(task_id)
         if not found:
             return ToolResult(content=f"no verdicts for {task_id}")
@@ -318,7 +325,7 @@ class CreateTask:
         if agent not in AGENT_PLAN:
             raise ToolError(f"{agent.value} can't be given tasks", tool=name)
         allowed_phase, kinds = AGENT_PLAN[agent]
-        output_kind = _str(args, "output_kind", name) or ""
+        output_kind = required_str(args, "output_kind", name)
         if output_kind not in kinds:
             raise ToolError(f"{agent.value} produces one of {list(kinds)}", tool=name)
         if agent is not AgentName.RESEARCHER and phase is not allowed_phase:
@@ -343,12 +350,12 @@ class CreateTask:
                 run_id=ctx.run.id,
                 phase=phase,
                 agent=agent,
-                objective=_str(args, "objective", name) or "",
+                objective=required_str(args, "objective", name),
                 output_kind=output_kind,
                 depends_on=deps,
                 origin=origin,
                 parent_task_id=ctx.task.id,
-                reason=_str(args, "reason", name),
+                reason=required_str(args, "reason", name),
                 max_attempts=self.max_attempts,
             )
         )
@@ -377,7 +384,7 @@ class AskUser:
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         """Create a waiting user task with the question, in the given or current phase."""
-        question = _str(args, "question", self.spec.name) or ""
+        question = required_str(args, "question", self.spec.name)
         try:
             phase = Phase(args["phase"]) if args.get("phase") else ctx.task.phase
         except ValueError as exc:

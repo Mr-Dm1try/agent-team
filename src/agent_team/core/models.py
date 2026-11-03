@@ -136,7 +136,8 @@ class RunStatus(StrEnum):
 
 
 class RequestKind(StrEnum):
-    """How the orchestrator classifies each user message."""
+    """What a user message asks for. A run is a build or a research question; a change
+    or a question about a run is handled inside the run it is about."""
 
     BUILD = "build"
     CHANGE = "change"

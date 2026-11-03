@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Callable
 from typing import Any
 
 from agent_team.core.models import AgentName
 from agent_team.llm.types import ContentBlock, LLMRequest, ToolResultBlock
 from agents.fakes import reply, tool_call
+
+Responder = Callable[[LLMRequest], list[ContentBlock] | str]
 
 PLAN_BUILD: dict[str, Any] = {
     "summary": "One ask; the database choice needs research.",
@@ -69,12 +73,49 @@ def _last_is_tool_result(request: LLMRequest) -> bool:
     return any(isinstance(b, ToolResultBlock) for b in last.content)
 
 
-def orchestrator_responder(
-    *, kind: str = "build", title: str = "Books API", plan: dict[str, Any] | None = None
-) -> Any:
+MESSAGE_PROMPT = "You are the orchestrator of a software-building agent team"
+
+
+def read_message(request: LLMRequest) -> tuple[str, list[str]]:
+    """The user's message and the waiting task ids from a message-loop prompt."""
+    text = getattr(request.messages[0].content[0], "text", "")
+    said = text.split("The user's message:\n", 1)[-1]
+    return said, re.findall(r"task_id=(\S+),", text)
+
+
+def default_message(kind: str) -> Responder:
+    """A careful model reading one message: start a run when there is none, answer the
+    first waiting item with the user's words, and otherwise just reply."""
+
     def respond(request: LLMRequest) -> list[ContentBlock] | str:
-        if request.system.startswith("You sort one message"):
-            return json.dumps({"kind": kind, "reason": "scripted", "title": title})
+        """One turn of the scripted message loop."""
+        if _last_is_tool_result(request):
+            return json.dumps({"reply": "On it."})
+        said, waiting = read_message(request)
+        text = getattr(request.messages[0].content[0], "text", "")
+        if text.startswith("No run is in progress."):
+            return tool_call("start_run", {"request": said, "kind": kind})
+        if waiting:
+            return tool_call("answer_pending", {"task_id": waiting[0], "text": said})
+        return json.dumps({"reply": "Noted."})
+
+    return respond
+
+
+def orchestrator_responder(
+    *,
+    kind: str = "build",
+    plan: dict[str, Any] | None = None,
+    message: Responder | None = None,
+) -> Responder:
+    """The scripted orchestrator: the message loop (``message``, or a careful default),
+    the planner, run questions and summaries."""
+    on_message = message or default_message(kind)
+
+    def respond(request: LLMRequest) -> list[ContentBlock] | str:
+        """Route by system prompt to the scripted reply for that call."""
+        if request.system.startswith(MESSAGE_PROMPT):
+            return on_message(request)
         if "Orchestrator's planner" in request.system:
             chosen = plan or (PLAN_RESEARCH if kind == "research_question" else PLAN_BUILD)
             return json.dumps(chosen)

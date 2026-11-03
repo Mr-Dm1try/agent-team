@@ -1,6 +1,7 @@
 """The orchestrator: the only agent you talk to.
 
-It classifies each message, starts runs, and drives a run through the fixed phases:
+It works out what each message means (orchestrator/messages.py), starts runs, and
+drives a run through the fixed phases:
 plan, dispatch ready tasks (in parallel, Engineer tasks one at a time), audit each
 output, apply the verdict policy's decisions, audit each phase gate, and finish with a
 whole-run audit. Every choice goes to the decision log. Run state lives in the task
@@ -20,8 +21,6 @@ from agent_team.core.models import (
     DecisionKind,
     Event,
     EventName,
-    Feedback,
-    FeedbackSource,
     Phase,
     RequestKind,
     ResultStatus,
@@ -37,67 +36,34 @@ from agent_team.core.models import (
 )
 from agent_team.orchestrator import gates
 from agent_team.orchestrator.base import (
-    APPROVE,
-    GATE_QUESTION,
     PAUSING,
-    RUN_QUESTION,
     OrchestratorConfig,
     failed_verdict,
 )
-from agent_team.orchestrator.classify import classify
 from agent_team.orchestrator.control import create_user_task
+from agent_team.orchestrator.conversation import ConversationMixin
 from agent_team.orchestrator.decisions import DecisionsMixin
 from agent_team.orchestrator.dispatcher import INTERRUPTED, PAUSING_ERRORS
 from agent_team.orchestrator.phases import PhaseMachine
 from agent_team.orchestrator.planning import RULE as PIPELINE
 from agent_team.orchestrator.planning import expand_plan, implementation_tasks
 from agent_team.orchestrator.policy import SimplePolicy
-from agent_team.orchestrator.replies import Reply, done_reply, waiting_reply
-from agent_team.orchestrator.run_qa import answer_run_question
+from agent_team.orchestrator.replies import (
+    Reply,
+    done_reply,
+    plain_kind,
+    upper_first,
+    waiting_reply,
+)
 from agent_team.orchestrator.settle import SettleMixin
 
 __all__ = ["Orchestrator", "OrchestratorConfig"]
 
 
-class Orchestrator(SettleMixin, DecisionsMixin):
+class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
     """Drives runs through the phases and answers the user. See the module docstring."""
 
     # --- entry points ----------------------------------------------------------------
-
-    async def handle(self, message: str, *, run_id: str | None = None) -> Reply:
-        """One user message: answer a pending question, or classify and act."""
-        run = await self.tasks.get_run(run_id) if run_id else None
-        await self.bus.emit(
-            Event(
-                name=EventName.USER_MESSAGE,
-                run_id=run.id if run else "session",
-                agent=AgentName.USER,
-                data={"text": message},
-            )
-        )
-        if run is not None and await self._pending(run.id):
-            return await self.answer(run.id, message)
-
-        result, made_by, _ = await classify(self.llm, message, run)
-        decision = Decision(
-            run_id=run.id if run else "session",
-            kind=DecisionKind.CLASSIFY_REQUEST,
-            inputs={"message": message[:500]},
-            choice=result.kind.value,
-            reason=result.reason,
-            made_by="model" if made_by == "model" else "code",
-            rule=None if made_by == "model" else "classify.heuristic",
-        )
-        if result.kind in (RequestKind.BUILD, RequestKind.RESEARCH_QUESTION):
-            new = await self.start_run(message, kind=result.kind, title=result.title)
-            # The classification belongs to the run it started.
-            await self._record(decision.model_copy(update={"run_id": new.id}))
-            return await self.drive(new.id)
-        await self._record(decision)
-        assert run is not None  # _sanitize guarantees a run for these kinds
-        if result.kind is RequestKind.RUN_QUESTION:
-            return await self.answer_run_question(run.id, message)
-        return await self.request_change(run.id, message, target=result.target or "prd")
 
     async def start_run(
         self,
@@ -212,14 +178,6 @@ class Orchestrator(SettleMixin, DecisionsMixin):
         for t in await self.tasks.list_tasks(run_id, status=TaskStatus.READY):
             found.setdefault(t.id, t)
         return [t for t in found.values() if t.phase is phase and t.agent is not AgentName.USER]
-
-    async def _pending(self, run_id: str) -> list[Task]:
-        """User tasks waiting on an answer or review."""
-        return [
-            t
-            for t in await self.tasks.list_tasks(run_id, status=TaskStatus.WAITING)
-            if t.agent is AgentName.USER
-        ]
 
     def _kind(self, tasks: list[Task]) -> RequestKind:
         """The run's request kind, read back from the planning task's objective."""
@@ -372,26 +330,6 @@ class Orchestrator(SettleMixin, DecisionsMixin):
             )
         )
 
-    async def _save_verdict(self, verdict: Verdict) -> None:
-        """Store a verdict and emit audit_verdict for it."""
-        await self.verdicts.save(verdict)
-        await self.bus.emit(
-            Event(
-                name=EventName.AUDIT_VERDICT,
-                run_id=verdict.run_id,
-                task_id=verdict.task_id,
-                agent=AgentName.AUDITOR,
-                level="info" if verdict.passed else "warning",
-                data={
-                    "verdict_id": verdict.id,
-                    "scope": verdict.scope.value,
-                    "phase": verdict.phase.value if verdict.phase else None,
-                    "passed": verdict.passed,
-                    "findings": [f.model_dump(mode="json") for f in verdict.findings],
-                },
-            )
-        )
-
     # --- gates and the end of a run -------------------------------------------------
 
     async def _gate(self, run: Run, phase: Phase, machine: PhaseMachine, tasks: list[Task]) -> None:
@@ -433,14 +371,12 @@ class Orchestrator(SettleMixin, DecisionsMixin):
         outputs = [str(t.output) for t in experts if t.output]
         summaries = [f"Audit: {gate.summary}"] if gate.summary else []
         summaries += [
-            f"Warning {f.rule_id}: {f.message}"
-            for f in gate.findings
-            if f.severity is Severity.WARNING
+            f"Warning: {f.message}" for f in gate.findings if f.severity is Severity.WARNING
         ]
         for t in experts:
             if t.output:
                 art = await self.artifacts.load(run.id, t.output)
-                summaries.append(f"{t.output}: {art.summary}")
+                summaries.append(f"{upper_first(plain_kind(t.output.kind))}: {art.summary}")
         child = await create_user_task(
             self.tasks,
             run,
@@ -471,14 +407,17 @@ class Orchestrator(SettleMixin, DecisionsMixin):
             verdict = failed_verdict(run, f"auditor error: {exc}")
         await self._save_verdict(verdict)
         if not verdict.passed:
-            lines = "; ".join(f"{f.rule_id}: {f.message}" for f in verdict.blockers)
+            lines = "; ".join(f.message for f in verdict.blockers)
             last_phase = PhaseMachine(self._kind(await self.tasks.list_tasks(run.id))).phases[-1]
             await self._apply(
                 run,
                 Decision(
                     run_id=run.id,
                     kind=DecisionKind.ASK_USER,
-                    inputs={"question": f"The whole-run audit failed: {lines}. How to proceed?"},
+                    inputs={
+                        "question": f"The final check of the whole run found problems: {lines}. "
+                        "Reply 'approve' to accept it as it is, tell me what to fix, or 'stop'."
+                    },
                     choice="ask the user",
                     reason="run audit failed",
                     made_by="code",
@@ -492,138 +431,6 @@ class Orchestrator(SettleMixin, DecisionsMixin):
             Event(name=EventName.RUN_FINISHED, run_id=run.id, data={"passed": True})
         )
         return await done_reply(run, await self.tasks.list_tasks(run.id), self.artifacts)
-
-    # --- the user's answers, comments and questions ----------------------------------
-
-    async def answer(self, run_id: str, text: str, *, task_id: str | None = None) -> Reply:
-        """Answers the given pending question or review (the oldest by default)."""
-        run = await self.tasks.get_run(run_id)
-        pending = await self._pending(run_id)
-        target = next((t for t in pending if t.id == task_id), None) if task_id else None
-        target = target or (pending[0] if pending else None)
-        if target is None:
-            return Reply(kind="error", text="Nothing is waiting on you.", run_id=run_id)
-        if target.reason == "escalation" and text.strip().lower() == "stop":
-            await self.tasks.transition(target.id, TaskStatus.DONE, reason="user said stop")
-            await self.stop(run_id, "the user stopped the run at an escalation")
-            return Reply(kind="stopped", text="Stopped the run.", run_id=run_id)
-
-        if target.origin is TaskOrigin.REVIEW:
-            await self.tasks.transition(target.id, TaskStatus.DONE, reason="reviewed")
-            if not APPROVE.match(text):
-                await self._comment(run, target.phase, text)
-        elif target.reason in (GATE_QUESTION, RUN_QUESTION):
-            return await self._answer_audit_question(run, target, text)
-        else:
-            parent = (
-                await self.tasks.get_task(target.parent_task_id) if target.parent_task_id else None
-            )
-            await self.feedback.add(
-                run_id,
-                Feedback(
-                    artifact=await self._feedback_ref(run, parent) if parent else None,
-                    source=FeedbackSource.USER_ANSWER,
-                    question_id=target.reason
-                    if target.reason and target.reason.startswith("Q-")
-                    else None,
-                    text=text,
-                ),
-            )
-            await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
-        await self._set_status(run_id, RunStatus.ACTIVE)
-        return await self.drive(run_id)
-
-    async def _answer_audit_question(self, run: Run, target: Task, text: str) -> Reply:
-        """A failed gate or run audit asked the user. 'stop' stops, an approval accepts
-        the work as it is, and anything else is a comment that reopens the phase."""
-        await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
-        reply = text.strip()
-        if reply.lower() == "stop":
-            await self.stop(run.id, "the user stopped the run after a failed audit")
-            return Reply(kind="stopped", text="Stopped the run.", run_id=run.id)
-        accepted = bool(APPROVE.match(reply))
-        await self._record(
-            Decision(
-                run_id=run.id,
-                task_id=target.id,
-                kind=DecisionKind.ASK_USER,
-                inputs={"question": target.objective, "answer": reply[:500]},
-                choice="accept as is" if accepted else "revise with the user's comment",
-                reason="the user answered a failed audit",
-                made_by="code",
-                rule="audit_question",
-            )
-        )
-        if accepted and target.reason == RUN_QUESTION:
-            await self._set_status(run.id, RunStatus.DONE)
-            await self.bus.emit(
-                Event(name=EventName.RUN_FINISHED, run_id=run.id, data={"accepted": True})
-            )
-        elif accepted:
-            history = await self.verdicts.for_gate(run.id, target.phase)
-            failed = history[-1] if history else None
-            await self._save_verdict(gates.accepted_gate(run, target.phase, failed))
-        else:
-            await self._comment(run, target.phase, reply)
-        await self._set_status(run.id, RunStatus.ACTIVE)
-        return await self.drive(run.id)
-
-    async def _comment(self, run: Run, phase: Phase, text: str) -> None:
-        """Send the user's comment to the phase's first tasks and re-run from there."""
-        tasks = await self.tasks.list_tasks(run.id)
-        experts = gates.expert_tasks(tasks, phase)
-        in_phase = {t.id for t in experts}
-        roots = [t for t in experts if not any(d in in_phase for d in t.depends_on)]
-        for t in roots:
-            await self.feedback.add(
-                run.id,
-                Feedback(
-                    artifact=await self._feedback_ref(run, t),
-                    source=FeedbackSource.USER_COMMENT,
-                    text=text,
-                ),
-            )
-            await self.reopen(run, t, origin=TaskOrigin.REVISION, reason=f"user comment: {text}")
-
-    async def request_change(self, run_id: str, text: str, *, target: str = "prd") -> Reply:
-        """Apply a change request from the first artifact it touches onward."""
-        run = await self.tasks.get_run(run_id)
-        tasks = [
-            t for t in await self.tasks.list_tasks(run_id) if t.status is not TaskStatus.SUPERSEDED
-        ]
-        producers = [t for t in tasks if t.output is not None and t.output.kind == target]
-        if not producers:
-            return Reply(
-                kind="error", text=f"This run has no {target} to change yet.", run_id=run_id
-            )
-        producer = producers[-1]
-        await self.feedback.add(
-            run_id,
-            Feedback(artifact=producer.output, source=FeedbackSource.USER_COMMENT, text=text),
-        )
-        await self.reopen(
-            run, producer, origin=TaskOrigin.CHANGE_REQUEST, reason=f"change request: {text}"
-        )
-        await self._set_status(run_id, RunStatus.ACTIVE)
-        return await self.drive(run_id)
-
-    async def answer_run_question(self, run_id: str, question: str) -> Reply:
-        """Answers from the task store, verdicts, decisions and the trace."""
-        run = await self.tasks.get_run(run_id)
-        text, error = await answer_run_question(
-            run,
-            question,
-            tasks=self.tasks,
-            artifacts=self.artifacts,
-            decisions=self.decisions,
-            verdicts=self.verdicts,
-            checkpoints=self.checkpoints,
-            bus=self.bus,
-            llm=self.llm,
-        )
-        if text is None:
-            return Reply(kind="error", text=f"I couldn't answer that: {error}", run_id=run_id)
-        return Reply(kind="answer", text=text, run_id=run_id)
 
 
 def _prepare_workspace(

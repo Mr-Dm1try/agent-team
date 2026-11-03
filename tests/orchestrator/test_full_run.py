@@ -56,7 +56,7 @@ async def test_build_runs_all_four_phases(tmp_path: Path) -> None:
     assert all(d.made_by == "code" and d.rule == "pipeline" for d in plans)
     assert kinds.count(DecisionKind.DELEGATE) == len(tasks)
     assert all(d.reason for d in team.decisions.items)
-    assert "qa_report@v1" in reply.text
+    assert "the QA check: All good" in reply.text and "@v" not in reply.text  # plain words
 
 
 async def test_research_question_gets_an_answer_and_no_code(tmp_path: Path) -> None:

@@ -272,32 +272,13 @@ async def test_resume_continues_an_interrupted_attempt(tmp_path: Path) -> None:
     assert planner[0].messages[0].content[0].text == "ENVELOPE FROM BEFORE THE CRASH"  # type: ignore[union-attr]
 
 
-async def test_run_question_is_answered_from_the_store(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
-    reply = await team.orch.handle("Build a books API")
-    assert reply.run_id
-    script: dict[AgentName, Any] = team.llm.script
-    from agents.scenario import orchestrator_responder
-
-    script[AgentName.ORCHESTRATOR] = orchestrator_responder(kind="run_question")
-    answer = await team.orch.handle("Why did the PRD retry?", run_id=reply.run_id)
-    assert answer.kind == "answer" and "retried once" in answer.text
-    last = team.llm.requests[-1].messages[-1].content[0]
-    assert "orchestrator" in last.content  # type: ignore[union-attr]  # list_tasks output
-
-
 async def test_change_request_reopens_from_the_target(tmp_path: Path) -> None:
     team = make_team(tmp_path)
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
-    from agents.scenario import orchestrator_responder
-
-    team.llm.script[AgentName.ORCHESTRATOR] = lambda r: (
-        json.dumps({"kind": "change", "reason": "rename", "target": "code_change"})
-        if r.system.startswith("You sort")
-        else orchestrator_responder()(r)
+    reply = await team.orch.request_change(
+        reply.run_id, "Rename the function to list_books", target="code_change"
     )
-    reply = await team.orch.handle("Rename the function to list_books", run_id=reply.run_id)
     assert reply.kind == "done", reply.text
     assert reply.run_id
     assert len(await _tasks(team.tasks, reply.run_id, "spec")) == 1
