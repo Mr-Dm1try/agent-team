@@ -31,14 +31,17 @@ PHASES_BY_KIND: dict[RequestKind, tuple[Phase, ...]] = {
 _CLOSED = frozenset({TaskStatus.DONE, TaskStatus.SUPERSEDED})
 
 
+#: Agents whose tasks are not the phase's work: the user's answers and reviews, and
+#: the checks (auditor tasks) of other tasks.
+_NOT_WORK = frozenset({AgentName.USER, AgentName.AUDITOR})
+
+
 def expert_tasks(tasks: Iterable[Task], phase: Phase) -> list[Task]:
-    """Live tasks in ``phase`` done by agents, not the user."""
+    """Live tasks in ``phase`` done by the experts, not the user or the auditor."""
     return [
         t
         for t in tasks
-        if t.phase is phase
-        and t.status is not TaskStatus.SUPERSEDED
-        and t.agent is not AgentName.USER
+        if t.phase is phase and t.status is not TaskStatus.SUPERSEDED and t.agent not in _NOT_WORK
     ]
 
 
@@ -70,8 +73,13 @@ class PhaseMachine:
         return self.phases[i + 1] if i + 1 < len(self.phases) else None
 
     def open_tasks(self, tasks: Iterable[Task], phase: Phase) -> list[Task]:
-        """Unfinished agent and user tasks in ``phase``."""
-        return [t for t in tasks if t.phase is phase and t.status not in _CLOSED]
+        """Unfinished expert and user tasks in ``phase``. A check left unfinished
+        doesn't hold the phase open: the task it checks does."""
+        return [
+            t
+            for t in tasks
+            if t.phase is phase and t.status not in _CLOSED and t.agent is not AgentName.AUDITOR
+        ]
 
     def finished(self, tasks: Iterable[Task], phase: Phase) -> bool:
         """``phase`` has work and all of it is done."""

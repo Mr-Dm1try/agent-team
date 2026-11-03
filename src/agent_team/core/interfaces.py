@@ -343,3 +343,9 @@ class Dispatcher(Protocol):
         """Build the envelope, run the agent with a timeout, catch and classify errors,
         save the artifact, move the task to auditing (or retry/escalated)."""
         ...
+
+    async def check(self, check: Task, subject: Task | None, artifact: Artifact | None) -> Verdict:
+        """Run a check (an auditor task) on ``subject``'s output, or on the whole run
+        when ``subject`` is None, with the check's own timeout and attempts. Returns
+        the verdict, failed closed when no attempt produced one."""
+        ...

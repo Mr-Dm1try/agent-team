@@ -55,7 +55,11 @@ async def test_build_runs_all_four_phases(tmp_path: Path) -> None:
     plans = [d for d in team.decisions.items if d.kind is DecisionKind.PLAN]
     assert [d.choice.split(":")[0] for d in plans] == ["3 tasks", "2 tasks"]
     assert all(d.made_by == "code" and d.rule == "pipeline" for d in plans)
-    assert kinds.count(DecisionKind.DELEGATE) == len(tasks)
+    work = [t for t in tasks if t.agent is not AgentName.AUDITOR]
+    assert kinds.count(DecisionKind.DELEGATE) == len(work)  # checks aren't delegated
+    checks = [t for t in tasks if t.agent is AgentName.AUDITOR]
+    assert len(checks) == len(work) + 1  # one per task, and one of the run
+    assert all(c.status is TaskStatus.DONE and c.attempt == 1 for c in checks)
     assert all(d.reason for d in team.decisions.items)
     assert "the QA check: All good" in reply.text and "@v" not in reply.text  # plain words
 
@@ -76,7 +80,7 @@ async def test_research_question_gets_an_answer_and_no_code(tmp_path: Path) -> N
     assert "Starlette" in reply.text
     finished = [e.data["phase"] for e in team.bus.events if e.name is EventName.PHASE_FINISHED]
     assert finished == [Phase.PLANNING.value]
-    agents = {t.agent for t in await team.tasks.list_tasks(reply.run_id)}
+    agents = {t.agent for t in await team.tasks.list_tasks(reply.run_id)} - {AgentName.AUDITOR}
     assert agents == {AgentName.ORCHESTRATOR, AgentName.RESEARCHER}
 
 

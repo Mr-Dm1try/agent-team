@@ -12,6 +12,7 @@ it left off.
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 from agent_team.agents.planner import kind_from_objective, planning_objective
@@ -34,10 +35,10 @@ from agent_team.core.models import (
     TaskStatus,
     new_id,
 )
+from agent_team.core.tracing import Tracer
 from agent_team.orchestrator.base import (
     PAUSING,
     OrchestratorConfig,
-    failed_verdict,
 )
 from agent_team.orchestrator.control import create_user_task
 from agent_team.orchestrator.conversation import ConversationMixin
@@ -51,6 +52,7 @@ from agent_team.orchestrator.policy import SimplePolicy
 from agent_team.orchestrator.replies import (
     Reply,
     done_reply,
+    plain_agent,
     upper_first,
     waiting_reply,
 )
@@ -86,6 +88,7 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
                 context_dirs=dirs,
             )
         )
+        await Tracer(self.bus).start_root(run)
         await self.bus.emit(
             Event(name=EventName.RUN_STARTED, run_id=run.id, data={"kind": kind.value})
         )
@@ -128,7 +131,16 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
     # --- the drive loop -------------------------------------------------------------
 
     async def drive(self, run_id: str) -> Reply:
-        """Run until the run is done, waits on the user, or stops."""
+        """Run until the run is done, waits on the user, or stops. Each pass through a
+        phase is a ``phase`` span under the run's root span."""
+        passes = _PhasePasses(Tracer(self.bus))
+        try:
+            return await self._drive(run_id, passes)
+        finally:
+            await passes.close()
+
+    async def _drive(self, run_id: str, passes: _PhasePasses) -> Reply:
+        """The drive loop; ``passes`` keeps the current phase's span open."""
         for _ in range(self.config.max_loops):
             run = await self.tasks.get_run(run_id)
             if run.status in (RunStatus.STOPPED, RunStatus.PAUSED):
@@ -148,7 +160,9 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             if await self._phases_finished(run, machine, tasks, before=phase):
                 continue  # a review was requested
             if phase is None:
+                await passes.close()
                 return await self._finish_run(run)
+            await passes.enter(run, phase)
             await self._phase_started(run, phase)
 
             open_tasks = machine.open_tasks(tasks, phase)
@@ -182,7 +196,12 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
         found = {t.id: t for t in await self.tasks.ready_tasks(run_id)}
         for t in await self.tasks.list_tasks(run_id, status=TaskStatus.READY):
             found.setdefault(t.id, t)
-        return [t for t in found.values() if t.phase is phase and t.agent is not AgentName.USER]
+        # Checks (auditor tasks) run inside the audit of the task they check, not here.
+        return [
+            t
+            for t in found.values()
+            if t.phase is phase and t.agent not in (AgentName.USER, AgentName.AUDITOR)
+        ]
 
     def _kind(self, tasks: list[Task]) -> RequestKind:
         """The run's request kind, read back from the planning task's objective."""
@@ -217,26 +236,30 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
                 rule="phase_order",
             )
         )
-        result = await self.dispatcher.dispatch(task)
-        if result.status is ResultStatus.ERROR and result.error_type in PAUSING_ERRORS:
-            status = RunStatus.STOPPED if result.error_type == "RunStopped" else RunStatus.PAUSED
-            await self._set_status(run.id, status)
-            return
-        task = await self.tasks.get_task(task.id)
-        if task.status is TaskStatus.AUDITING:  # not superseded while it ran
-            await self._audit(run, task, result.artifact)
+        name = f"{task.agent.value} {task.output_kind}"
+        async with Tracer(self.bus).in_run(run, name, "task", task_id=task.id, agent=task.agent):
+            result = await self.dispatcher.dispatch(task)
+            if result.status is ResultStatus.ERROR and result.error_type in PAUSING_ERRORS:
+                status = (
+                    RunStatus.STOPPED if result.error_type == "RunStopped" else RunStatus.PAUSED
+                )
+                await self._set_status(run.id, status)
+                return
+            task = await self.tasks.get_task(task.id)
+            if task.status is TaskStatus.AUDITING:  # not superseded while it ran
+                await self._audit(run, task, result.artifact)
 
     async def _audit(self, run: Run, task: Task, artifact: Artifact | None) -> None:
-        """Audit one output and apply the policy's decisions; fails closed and pauses on budget or
-        stop."""
+        """Check one output with an auditor task and apply the policy's decisions. The
+        check has its own attempts and fails closed; budget or stop pauses the run, and
+        the task stays auditing to be checked on resume."""
+        check = await self._check_task(run, task)
         try:
-            verdict = await self.auditor.audit_task(task, artifact, run)
+            verdict = await self.dispatcher.check(check, task, artifact)
         except PAUSING as exc:
-            await self._pause(run.id, exc)  # the task stays auditing and is audited on resume
+            await self._pause(run.id, exc)
             return
-        except Exception as exc:  # fail closed
-            verdict = failed_verdict(run, f"auditor error: {exc}", task_id=task.id)
-        await self._save_verdict(verdict)
+        await self._save_verdict(verdict, check=check)
         task = await self.tasks.get_task(task.id)
         if task.status is not TaskStatus.AUDITING:
             return  # superseded by a reopen while the auditor ran
@@ -406,16 +429,50 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             )
         )
 
+    async def _check_task(self, run: Run, subject: Task | None) -> Task:
+        """The auditor task that checks ``subject``'s current attempt (or the run): the
+        one left unfinished by a crash or pause, else a new one."""
+        reason = f"check of attempt {subject.attempt}" if subject else "check of the run"
+        parent = subject.id if subject else None
+        for t in await self.tasks.list_tasks(run.id):
+            if (
+                t.agent is AgentName.AUDITOR
+                and t.parent_task_id == parent
+                and t.reason == reason
+                and t.status not in (TaskStatus.DONE, TaskStatus.ESCALATED, TaskStatus.SUPERSEDED)
+            ):
+                return t
+        if subject is not None:
+            phase = subject.phase
+            who = plain_agent(subject.agent)
+            objective = f"Check {plain_kind(subject.output_kind)} from {who}"
+        else:
+            phase = PhaseMachine(self._kind(await self.tasks.list_tasks(run.id))).phases[-1]
+            objective = "Check the whole run"
+        return await self.tasks.create_task(
+            Task(
+                run_id=run.id,
+                phase=phase,
+                agent=AgentName.AUDITOR,
+                objective=objective,
+                inputs=[subject.output] if subject and subject.output else [],
+                output_kind="verdict",
+                max_attempts=self.config.max_check_attempts,
+                origin=TaskOrigin.CHECK,
+                parent_task_id=parent,
+                reason=reason,
+            )
+        )
+
     async def _finish_run(self, run: Run) -> Reply:
-        """Run the whole-run audit: finish the run on a pass, or ask the user how to proceed."""
+        """Check the whole run: finish it on a pass, or ask the user how to proceed."""
+        check = await self._check_task(run, None)
         try:
-            verdict = await self.auditor.audit_run(run)
+            verdict = await self.dispatcher.check(check, None, None)
         except PAUSING as exc:
             await self._pause(run.id, exc)
             return await self.drive(run.id)
-        except Exception as exc:
-            verdict = failed_verdict(run, f"auditor error: {exc}")
-        await self._save_verdict(verdict)
+        await self._save_verdict(verdict, check=check)
         if not verdict.passed:
             lines = "; ".join(f.message for f in verdict.blockers)
             last_phase = PhaseMachine(self._kind(await self.tasks.list_tasks(run.id))).phases[-1]
@@ -436,11 +493,35 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
                 verdict.model_copy(update={"phase": last_phase}),
             )
             return await self.drive(run.id)
-        run = await self._set_status(run.id, RunStatus.DONE)
-        await self.bus.emit(
-            Event(name=EventName.RUN_FINISHED, run_id=run.id, data={"passed": True})
-        )
+        run = await self._run_done(run, {"passed": True})
         return await done_reply(run, await self.tasks.list_tasks(run.id), self.artifacts)
+
+
+class _PhasePasses:
+    """The span of the phase the drive loop is working on: a new one opens when the
+    loop moves to another phase (or back to an earlier one after a reopen)."""
+
+    def __init__(self, tracer: Tracer) -> None:
+        """Open spans with ``tracer``; none is open yet."""
+        self.tracer = tracer
+        self.phase: Phase | None = None
+        self._stack = AsyncExitStack()
+
+    async def enter(self, run: Run, phase: Phase) -> None:
+        """Make ``phase`` the open pass, closing the previous one if it differs."""
+        if phase is self.phase:
+            return
+        await self.close()
+        await self._stack.enter_async_context(
+            self.tracer.in_run(run, phase.value, "phase", phase=phase.value)
+        )
+        self.phase = phase
+
+    async def close(self) -> None:
+        """Close the open pass, if any."""
+        await self._stack.aclose()
+        self._stack = AsyncExitStack()
+        self.phase = None
 
 
 def _prepare_workspace(

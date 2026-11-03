@@ -360,10 +360,7 @@ class ConversationMixin(OrchestratorBase):
             )
         )
         if accepted:
-            await self._set_status(run.id, RunStatus.DONE)
-            await self.bus.emit(
-                Event(name=EventName.RUN_FINISHED, run_id=run.id, data={"accepted": True})
-            )
+            await self._run_done(run, {"accepted": True})
         else:
             await self._comment(run, target.phase, reply)
         return None

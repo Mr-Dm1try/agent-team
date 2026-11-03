@@ -4,6 +4,11 @@ It builds the task envelope, runs the agent with a timeout, catches and classifi
 every error, saves the artifact and moves the task on: to auditing when an artifact is
 ready, to waiting when the agent asked questions or for research, and to retry or
 escalated when the attempt failed. One agent's error never escapes into the run.
+
+Checks run here too, as auditor tasks with their own attempts, timeout and events: an
+auditor that crashes, times out or returns no valid verdict retries on the check's
+attempts, never the checked task's, and fails closed once they run out. Each attempt
+is an ``attempt`` span in the run's trace.
 """
 
 from __future__ import annotations
@@ -16,10 +21,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
 from agent_team.core.artifacts import Artifact, ArtifactRef
+from agent_team.core.errors import BudgetExceeded, RunStopped
 from agent_team.core.interfaces import (
     Agent,
     AgentContext,
     ArtifactStore,
+    Auditor,
     CheckpointStore,
     EventBus,
     FeedbackStore,
@@ -28,6 +35,7 @@ from agent_team.core.interfaces import (
     VerdictStore,
 )
 from agent_team.core.models import (
+    AUDIT_RULE,
     AgentName,
     AgentResult,
     Event,
@@ -35,12 +43,15 @@ from agent_team.core.models import (
     Feedback,
     Finding,
     ResultStatus,
+    RuleScope,
     Run,
+    Severity,
     Task,
     TaskEnvelope,
     TaskStatus,
-    new_id,
+    Verdict,
 )
+from agent_team.core.tracing import Tracer
 from agent_team.llm.types import LLMClient
 from agent_team.orchestrator.lineage import ancestry
 
@@ -81,19 +92,28 @@ class Dispatcher:
     constraints: ConstraintSource | None = None
     timeout_s: float = 600.0
     timeouts: dict[AgentName, float] = field(default_factory=dict)
+    auditor: Auditor | None = None
 
     async def dispatch(self, task: Task) -> AgentResult:
         """Run one attempt of ``task`` and move it on; never raises for agent errors."""
         task = await self.tasks.get_task(task.id)
         run = await self.tasks.get_run(task.run_id)
-        agent = self.agents.get(task.agent)
         resume = task.last_error == INTERRUPTED and task.attempt > 0
+        attempt = task.attempt if resume else task.attempt + 1
+        async with Tracer(self.bus).in_run(
+            run, f"attempt {attempt}", "attempt", task_id=task.id, agent=task.agent, attempt=attempt
+        ) as span:
+            return await self._attempt(task, run, resume=resume, span_id=span.span_id)
+
+    async def _attempt(self, task: Task, run: Run, *, resume: bool, span_id: str) -> AgentResult:
+        """One attempt inside its span: start it, run the agent, record the outcome."""
+        agent = self.agents.get(task.agent)
         if not resume:
             task.attempt += 1
         task.last_error = None
         task.last_traceback = None
-        task.trace_id = task.trace_id or new_id("trace")
-        task.span_id = new_id("span")
+        task.trace_id = run.trace_id
+        task.span_id = span_id
         task = await self.tasks.update_task(task)
         task = await self.tasks.transition(
             task.id,
@@ -142,6 +162,104 @@ class Dispatcher:
                 traceback=traceback.format_exc(),
             )
         return await self._finish(task, result, envelope)
+
+    # --- checks ------------------------------------------------------------------
+
+    async def check(self, check: Task, subject: Task | None, artifact: Artifact | None) -> Verdict:
+        """Run a check (an auditor task) to a verdict on ``subject``'s output, or on the
+        whole run when ``subject`` is None. An auditor that raises, times out or
+        returns no valid verdict uses the check's attempts; once they run out the last
+        failed-closed verdict is returned and the check is escalated. BudgetExceeded
+        and RunStopped propagate and leave the check to resume on the same attempt."""
+        if self.auditor is None:
+            raise RuntimeError("the dispatcher has no auditor to run checks")
+        run = await self.tasks.get_run(check.run_id)
+        while True:
+            check = await self.tasks.get_task(check.id)
+            resume = check.last_error == INTERRUPTED and check.attempt > 0
+            attempt = check.attempt if resume else check.attempt + 1
+            async with Tracer(self.bus).in_run(
+                run,
+                f"attempt {attempt}",
+                "attempt",
+                task_id=check.id,
+                agent=AgentName.AUDITOR,
+                attempt=attempt,
+            ) as span:
+                verdict, error = await self._check_once(
+                    check, run, subject, artifact, resume=resume, span_id=span.span_id
+                )
+            check = await self.tasks.get_task(check.id)
+            if error is None:
+                await self.tasks.transition(check.id, TaskStatus.DONE, reason="verdict ready")
+                await self._emit(
+                    EventName.TASK_FINISHED, check, {"status": "ok", "passed": verdict.passed}
+                )
+                return verdict
+            check.last_error = error
+            await self.tasks.update_task(check)
+            await self._emit(EventName.ERROR, check, {"error": error}, level="error")
+            if check.attempt < check.max_attempts:
+                await self.tasks.transition(check.id, TaskStatus.RETRY, reason="check failed")
+                await self._emit(EventName.TASK_RETRIED, check, {"error": error})
+                await self.tasks.transition(check.id, TaskStatus.READY, reason="retry the check")
+                continue
+            await self.tasks.transition(
+                check.id, TaskStatus.ESCALATED, reason="no check attempts left"
+            )
+            await self._emit(EventName.TASK_ESCALATED, check, {"error": error})
+            return verdict
+
+    async def _check_once(
+        self,
+        check: Task,
+        run: Run,
+        subject: Task | None,
+        artifact: Artifact | None,
+        *,
+        resume: bool,
+        span_id: str,
+    ) -> tuple[Verdict, str | None]:
+        """One attempt of a check: the verdict, and why the attempt failed (None when
+        it produced a real verdict)."""
+        assert self.auditor is not None
+        if not resume:
+            check.attempt += 1
+        check.last_error = None
+        check.trace_id = run.trace_id
+        check.span_id = span_id
+        check = await self.tasks.update_task(check)
+        if check.status in (TaskStatus.PENDING, TaskStatus.RETRY):
+            check = await self.tasks.transition(check.id, TaskStatus.READY, reason="check due")
+        check = await self.tasks.transition(
+            check.id, TaskStatus.RUNNING, reason=f"started check attempt {check.attempt}"
+        )
+        await self._emit(EventName.TASK_STARTED, check, {"resume": resume})
+        timeout = self.timeouts.get(AgentName.AUDITOR, self.timeout_s)
+        task_id = subject.id if subject else None
+        try:
+            async with Tracer(self.bus).span(run.id, "check", "audit", task_id=check.id):
+                pending = (
+                    self.auditor.audit_task(subject, artifact, run)
+                    if subject is not None
+                    else self.auditor.audit_run(run)
+                )
+                verdict = await asyncio.wait_for(pending, timeout=timeout)
+        except (BudgetExceeded, RunStopped):
+            check.last_error = INTERRUPTED
+            await self.tasks.update_task(check)
+            await self.tasks.transition(check.id, TaskStatus.READY, reason="paused mid-check")
+            raise
+        except TimeoutError:
+            message = f"the check took longer than {timeout:.0f}s"
+            return failed_verdict(run, message, task_id=task_id), message
+        except Exception as exc:
+            message = f"auditor error: {type(exc).__name__}: {exc}"
+            return failed_verdict(run, message, task_id=task_id), message
+        unfinished = [f.message for f in verdict.blockers if f.rule_id == AUDIT_RULE]
+        if unfinished:
+            return verdict, f"no valid verdict: {unfinished[0]}"
+        return verdict, None
 
     # --- envelope ----------------------------------------------------------------
 
@@ -226,8 +344,8 @@ class Dispatcher:
             findings=findings,
             previous_output=previous,
             upstream_diff=await self._upstream_diff(run.id, previous, inputs) if previous else None,
-            trace_id=task.trace_id or new_id("trace"),
-            span_id=task.span_id or new_id("span"),
+            trace_id=task.trace_id or run.trace_id,
+            span_id=task.span_id or run.span_id,
         )
 
     async def _upstream_diff(
@@ -375,4 +493,15 @@ def json_diff(old: Artifact, new: Artifact) -> str:
             tofile=f"{new.kind}@v{new.version}",
             lineterm="",
         )
+    )
+
+
+def failed_verdict(run: Run, message: str, *, task_id: str | None = None) -> Verdict:
+    """A failing verdict with one AUDIT blocker, used when no real verdict can be had."""
+    return Verdict(
+        run_id=run.id,
+        scope=RuleScope.TASK if task_id else RuleScope.RUN,
+        task_id=task_id,
+        passed=False,
+        findings=[Finding(rule_id=AUDIT_RULE, severity=Severity.BLOCKER, message=message)],
     )

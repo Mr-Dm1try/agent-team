@@ -11,7 +11,6 @@ from agent_team.core.artifacts import Artifact
 from agent_team.core.errors import BudgetExceeded, RunStopped
 from agent_team.core.interfaces import (
     ArtifactStore,
-    Auditor,
     CheckpointStore,
     DecisionLog,
     Dispatcher,
@@ -30,19 +29,17 @@ from agent_team.core.models import (
     EventName,
     Feedback,
     FeedbackSource,
-    Finding,
     Phase,
     RequestKind,
     ReviewMode,
-    RuleScope,
     Run,
     RunStatus,
-    Severity,
     Task,
     TaskOrigin,
     TaskStatus,
     Verdict,
 )
+from agent_team.core.tracing import Tracer
 from agent_team.llm.types import LLMClient
 from agent_team.orchestrator.lineage import reopen
 from agent_team.orchestrator.policy import SimplePolicy
@@ -71,6 +68,8 @@ class OrchestratorConfig:
     runs_dir: Path
     review_mode: ReviewMode = ReviewMode.AUTO_ASSUMPTIONS
     max_attempts: int = 3
+    #: Attempts of each check (auditor task) before it fails closed.
+    max_check_attempts: int = 3
     max_upstream_reruns: int = 2
     max_loops: int = 500  # safety valve for drive()
 
@@ -89,7 +88,6 @@ class OrchestratorBase:
         verdicts: VerdictStore,
         bus: EventBus,
         llm: LLMClient,
-        auditor: Auditor,
         dispatcher: Dispatcher,
         config: OrchestratorConfig,
         policy: VerdictPolicy | None = None,
@@ -103,7 +101,6 @@ class OrchestratorBase:
         self.verdicts = verdicts
         self.bus = bus
         self.llm = llm
-        self.auditor = auditor
         self.dispatcher = dispatcher
         self.config = config
         self.policy: VerdictPolicy = policy or SimplePolicy()
@@ -143,8 +140,8 @@ class OrchestratorBase:
             if t.agent is AgentName.USER
         ]
 
-    async def _save_verdict(self, verdict: Verdict) -> None:
-        """Store a verdict and emit audit_verdict for it."""
+    async def _save_verdict(self, verdict: Verdict, *, check: Task | None = None) -> None:
+        """Store a verdict and emit audit_verdict for it, naming the check that made it."""
         await self.verdicts.save(verdict)
         await self.bus.emit(
             Event(
@@ -155,6 +152,7 @@ class OrchestratorBase:
                 level="info" if verdict.passed else "warning",
                 data={
                     "verdict_id": verdict.id,
+                    "check_task_id": check.id if check else None,
                     "scope": verdict.scope.value,
                     "phase": verdict.phase.value if verdict.phase else None,
                     "passed": verdict.passed,
@@ -195,6 +193,13 @@ class OrchestratorBase:
         if run.status is status:
             return run
         return await self.tasks.update_run(run.model_copy(update={"status": status}))
+
+    async def _run_done(self, run: Run, data: dict[str, object]) -> Run:
+        """Mark the run done, close its root span and emit run_finished."""
+        run = await self._set_status(run.id, RunStatus.DONE)
+        await Tracer(self.bus).finish_root(run)
+        await self.bus.emit(Event(name=EventName.RUN_FINISHED, run_id=run.id, data=dict(data)))
+        return run
 
     async def _pause(self, run_id: str, exc: Exception) -> None:
         """Stop on RunStopped, pause on BudgetExceeded; either way the run can resume."""
@@ -239,15 +244,4 @@ def can_keep(task: Task, verdict: Verdict | None) -> bool:
         return False
     return not any(
         f.rule_id == AUDIT_RULE or f.rule_id in DANGEROUS_ACTION_RULES for f in verdict.blockers
-    )
-
-
-def failed_verdict(run: Run, message: str, *, task_id: str | None = None) -> Verdict:
-    """A failing verdict with one AUDIT blocker, used when no real verdict can be had."""
-    return Verdict(
-        run_id=run.id,
-        scope=RuleScope.TASK if task_id else RuleScope.RUN,
-        task_id=task_id,
-        passed=False,
-        findings=[Finding(rule_id=AUDIT_RULE, severity=Severity.BLOCKER, message=message)],
     )

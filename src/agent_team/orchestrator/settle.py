@@ -35,8 +35,8 @@ class SettleMixin(OrchestratorBase):
         changed = False
         by_id = {t.id: t for t in tasks}
         for task in tasks:
-            if task.agent is AgentName.USER:
-                continue
+            if task.agent in (AgentName.USER, AgentName.AUDITOR):
+                continue  # user tasks are answered; checks run inside their task's audit
             if task.status is TaskStatus.RETRY:
                 await self.tasks.transition(task.id, TaskStatus.READY, reason="retry with feedback")
                 changed = True

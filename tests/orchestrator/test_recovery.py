@@ -14,6 +14,8 @@ from agent_team.core.artifacts import Artifact
 from agent_team.core.errors import BudgetExceeded
 from agent_team.core.models import (
     AgentName,
+    DecisionKind,
+    EventName,
     Phase,
     ReviewMode,
     Run,
@@ -39,14 +41,17 @@ def _fresh_orchestrator(team: Team, tmp_path: Path) -> Orchestrator:
         verdicts=team.verdicts,
         bus=team.bus,
         llm=team.llm,
-        auditor=team.auditor,
         dispatcher=team.dispatcher,
         config=OrchestratorConfig(runs_dir=tmp_path / "runs"),
     )
 
 
 def _live(tasks: list[Task]) -> Counter[str]:
-    return Counter(t.output_kind for t in tasks if t.status is not TaskStatus.SUPERSEDED)
+    return Counter(
+        t.output_kind
+        for t in tasks
+        if t.status is not TaskStatus.SUPERSEDED and t.agent is not AgentName.AUDITOR
+    )
 
 
 async def test_finished_phases_survive_a_restart(tmp_path: Path) -> None:
@@ -138,6 +143,62 @@ async def test_budget_during_an_audit_pauses_and_resumes(tmp_path: Path) -> None
     reply = await team.orch.resume(reply.run_id)
     assert reply.kind == "done", reply.text
     assert (await team.tasks.get_task(prd.id)).attempt == 1
+    # The same check resumed on its interrupted attempt; no second check was made.
+    [check] = [
+        t
+        for t in await team.tasks.list_tasks(reply.run_id)
+        if t.parent_task_id == prd.id and t.agent is AgentName.AUDITOR
+    ]
+    assert check.status is TaskStatus.DONE and check.attempt == 1
+
+
+async def test_an_auditor_crash_retries_the_check_not_the_task(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    passing = team.auditor.audit_task
+    crashes: list[str] = []
+
+    async def audit(task: Task, artifact: Artifact | None, run: Run) -> Verdict:
+        if task.output_kind == "prd" and not crashes:
+            crashes.append(task.id)
+            raise RuntimeError("judge fell over")
+        return await passing(task, artifact, run)
+
+    team.auditor.audit_task = audit  # type: ignore[method-assign]
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "done", reply.text
+    assert reply.run_id
+    tasks = await team.tasks.list_tasks(reply.run_id)
+    prd = next(t for t in tasks if t.output_kind == "prd")
+    [check] = [t for t in tasks if t.parent_task_id == prd.id and t.agent is AgentName.AUDITOR]
+    assert prd.attempt == 1 and check.attempt == 2  # the check's retry, not the PRD's
+    assert not any(d.kind is DecisionKind.RETRY for d in team.decisions.items)
+    errors = [e for e in team.bus.events if e.name is EventName.ERROR and e.task_id == check.id]
+    assert errors and "judge fell over" in str(errors[0].data["error"])
+    verdicts = [v for v in team.verdicts.items if v.task_id == prd.id]
+    assert [v.passed for v in verdicts] == [True]  # the crash left no verdict behind
+
+
+async def test_a_check_that_keeps_failing_closes_and_asks(tmp_path: Path) -> None:
+    team = make_team(tmp_path)
+    passing = team.auditor.audit_task
+
+    async def audit(task: Task, artifact: Artifact | None, run: Run) -> Verdict:
+        if task.output_kind == "prd":
+            raise RuntimeError("judge fell over")
+        return await passing(task, artifact, run)
+
+    team.auditor.audit_task = audit  # type: ignore[method-assign]
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "waiting" and reply.run_id, reply.text
+    tasks = await team.tasks.list_tasks(reply.run_id)
+    prd = next(t for t in tasks if t.output_kind == "prd")
+    [check] = [t for t in tasks if t.parent_task_id == prd.id and t.agent is AgentName.AUDITOR]
+    assert check.status is TaskStatus.ESCALATED and check.attempt == check.max_attempts
+    assert prd.attempt == 1 and prd.status is TaskStatus.ESCALATED  # never passed unchecked
+    [verdict] = [v for v in team.verdicts.items if v.task_id == prd.id]
+    assert not verdict.passed and verdict.blockers[0].rule_id == "AUDIT"
+    asked = await team.tasks.get_task(reply.pending[0].task_id)
+    assert "keep the work" not in asked.objective  # unchecked work can't be kept
 
 
 async def test_reopening_the_plan_rebuilds_the_pipeline_once(tmp_path: Path) -> None:

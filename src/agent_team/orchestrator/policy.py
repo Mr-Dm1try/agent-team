@@ -3,12 +3,13 @@ passed in. It implements the VerdictPolicy Protocol:
 
 - pass -> no decisions (the orchestrator marks the task done)
 - fail with attempts left -> RETRY
-- fail with none left -> ESCALATE
+- fail with none left, or a check that failed closed -> ESCALATE. A check that could
+  not be completed already used its own attempts; it never costs the task one.
 """
 
 from __future__ import annotations
 
-from agent_team.core.models import Decision, DecisionKind, Run, Task, Verdict
+from agent_team.core.models import AUDIT_RULE, Decision, DecisionKind, Run, Task, Verdict
 
 
 class SimplePolicy:
@@ -21,7 +22,8 @@ class SimplePolicy:
         if verdict.passed:
             return []
         rules = sorted({f.rule_id for f in verdict.blockers}) or ["(none)"]
-        if task.attempt < task.max_attempts:
+        unchecked = AUDIT_RULE in rules
+        if task.attempt < task.max_attempts and not unchecked:
             return [
                 Decision(
                     run_id=run.id,
@@ -41,7 +43,9 @@ class SimplePolicy:
                 kind=DecisionKind.ESCALATE,
                 inputs={"task_id": task.id, "verdict_id": verdict.id},
                 choice="escalate",
-                reason=f"failed {', '.join(rules)} with no attempts left",
+                reason="the check could not be completed"
+                if unchecked
+                else f"failed {', '.join(rules)} with no attempts left",
                 made_by="code",
                 rule="simple_policy.escalate",
             )

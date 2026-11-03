@@ -63,6 +63,7 @@ def make_team(
         feedback=feedback,
         verdicts=verdicts,
         timeout_s=5,
+        auditor=auditor,
     )
     orch = Orchestrator(
         tasks=tasks,
@@ -73,7 +74,6 @@ def make_team(
         verdicts=verdicts,
         bus=bus,
         llm=llm,
-        auditor=auditor,
         dispatcher=dispatcher,
         config=OrchestratorConfig(runs_dir=tmp_path / "runs", review_mode=review_mode),
         policy=policy,
