@@ -52,6 +52,7 @@ class InMemoryToolCallLog:
     ``attach(bus)`` records every finished tool call."""
 
     def __init__(self) -> None:
+        """Start with no calls."""
         self._calls: list[ToolCall] = []
 
     def record(self, call: ToolCall) -> None:
@@ -63,6 +64,7 @@ class InMemoryToolCallLog:
         bus.on_after(EventName.TOOL_CALL_AFTER, self._on_event)
 
     async def _on_event(self, event: Event) -> None:
+        """Record one tool_call_after event."""
         call = tool_call_from_event(event)
         if call is not None:
             self.record(call)
@@ -81,6 +83,7 @@ class EventFileToolCallLog:
     sees every tool call after a crash and resume."""
 
     def __init__(self, runs_dir: str | Path) -> None:
+        """Point at the runs folder that holds each run's events.jsonl."""
         self.runs_dir = runs_dir
 
     async def for_run(self, run_id: str) -> list[ToolCall]:

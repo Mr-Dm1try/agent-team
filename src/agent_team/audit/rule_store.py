@@ -26,6 +26,7 @@ class SqliteRuleStore:
     """
 
     def __init__(self, path: Path | str = ":memory:") -> None:
+        """Open the database, turn on WAL for files and create the table."""
         self._db = sqlite3.connect(str(path), check_same_thread=False)
         if str(path) != ":memory:":
             self._db.execute("PRAGMA journal_mode=WAL")

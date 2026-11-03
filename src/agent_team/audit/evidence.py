@@ -167,6 +167,7 @@ def helper(name: str) -> Callable[[Helper], Helper]:
     """Register an evidence helper under the name rules.yaml uses for it."""
 
     def register(fn: Helper) -> Helper:
+        """Store the helper under its name and return it unchanged."""
         HELPERS[name] = fn
         return fn
 
@@ -223,6 +224,7 @@ def gather(ctx: AuditContext, rules: Iterable[Rule]) -> dict[str, HelperResult]:
 
 
 def _missing(rule: Rule, kind: str) -> HelperResult:
+    """A hit for a rule whose required artifact doesn't exist."""
     return HelperResult(findings=[hit(rule, f"no {kind} artifact to check", item=kind)])
 
 
@@ -302,6 +304,7 @@ def schema(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 
 def _texts(model: BaseModel) -> str:
+    """An artifact as JSON text, for pattern scans."""
     return model.model_dump_json(indent=1)
 
 
@@ -462,6 +465,7 @@ def minimal_revision(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 
 def _changed_sections(old: ArtifactBase, new: ArtifactBase) -> list[str]:
+    """Top-level fields, and list items by id, that differ between two versions."""
     skip = {"run_id", "task_id", "version", "built_from"}
     a, b = old.model_dump(), new.model_dump()
     out: list[str] = []
@@ -477,7 +481,10 @@ def _changed_sections(old: ArtifactBase, new: ArtifactBase) -> list[str]:
 
 
 def _changed_items(before: list[Any], after: list[Any]) -> list[str]:
+    """Ids of list items that were added, removed or changed."""
+
     def key(x: Any, i: int) -> str:
+        """An item's id, name or key, else its position."""
         if isinstance(x, dict):
             return str(x.get("id") or x.get("name") or x.get("key") or i)
         return str(i)
@@ -836,6 +843,7 @@ def interface_names(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 
 def _interface_needle(name: str) -> str:
+    """What to search the code for: a route's static path or a function's name."""
     route = re.search(r"/[^\s{]*", name)
     if route:
         return route.group(0).rstrip("/") or "/"

@@ -270,6 +270,7 @@ class CodeHit:
 
 
 def _code_lines(text: str) -> list[tuple[int, str]]:
+    """Numbered code lines with comment lines left out."""
     return [
         (n, line)
         for n, line in enumerate(text.splitlines(), start=1)
@@ -315,6 +316,7 @@ _REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._\-]*)\s*(\[[^\]]*\])?\s*(===|==|
 
 
 def _norm_pkg(name: str) -> str:
+    """A package name in PyPI's normalized form."""
     return re.sub(r"[-_.]+", "-", name).lower()
 
 

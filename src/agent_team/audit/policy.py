@@ -80,6 +80,7 @@ def _decision(
     rule: str,
     **inputs: Any,
 ) -> Decision:
+    """A code-made Decision with task_id always in its inputs."""
     return Decision(
         run_id=run.id,
         task_id=task_id,
@@ -101,20 +102,24 @@ def _blocker_keys(verdict: Verdict) -> frozenset[tuple[str, str, str]]:
 
 
 def _summary(findings: Iterable[Finding], limit: int = 5) -> str:
+    """A short one-line list of findings for reasons and questions."""
     items = [f"{f.rule_id}" + (f" {f.item}" if f.item else "") + f": {f.message}" for f in findings]
     more = f" (+{len(items) - limit} more)" if len(items) > limit else ""
     return "; ".join(items[:limit]) + more
 
 
 def _ids(findings: Iterable[Finding]) -> list[str]:
+    """The ids of these findings."""
     return [f.id for f in findings]
 
 
 def _lineage(task: Task) -> set[str]:
+    """The task and the task it came from, for history lookups."""
     return {task.id} | ({task.parent_task_id} if task.parent_task_id else set())
 
 
 def _earliest_upstream(findings: Iterable[Finding], below: int) -> ArtifactRef | None:
+    """The most upstream artifact a finding blames, below a given kind rank."""
     upstream = [
         f.artifact
         for f in findings
@@ -126,6 +131,7 @@ def _earliest_upstream(findings: Iterable[Finding], below: int) -> ArtifactRef |
 
 
 def _producer(ref: ArtifactRef, tasks: Iterable[Task]) -> Task | None:
+    """The task that produced an artifact version, else the latest of that kind."""
     exact = [t for t in tasks if t.output == ref]
     if exact:
         return exact[-1]
@@ -294,6 +300,7 @@ def decide_task(
 
 
 def _ask(run: Run, task_id: str | None, question: str, rule: str, fids: list[str]) -> Decision:
+    """An ASK_USER decision with the question in its inputs."""
     inputs: dict[str, Any] = {"question": question, "finding_ids": fids}
     if task_id is not None:
         inputs["task_id"] = task_id
@@ -321,6 +328,7 @@ def _upstream_or_ask(
     lineage: set[str],
     gate: Phase | None,
 ) -> Decision:
+    """Reopen the upstream artifact, or ask the user when a cap or a repeat applies."""
     fids = _ids(blockers)
     already = [
         d
@@ -372,6 +380,8 @@ def _upstream_or_ask(
 
 @dataclass
 class _Fix:
+    """The findings routed to one task at a gate."""
+
     task: Task
     findings: list[Finding] = field(default_factory=list)
 
@@ -567,6 +577,7 @@ class CodeVerdictPolicy:
         verdicts: VerdictStore,
         limits: PolicyLimits | None = None,
     ) -> None:
+        """Wire the policy to the stores it reads."""
         self.tasks = tasks
         self.artifacts = artifacts
         self.decisions = decisions

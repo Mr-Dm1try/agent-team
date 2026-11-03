@@ -49,6 +49,7 @@ class Reply[T: BaseModel]:
     usage across attempts and the last parse error."""
 
     def __init__(self, value: T | None, model: str | None, usage: Usage, error: str | None):
+        """Hold one ask_json result."""
         self.value = value
         self.model = model
         self.usage = usage

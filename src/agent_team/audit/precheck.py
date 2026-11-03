@@ -43,6 +43,8 @@ WEB_TOOLS = frozenset({"web_fetch", "web_search", "fetch", "http_request", "open
 
 
 class _ModelPrecheck(BaseModel):
+    """The pre-check model's answer on one unclear tool call."""
+
     model_config = ConfigDict(extra="ignore")
     decision: Literal["allow", "block", "ask_user"]
     reason: str = ""
@@ -61,7 +63,9 @@ class Prechecker(Protocol):
 
     async def precheck(
         self, tool: str, args: dict[str, Any], task: Task, run: Run
-    ) -> PrecheckResult: ...
+    ) -> PrecheckResult:
+        """Check one tool call before it runs."""
+        ...
 
 
 class ToolPrecheck:
@@ -74,17 +78,20 @@ class ToolPrecheck:
         llm: LLMClient | None,
         artifacts: ArtifactStore | None = None,
     ) -> None:
+        """Wire the pre-check to the rules, the model and, optionally, the spec's hosts."""
         self.rules = rules
         self.llm = llm
         self.artifacts = artifacts  # for the spec's allowed hosts, when there is one
 
     async def _allowed_hosts(self, run: Run) -> tuple[str, ...]:
+        """Hosts the run's latest spec allows, if any."""
         if self.artifacts is None:
             return ()
         spec = await self.artifacts.latest(run.id, "spec")
         return tuple(spec.allowed_hosts) if isinstance(spec, Spec) else ()
 
     async def _precheck_rules(self) -> dict[str, Rule]:
+        """Enabled rules marked precheck, by id."""
         found: dict[str, Rule] = {}
         for scope in ("task", "phase", "run"):
             for rule in await self.rules.for_scope(scope, phase=None, agent=None):
@@ -118,6 +125,7 @@ class ToolPrecheck:
         rules: list[Rule],
         unclear: list[tuple[str, str]],
     ) -> PrecheckResult:
+        """Ask the model about unclear calls; anything unusable blocks."""
         rule_id = unclear[0][0]
         if self.llm is None:
             return PrecheckResult(

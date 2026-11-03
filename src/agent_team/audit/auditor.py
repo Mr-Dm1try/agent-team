@@ -63,6 +63,8 @@ _MAX_TOOL_CALLS = 60
 
 
 class _ModelFinding(BaseModel):
+    """One finding as the auditor model reports it; lenient, since model output is untrusted."""
+
     model_config = ConfigDict(extra="ignore")
     rule_id: str
     severity: Literal["blocker", "warning"] | None = None
@@ -74,12 +76,16 @@ class _ModelFinding(BaseModel):
 
 
 class _ModelVerdict(BaseModel):
+    """The auditor model's whole answer: a short summary and its findings."""
+
     model_config = ConfigDict(extra="ignore")
     summary: str = ""
     findings: list[_ModelFinding] = Field(default_factory=list)
 
 
 class _SecondCheck(BaseModel):
+    """The second, independent model check's answer on one finding."""
+
     model_config = ConfigDict(extra="ignore")
     confirmed: bool
     reason: str = ""
@@ -125,6 +131,7 @@ class LLMAuditor:
         prechecker: ToolPrecheck | None = None,
         second_check: bool = True,
     ) -> None:
+        """Wire the auditor to the model, the stores and the tool-call log."""
         self.llm = llm
         self.rules = rules
         self.tasks = tasks
@@ -145,6 +152,7 @@ class LLMAuditor:
         )
 
         async def build() -> tuple[AuditContext, list[Rule]]:
+            """Gather what this sweep can see and the rules it applies."""
             ctx = AuditContext(
                 run=run, scope=RuleScope.TASK, phase=task.phase, task=task, artifact=artifact
             )
@@ -167,6 +175,7 @@ class LLMAuditor:
         base = Verdict(run_id=run.id, scope=RuleScope.PHASE, phase=phase, passed=False)
 
         async def build() -> tuple[AuditContext, list[Rule]]:
+            """Gather what this sweep can see and the rules it applies."""
             ctx = AuditContext(run=run, scope=RuleScope.PHASE, phase=phase)
             ctx.tasks = await self.tasks.list_tasks(run.id)
             ctx.latest = await self._latest(run.id)
@@ -186,6 +195,7 @@ class LLMAuditor:
         base = Verdict(run_id=run.id, scope=RuleScope.RUN, passed=False)
 
         async def build() -> tuple[AuditContext, list[Rule]]:
+            """Gather what this sweep can see and the rules it applies."""
             ctx = AuditContext(run=run, scope=RuleScope.RUN)
             ctx.tasks = await self.tasks.list_tasks(run.id)
             ctx.latest = await self._latest(run.id)
@@ -232,6 +242,7 @@ class LLMAuditor:
         rules: list[Rule],
         helpers: dict[str, HelperResult],
     ) -> Verdict:
+        """Ask the model for a verdict, merge it with the helper hits and second-check the rest."""
         prompt = render_prompt(ctx, rules, helpers)
         reply = await ask_json(
             self.llm,
@@ -298,6 +309,7 @@ class LLMAuditor:
     # --- store helpers ---
 
     async def _latest(self, run_id: str) -> dict[str, Artifact]:
+        """The latest artifact of every kind in the run."""
         out: dict[str, Artifact] = {}
         for kind in ARTIFACT_TYPES:
             artifact = await self.artifacts.latest(run_id, kind)
@@ -306,6 +318,7 @@ class LLMAuditor:
         return out
 
     async def _previous(self, run_id: str, artifact: Artifact) -> Artifact | None:
+        """The version before this artifact, for revision checks; None if unreadable."""
         if artifact.version <= 1:
             return None
         ref = ref_of(artifact)
@@ -340,6 +353,7 @@ def _head_and_tail(text: str, limit: int) -> str:
 def _fail_closed(
     base: Verdict, reason: str, helpers: dict[str, HelperResult], rules: list[Rule]
 ) -> Verdict:
+    """Turn a sweep that produced no valid verdict into a failing one, keeping helper hits."""
     base.passed = False
     base.rules_checked = base.rules_checked or [r.id for r in rules]
     base.findings = [
@@ -355,6 +369,7 @@ def _fail_closed(
 
 
 def _from_model(mf: _ModelFinding, rules: dict[str, Rule]) -> Finding:
+    """Turn a model finding into a Finding, capping severity at the rule's own."""
     rule = rules.get(mf.rule_id)
     artifact: ArtifactRef | None = None
     if mf.artifact:
@@ -387,14 +402,17 @@ def _from_model(mf: _ModelFinding, rules: dict[str, Rule]) -> Finding:
 
 
 def _norm_item(item: str | None) -> str:
+    """Normalize an item name so model and helper findings on the same item match."""
     return (item or "").strip().lower().removeprefix("./")
 
 
 def _same(a: Finding, b: Finding) -> bool:
+    """Whether two findings are about the same rule and item."""
     return a.rule_id == b.rule_id and _norm_item(a.item) == _norm_item(b.item)
 
 
 def _helper_support(finding: Finding, helpers: dict[str, HelperResult]) -> Finding | None:
+    """The helper hit that backs a model finding, if there is one."""
     result = helpers.get(finding.rule_id)
     if result is None:
         return None
@@ -408,10 +426,12 @@ def _helper_support(finding: Finding, helpers: dict[str, HelperResult]) -> Findi
 
 
 def _clip(text: str, limit: int) -> str:
+    """Cut text to a limit and say how much was cut."""
     return text if len(text) <= limit else text[:limit] + f"\n… ({len(text) - limit} chars cut)"
 
 
 def _dump(model: BaseModel, limit: int) -> str:
+    """An artifact as compact JSON, clipped for the prompt."""
     return _clip(model.model_dump_json(indent=1, exclude_none=True), limit)
 
 
