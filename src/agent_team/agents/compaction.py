@@ -22,9 +22,9 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent_team.agents.jsonrepair import parse_output
 from agent_team.core.interfaces import EventBus
 from agent_team.core.models import AgentName, Event, EventName, Run, Usage
+from agent_team.llm.structured import parse_output
 from agent_team.llm.tokens import CHARS_PER_TOKEN, Anchor, estimate_json_tokens, to_json
 from agent_team.llm.types import (
     ContentBlock,

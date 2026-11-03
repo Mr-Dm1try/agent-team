@@ -322,14 +322,12 @@ class SqliteCheckpointStore:
         db: Database,
         runs_dir: str | Path,
         *,
-        bus: EventBus | None = None,
         inline_limit: int = 20_000,
         preview_chars: int = 2_000,
     ) -> None:
         """Use ``db`` for rows and ``runs_dir`` for blobs of results over ``inline_limit``."""
         self.db = db
         self.runs_dir = Path(runs_dir)
-        self.bus = bus
         self.inline_limit = inline_limit
         self.preview_chars = preview_chars
 
@@ -349,17 +347,6 @@ class SqliteCheckpointStore:
             "VALUES (?, ?, ?, ?, ?)",
             (task_id, attempt, step, utcnow().isoformat(), _MESSAGES.dump_json(stored).decode()),
         )
-        if self.bus is not None:
-            await self.bus.emit(
-                Event(
-                    name=EventName.CHECKPOINT_SAVED,
-                    run_id=run_id,
-                    task_id=task_id,
-                    attempt=attempt,
-                    level="debug",
-                    data={"step": step, "messages": len(messages)},
-                )
-            )
 
     async def _offload(self, run_id: str, task_id: str, attempt: int, message: Message) -> Message:
         """Move large tool results to blob files, leaving a preview and the path."""

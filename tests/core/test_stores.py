@@ -214,14 +214,12 @@ async def test_artifact_needs_run_id(db: Database, tmp_path: Path) -> None:
 
 
 async def test_checkpoints_keep_latest_and_offload_large_results(
-    db: Database, bus: InMemoryEventBus, events: list[Event], tmp_path: Path
+    db: Database, tmp_path: Path
 ) -> None:
     tasks = SqliteTaskStore(db)
     run = await tasks.create_run(make_run(tmp_path))
     task = await tasks.create_task(make_task(run))
-    store = SqliteCheckpointStore(
-        db, tmp_path / "runs", bus=bus, inline_limit=100, preview_chars=50
-    )
+    store = SqliteCheckpointStore(db, tmp_path / "runs", inline_limit=100, preview_chars=50)
 
     assert await store.load_latest(task.id, 1) is None
     big = "x" * 500
@@ -244,7 +242,6 @@ async def test_checkpoints_keep_latest_and_offload_large_results(
     assert str(tmp_path / "runs" / run.id / "blobs") in result.stored_at
     assert len(result.content) < len(big)
     assert isinstance(back[0].content[0], TextBlock)
-    assert [e.data["step"] for e in events if e.name is EventName.CHECKPOINT_SAVED] == [1, 2, 1]
     # The full result is written once even though steps keep resaving the history.
     await store.save_step(task.id, 1, 3, msgs)
     blobs = await asyncio.to_thread(lambda: list((tmp_path / "runs" / run.id / "blobs").iterdir()))

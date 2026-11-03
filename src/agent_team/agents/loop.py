@@ -16,10 +16,10 @@ from typing import Any, Literal
 from pydantic import BaseModel
 
 from agent_team.agents.compaction import Compactor, sent_json
-from agent_team.agents.jsonrepair import parse_output
 from agent_team.core.errors import OutputValidationError, ToolError
 from agent_team.core.interfaces import CheckpointStore, EventBus, Tool, ToolContext
 from agent_team.core.models import AgentName, Event, EventName, Run, ToolResult, Usage
+from agent_team.llm.structured import parse_output
 from agent_team.llm.tokens import Anchor, Calibration
 from agent_team.llm.types import (
     ContentBlock,
