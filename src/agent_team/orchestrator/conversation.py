@@ -31,6 +31,7 @@ from agent_team.core.models import (
     TaskStatus,
     Verdict,
 )
+from agent_team.core.tracing import Tracer
 from agent_team.orchestrator.base import (
     APPROVE,
     ESCALATION,
@@ -66,8 +67,16 @@ class ConversationMixin(OrchestratorBase):
     async def handle(self, message: str, *, run_id: str | None = None) -> Reply:
         """One user message. An orchestrator tool loop works out what it means from the
         run's state and picks actions; code then carries them out. If the loop fails,
-        nothing is acted on and the user is asked again."""
+        nothing is acted on and the user is asked again. A message about a run is a
+        span in that run's trace."""
         run = await self.tasks.get_run(run_id) if run_id else None
+        if run is None:
+            return await self._handle(message, None)
+        async with Tracer(self.bus).in_run(run, "user message", "other", agent=AgentName.USER):
+            return await self._handle(message, run)
+
+    async def _handle(self, message: str, run: Run | None) -> Reply:
+        """Read one message and carry out what it means; see ``handle``."""
         await self.bus.emit(
             Event(
                 name=EventName.USER_MESSAGE,

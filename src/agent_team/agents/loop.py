@@ -19,6 +19,7 @@ from agent_team.agents.compaction import Compactor, sent_json
 from agent_team.core.errors import OutputValidationError, ToolError
 from agent_team.core.interfaces import CheckpointStore, EventBus, Tool, ToolContext
 from agent_team.core.models import AgentName, Event, EventName, Run, ToolResult, Usage
+from agent_team.core.tracing import Tracer
 from agent_team.llm.structured import parse_output
 from agent_team.llm.tokens import Anchor, Calibration
 from agent_team.llm.types import (
@@ -132,6 +133,13 @@ class ToolLoop[M: BaseModel]:
     # --- tools ---------------------------------------------------------------------
 
     async def _call_tool(self, call: ToolUseBlock, *, resumed: bool = False) -> ToolResultBlock:
+        """Run one tool call in its own ``tool`` span, under the attempt's."""
+        async with Tracer(self.bus).span(self.run.id, call.name, "tool", call_id=call.id) as span:
+            result = await self._tool(call, resumed=resumed)
+            span.set(is_error=result.is_error)
+            return result
+
+    async def _tool(self, call: ToolUseBlock, *, resumed: bool) -> ToolResultBlock:
         """Run one tool call through the pre-call hooks; every failure becomes an error result for
         the model."""
         tool = self.tools.get(call.name)
