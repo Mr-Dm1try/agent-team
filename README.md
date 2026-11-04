@@ -7,9 +7,9 @@ for changes.
 
 Built for the AI Engineer Challenge: Research Agent Teams.
 
-> **Status:** the team, the auditor, the gateway and the CLI run end to end (the tests
-> drive a whole build with a scripted model). The Docker sandbox and memory are not
-> built yet, so a real build can't run its tests and fails rule R6 until the sandbox lands.
+> **Status:** the team, the auditor, the gateway, the Docker sandbox and the CLI run end
+> to end (the tests drive a whole build with a scripted model). A real build needs Docker
+> running; memory is not built yet.
 
 ## What it does
 

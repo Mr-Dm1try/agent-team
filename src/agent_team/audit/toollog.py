@@ -2,8 +2,9 @@
 
 No contract in ``core`` reads events back, so the auditor keeps its own log, filled
 from ``tool_call_after`` events. The event's ``data`` is read leniently: ``tool`` (or
-``name``), ``args`` (or ``arguments``), ``result`` (or ``content``), ``is_error`` and
-``blocked`` (True when the pre-check refused the call, so it never ran).
+``name``), ``args`` (or ``arguments``), ``result`` (or ``content``), ``is_error``,
+``blocked`` (True when the pre-check refused the call, so it never ran) and ``data``
+(the tool's structured result, such as a command's ``exit_code``).
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ class ToolCall(Contract):
     result: str = ""
     is_error: bool = False
     blocked: bool = False  # refused by the pre-check: it never ran
+    data: dict[str, Any] = Field(default_factory=dict)
     ts: datetime = Field(default_factory=utcnow)
 
 
@@ -105,6 +107,7 @@ def tool_call_from_event(event: Event) -> ToolCall | None:
         return None
     args = data.get("args", data.get("arguments", {}))
     result = data.get("result", data.get("content", ""))
+    extra = data.get("data")
     return ToolCall(
         run_id=event.run_id,
         task_id=event.task_id,
@@ -114,5 +117,6 @@ def tool_call_from_event(event: Event) -> ToolCall | None:
         result=result if isinstance(result, str) else str(result),
         is_error=bool(data.get("is_error", False)),
         blocked=bool(data.get("blocked", False)),
+        data=extra if isinstance(extra, dict) else {},
         ts=event.ts,
     )

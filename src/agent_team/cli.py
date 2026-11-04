@@ -19,6 +19,7 @@ import typer
 from agent_team import __version__
 from agent_team.app import App, build_app
 from agent_team.core.config import Config, load_config
+from agent_team.core.errors import SandboxError
 from agent_team.core.models import Event
 from agent_team.core.tracing import load_spans, read_events, render_tree, span_tree
 from agent_team.llm.chaos import parse_chaos
@@ -94,8 +95,13 @@ def _config(path: Path | None, chaos: str | None) -> Config:
 async def _talk(config: Config, *, request: str | None = None, run_id: str | None = None) -> int:
     """Send the request (or resume the run), then pass each typed line on while the run
     waits. Returns the exit code: 0 once the run is done or left waiting, 1 when it
-    stopped or failed with nothing to answer."""
-    with await _factory(config) as team:
+    stopped or failed with nothing to answer, or the sandbox couldn't start."""
+    try:
+        team = await _factory(config)
+    except SandboxError as exc:
+        typer.echo(f"Can't start: {exc}", err=True)
+        return 1
+    with team:
         if run_id is not None:
             reply = await team.orchestrator.resume(run_id)
         else:

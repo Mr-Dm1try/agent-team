@@ -71,7 +71,8 @@ class ToolBlocked(ToolError):
 
 
 class SandboxError(AgentTeamError):
-    """Docker missing, container timeout, or another sandbox failure. Escalates the task."""
+    """Docker missing or a container failure. Stops the app at start when Docker is
+    missing; during a command the tool turns it into an error the model can retry."""
 
 
 class AuditFailure(AgentTeamError):

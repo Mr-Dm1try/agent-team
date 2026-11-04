@@ -15,9 +15,12 @@ from agent_team.core.errors import ToolError
 from agent_team.core.interfaces import Tool, ToolContext
 from agent_team.core.models import Run, ToolResult
 from agent_team.llm.types import ToolSpec
+from agent_team.sandbox.base import DEPS_DIR
 from agent_team.tools.base import display_path, resolve_path
 
-_SKIP_DIRS = frozenset({".git", "__pycache__", ".venv", "node_modules", ".mypy_cache"})
+_SKIP_DIRS = frozenset(
+    {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".pytest_cache", DEPS_DIR}
+)
 
 
 def _str_arg(args: dict[str, Any], key: str, tool: str, default: str | None = None) -> str:

@@ -5,12 +5,15 @@ its pre-check, the verdict policy and the JSONL trace."""
 from __future__ import annotations
 
 import contextlib
+import subprocess
 from pathlib import Path
 from typing import Any
 
 from agents.scenario import Responder
+from sandbox.fakes import FakeRunner
 
 from agent_team.app import App
+from agent_team.core.artifacts import ArtifactRef
 from agent_team.core.models import (
     AgentName,
     DecisionKind,
@@ -22,6 +25,7 @@ from agent_team.core.models import (
 from agent_team.core.tracing import SpanNode, load_spans, read_events, render_tree, span_tree
 from agent_team.llm.types import LLMRequest
 from agent_team.orchestrator.replies import Reply
+from agent_team.sandbox import WorkspaceGit
 from e2e.team import PASS, e2e_app, e2e_script
 
 SPEC_GAP = {
@@ -56,9 +60,56 @@ async def test_a_build_goes_through_every_phase_to_done(tmp_path: Path) -> None:
         return PASS
 
     # The first model call of the run hits a 503 and is retried.
-    app = await e2e_app(tmp_path, auditor=auditor, chaos={"script": ["server_error"]})
+    runner = FakeRunner()
+    app = await e2e_app(
+        tmp_path, auditor=auditor, runner=runner, chaos={"script": ["server_error"]}
+    )
     with app:
-        await _check_the_build(app, await app.orchestrator.handle("Build a books API"))
+        reply = await app.orchestrator.handle("Build a books API")
+        await _check_the_build(app, reply)
+        await _check_the_sandbox(app, runner, reply)
+
+
+async def _check_the_sandbox(app: App, runner: FakeRunner, reply: Reply) -> None:
+    """The Engineer's commands went through the real tools, each passing version was
+    committed, and every task's containers were cleaned up."""
+    assert reply.run_id
+    run = await app.stores.tasks.get_run(reply.run_id)
+    tasks = await app.stores.tasks.list_tasks(run.id)
+    engineers = [t for t in tasks if t.agent is AgentName.ENGINEER]
+    # Each Engineer attempt installed pytest with the network on, then ran it without.
+    installs = [s for s in runner.specs if s.network]
+    tests = [s for s in runner.specs if not s.network]
+    assert len(installs) == len(tests) == len(engineers) == 2
+    assert all(s.argv[-1] == "pytest==8.3.3" for s in installs)
+    assert all(s.argv == ["pytest", "-q"] and s.workspace == run.workspace for s in tests)
+    assert {s.task_id for s in runner.specs} == {t.id for t in engineers}
+    cleaned = {c["task_id"] for c in runner.cleaned}
+    assert {t.id for t in engineers} <= cleaned
+    assert {"run_id": run.id, "task_id": None} in runner.cleaned
+
+    # Both code versions passed their checks and were committed and tagged.
+    def git(*args: str) -> list[str]:
+        """Run git in the workspace and return its output lines."""
+        out = subprocess.run(["git", *args], cwd=run.workspace, capture_output=True, text=True)
+        return out.stdout.splitlines()
+
+    assert git("log", "--format=%s") == [
+        "code_change v2: " + engineers[1].objective[:72],
+        "code_change v1: " + engineers[0].objective[:72],
+    ]
+    assert {"app.py", ".gitignore"} <= set(
+        git("show", "--name-only", "--format=", "code_change-v1")
+    )
+    assert ".deps" not in "".join(git("ls-files"))
+    assert (
+        await WorkspaceGit(run.workspace).diff(
+            ArtifactRef(kind="code_change", version=1), ArtifactRef(kind="code_change", version=2)
+        )
+        == ""
+    )
+    ignored = set(git("show", "code_change-v1:.gitignore"))
+    assert {".deps/", "__pycache__/", ".pytest_cache/"} <= ignored
 
 
 async def _check_the_build(app: App, reply: Reply) -> None:

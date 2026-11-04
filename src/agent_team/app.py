@@ -49,7 +49,8 @@ from agent_team.llm.chaos import Chaos
 from agent_team.llm.factory import build_gateway
 from agent_team.llm.types import LLMClient, Provider
 from agent_team.orchestrator import Dispatcher, Orchestrator, OrchestratorConfig
-from agent_team.tools import file_tools
+from agent_team.sandbox import CommandRunner, DockerRunner, attach_cleanup, make_commit_hook
+from agent_team.tools import command_tools, file_tools, web_tools
 
 
 @dataclass
@@ -118,6 +119,27 @@ def _make_dirs(config: Config) -> Path:
     return runs_dir
 
 
+async def _build_tools(
+    config: Config,
+    runs_dir: Path,
+    runner: CommandRunner | None,
+    closers: list[Callable[[], None]],
+) -> tuple[dict[str, Tool], CommandRunner | None]:
+    """The file tools, plus the sandbox's command tools and the web tools when the
+    config enables them. Connects to Docker when no runner is given, sweeping what
+    crashed runs left behind; the app closes the runner it opened."""
+    tools = file_tools()
+    if config.sandbox.enabled:
+        if runner is None:
+            runner = await DockerRunner.connect(config.sandbox, runs_dir)
+            closers.append(runner.close)
+        await runner.sweep()
+        tools |= command_tools(runner, config.sandbox)
+    if config.web.enabled:
+        tools |= web_tools(config.web)
+    return tools, runner
+
+
 async def build_app(
     config: Config | None = None,
     *,
@@ -129,12 +151,15 @@ async def build_app(
     agents: Mapping[AgentName, Agent] | None = None,
     tools: dict[str, Tool] | None = None,
     policy: VerdictPolicy | None = None,
+    runner: CommandRunner | None = None,
 ) -> App:
     """Build the team from ``config`` (the default config file when None). Each keyword
     replaces one collaborator; the rest is built from the config: SQLite stores in WAL
     mode, the event bus with the JSONL log and the configured hooks, the gateway over
     the configured (or given) providers, the auditor over the seeded rule catalog with
-    its pre-check on every tool call, the agents, the dispatcher and the orchestrator."""
+    its pre-check on every tool call, the tools, the agents, the dispatcher and the
+    orchestrator. When the sandbox is enabled and neither ``tools`` nor ``runner`` is
+    given, this connects to Docker and raises SandboxError if it can't."""
     config = config or load_config()
     runs_dir = _make_dirs(config)
     closers: list[Callable[[], None]] = []
@@ -170,6 +195,17 @@ async def build_app(
             tool_log=EventFileToolCallLog(runs_dir),
         )
     bus.on_before(EventName.TOOL_CALL_BEFORE, make_precheck_hook(auditor, stores.tasks))
+    if config.sandbox.commit_versions:
+        bus.on_after(EventName.AUDIT_VERDICT, make_commit_hook(stores.tasks))
+    if tools is None:
+        try:
+            tools, runner = await _build_tools(config, runs_dir, runner, closers)
+        except BaseException:
+            while closers:
+                closers.pop()()
+            raise
+    if runner is not None:
+        attach_cleanup(bus, runner)
     dispatcher = Dispatcher(
         tasks=stores.tasks,
         artifacts=stores.artifacts,
@@ -177,7 +213,7 @@ async def build_app(
         bus=bus,
         llm=llm,
         agents=agents if agents is not None else default_agents(),
-        tools=tools if tools is not None else file_tools(),
+        tools=tools,
         feedback=stores.feedback,
         verdicts=stores.verdicts,
         timeout_s=config.limits.task_timeout_s,

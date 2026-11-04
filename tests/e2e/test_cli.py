@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 from agent_team import cli
 from agent_team.app import App
 from agent_team.core.config import Config
+from agent_team.core.errors import SandboxError
 from agent_team.core.models import AgentName
 from agent_team.llm.types import LLMRequest
 from e2e.team import e2e_config, e2e_script, scripted_app
@@ -95,3 +96,17 @@ def test_logs_of_an_unknown_run_fail(config_file: Path) -> None:
     result = CliRunner().invoke(cli.app, ["logs", "run_nope", "-c", str(config_file)])
     assert result.exit_code == 1
     assert "No events for run run_nope" in result.output
+
+
+def test_no_docker_prints_the_help_not_a_traceback(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_docker(config: Config) -> App:
+        """The sandbox can't start."""
+        raise SandboxError("Docker isn't reachable (test). Start Docker.")
+
+    monkeypatch.setattr(cli, "_factory", no_docker)
+    result = CliRunner().invoke(cli.app, ["run", "Build it", "-c", str(config_file)])
+    assert result.exit_code == 1
+    assert "Can't start: Docker isn't reachable (test). Start Docker." in result.output
+    assert "Traceback" not in result.output

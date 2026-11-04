@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -110,6 +111,47 @@ async def test_lookalike_install_asks_the_model(
         "run_command", {"command": "pip install 'reqeusts>=2.0'"}, task, run
     )
     assert (result.decision, result.rule_id) == (PrecheckDecision.BLOCK, "S4")
+
+
+def write_requirements(run: Run, text: str) -> None:
+    """Put a requirements.txt in the run's workspace."""
+    Path(run.workspace).mkdir(parents=True, exist_ok=True)
+    Path(run.workspace, "requirements.txt").write_text(text)
+
+
+async def test_install_deps_lookalikes_ask_the_model(
+    rule_store: SqliteRuleStore, run: Run, task: Task
+) -> None:
+    llm = FakeLLM([{"decision": "block", "reason": "typosquat"}])
+    check = pc(rule_store, llm)
+    result = await check.check("install_deps", {"packages": ["reqeusts==2.32.0"]}, task, run)
+    assert (result.decision, result.rule_id) == (PrecheckDecision.BLOCK, "S4")
+    # Packages in a requirements file are read from the workspace and checked too.
+    write_requirements(run, "fastapi==0.115.0  # api\nnumpyy\n")
+    llm.push({"decision": "block", "reason": "typosquat"})
+    result = await check.check("install_deps", {"requirements": "requirements.txt"}, task, run)
+    assert (result.decision, result.rule_id) == (PrecheckDecision.BLOCK, "S4")
+    assert "numpyy" in str(llm.requests[-1].messages[0].content[0])
+    # A single name given as a string is still checked as one name.
+    llm.push({"decision": "block", "reason": "typosquat"})
+    result = await check.check("install_deps", {"packages": "reqeusts"}, task, run)
+    assert (result.decision, result.rule_id) == (PrecheckDecision.BLOCK, "S4")
+    # Known packages need no model call.
+    calls = len(llm.requests)
+    ok = await check.check("install_deps", {"packages": ["pytest==8.3.3", "httpx"]}, task, run)
+    assert ok.decision is PrecheckDecision.ALLOW and len(llm.requests) == calls
+
+
+async def test_install_deps_never_reads_a_file_outside_the_workspace(
+    rule_store: SqliteRuleStore, run: Run, task: Task, tmp_path: Path
+) -> None:
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_text("reqeusts\n")
+    llm = FakeLLM()
+    result = await pc(rule_store, llm).check(
+        "install_deps", {"requirements": str(outside)}, task, run
+    )
+    assert result.decision is PrecheckDecision.ALLOW and llm.requests == []
 
 
 async def test_unusable_model_answer_blocks(

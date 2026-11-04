@@ -222,6 +222,22 @@ def test_r2_real_sources(run: Run) -> None:
     assert sorted(blockers(run_helper("R2", bad))) == ["docs/a.md", "https://fastapi.tiangolo.com/"]
 
 
+def test_r2_accepts_the_page_a_fetch_was_redirected_to(run: Run) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    page = "https://docs.example.org/en/stable/"
+    brief = ResearchBrief(
+        summary="s",
+        answers=[AnsweredQuestion(question="q", answer="a")],
+        findings=[ResearchFinding(claim="c", sources=[Source(ref=page)])],
+    )
+    fetched = call(run, task, "web_fetch", "page", url="https://docs.example.org/")
+    fetched = fetched.model_copy(update={"data": {"final_url": page}})
+    ctx = AuditContext(
+        run=run, scope=RuleScope.TASK, task=task, artifact=brief, tool_calls=[fetched]
+    )
+    assert blockers(run_helper("R2", ctx)) == []
+
+
 def test_r2_site_root_does_not_open_its_pages(run: Run) -> None:
     task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
     page = "https://docs.python.org/3/library/asyncio-task.html"
@@ -513,6 +529,36 @@ def test_r6_tests_ran(run: Run) -> None:
     assert "no run of 'pytest -q'" in run_helper("R6", not_logged).findings[0].message
     untested = code_ctx(run, tests=None)
     assert len(blockers(run_helper("R6", untested))) == 1
+
+
+def test_r6_blocks_a_reported_pass_the_tool_log_contradicts(run: Run) -> None:
+    ctx = code_ctx(run)
+    [eng] = [t for t, _ in ctx.outputs]
+    logged = call(run, eng, "run_command", "1 failed", argv=["pytest", "-q"])
+    ctx.tool_calls = [logged.model_copy(update={"data": {"exit_code": 1}})]
+    [finding] = run_helper("R6", ctx).findings
+    assert finding.severity == "blocker"
+    assert "exited 1, but the change reports exit 0" in finding.message
+    # The last run counts: a failure fixed and re-run passes.
+    rerun = call(run, eng, "run_command", "3 passed", argv=["pytest", "-q"])
+    ctx.tool_calls.append(rerun.model_copy(update={"data": {"exit_code": 0}}))
+    assert blockers(run_helper("R6", ctx)) == []
+    # A later narrower run, such as one test picked to look at, doesn't replace it.
+    narrow = call(run, eng, "run_command", "1 failed", argv=["pytest", "-q", "-k", "slow"])
+    ctx.tool_calls.append(narrow.model_copy(update={"data": {"exit_code": 1}}))
+    assert blockers(run_helper("R6", ctx)) == []
+
+
+def test_r6_a_passing_subset_does_not_hide_a_failing_full_run(run: Run) -> None:
+    ctx = code_ctx(run)
+    [eng] = [t for t, _ in ctx.outputs]
+    full = call(run, eng, "run_command", "1 failed", argv=["pytest", "-q"])
+    subset = call(run, eng, "run_command", "1 passed", argv=["pytest", "-q", "tests/test_ok.py"])
+    ctx.tool_calls = [
+        full.model_copy(update={"data": {"exit_code": 1}}),
+        subset.model_copy(update={"data": {"exit_code": 0}}),
+    ]
+    assert len(blockers(run_helper("R6", ctx))) == 1
 
 
 def test_r7_qa_clean(run: Run) -> None:

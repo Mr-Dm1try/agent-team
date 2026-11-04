@@ -144,6 +144,40 @@ class ChaosSettings(_Cfg):
     script: list[str] = Field(default_factory=list)
 
 
+class SandboxConfig(_Cfg):
+    """The Docker sandbox that runs model-written code, and its limits."""
+
+    #: Off means no run_command or install_deps tools; R6 then fails every build.
+    enabled: bool = True
+    image: str = "python:3.12-slim"
+    cpus: float = 1.0
+    memory: str = "1g"
+    pids_limit: int = 256
+    #: Default and longest wall-clock time of one run_command call.
+    timeout_s: float = 120.0
+    max_timeout_s: float = 600.0
+    #: Wall-clock time of one install_deps call, the only step with the network on.
+    install_timeout_s: float = 300.0
+    #: Characters of stdout and of stderr kept from the end of each command's output.
+    output_tail_chars: int = 4000
+    #: Commit the workspace as each Engineer version passes its check.
+    commit_versions: bool = True
+
+
+class WebConfig(_Cfg):
+    """Limits for the Researcher's web_search and web_fetch tools."""
+
+    enabled: bool = True
+    timeout_s: float = 20.0
+    #: Bytes read from one response before the rest is dropped.
+    max_bytes: int = 2_000_000
+    #: Characters of readable text returned from one page.
+    max_chars: int = 20_000
+    max_results: int = 8
+    max_redirects: int = 5
+    user_agent: str = "agent-team/0.1 (research tool)"
+
+
 class PathsConfig(_Cfg):
     """Where runs and the database live."""
 
@@ -170,6 +204,8 @@ class Config(_Cfg):
     review: ReviewMode = ReviewMode.AUTO_ASSUMPTIONS
     hooks: list[str] = Field(default_factory=list)
     paths: PathsConfig = Field(default_factory=PathsConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
 
     @model_validator(mode="after")
     def _ollama_routes_fit(self) -> Config:
