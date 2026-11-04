@@ -55,6 +55,10 @@ class LimitsConfig(_Cfg):
     max_attempts: int = 3
     max_upstream_reruns: int = 2
     max_concurrent_calls: int = 4
+    #: Attempts of each check (auditor task) before it fails closed.
+    max_check_attempts: int = 3
+    #: Wall-clock limit on one attempt of a task or a check.
+    task_timeout_s: float = 600.0
 
 
 class RetryConfig(_Cfg):
@@ -82,6 +86,9 @@ class AnthropicConfig(_Cfg):
     """Anthropic provider settings."""
 
     timeout_s: float = 120.0
+    #: Calls that may write more than this many tokens are streamed, so a long reply
+    #: isn't cut by ``timeout_s``: on a stream the timeout is per read, not per call.
+    stream_above_tokens: int = 4096
     #: Sent as ``thinking`` on every call; adaptive lets the model decide how much to
     #: think, and the route's effort sets how hard it tries.
     thinking: dict[str, Any] = Field(default_factory=lambda: {"type": "adaptive"})
@@ -106,6 +113,9 @@ class OllamaConfig(_Cfg):
     base_url: str = "http://localhost:11434/v1"
     num_ctx: int = 32_768
     timeout_s: float = 300.0
+    #: The slowest generation speed planned for. A call's timeout grows past
+    #: ``timeout_s`` when its ``max_tokens`` would take longer than that at this speed.
+    min_tokens_per_s: float = 20.0
     #: Models (by name before the ":" tag) that take ``reasoning_effort``. Ollama
     #: rejects it for models that can't think, so others get no effort at all.
     reasoning_models: list[str] = Field(default_factory=lambda: ["gpt-oss"])

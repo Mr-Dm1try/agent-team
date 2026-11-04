@@ -231,6 +231,35 @@ async def test_compaction_runs_inside_the_loop(tmp_path: Path) -> None:
     assert isinstance(first, TextBlock) and first.text.startswith("# Task")
 
 
+@pytest.mark.parametrize(
+    ("route", "counted"), [(["anthropic", "ollama"], "ollama"), (["anthropic"], "anthropic")]
+)
+async def test_compaction_counts_for_the_provider_that_would_send_most(
+    tmp_path: Path, route: list[str], counted: str
+) -> None:
+    from agent_team.llm.types import ThinkingBlock
+
+    seen: list[str | None] = []
+
+    class Spy(Compactor):
+        """Records which provider each compaction check counted for."""
+
+        def needs_compaction(self, *args: Any, **kwargs: Any) -> bool:
+            """Note the provider, then decide as usual."""
+            seen.append(kwargs.get("provider"))
+            return super().needs_compaction(*args, **kwargs)
+
+    env = envelope(tmp_path, AgentName.PRODUCT, "prd")
+    thought = ThinkingBlock(provider="ollama", model="m", raw={"thinking": "t" * 4000})
+    replies: list[Any] = [[thought, TextBlock(text="not json")], json.dumps(PRD)]
+    llm = FakeLLM({AgentName.PRODUCT: replies})
+    llm.providers = route
+    await Product(compactor=Spy()).run(env, ctx(llm))
+    # After Ollama wrote thinking, a call on a route that can fall back to Ollama may
+    # send it all back, so it counts; Anthropic alone drops it.
+    assert seen[-1] == counted
+
+
 @pytest.mark.parametrize("budget", [10_000_000])
 async def test_no_compaction_under_budget(tmp_path: Path, budget: int) -> None:
     env = envelope(tmp_path, AgentName.PRODUCT, "prd")

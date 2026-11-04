@@ -15,11 +15,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from agent_team.agents.compaction import Compactor, sent_json
-from agent_team.agents.jsonrepair import parse_output
+from agent_team.agents.compaction import Compactor, estimate_tokens, sent_json
 from agent_team.core.errors import OutputValidationError, ToolError
 from agent_team.core.interfaces import CheckpointStore, EventBus, Tool, ToolContext
 from agent_team.core.models import AgentName, Event, EventName, Run, ToolResult, Usage
+from agent_team.core.tracing import Tracer
+from agent_team.llm.structured import parse_output
 from agent_team.llm.tokens import Anchor, Calibration
 from agent_team.llm.types import (
     ContentBlock,
@@ -132,6 +133,13 @@ class ToolLoop[M: BaseModel]:
     # --- tools ---------------------------------------------------------------------
 
     async def _call_tool(self, call: ToolUseBlock, *, resumed: bool = False) -> ToolResultBlock:
+        """Run one tool call in its own ``tool`` span, under the attempt's."""
+        async with Tracer(self.bus).span(self.run.id, call.name, "tool", call_id=call.id) as span:
+            result = await self._tool(call, resumed=resumed)
+            span.set(is_error=result.is_error)
+            return result
+
+    async def _tool(self, call: ToolUseBlock, *, resumed: bool) -> ToolResultBlock:
         """Run one tool call through the pre-call hooks; every failure becomes an error result for
         the model."""
         tool = self.tools.get(call.name)
@@ -272,8 +280,21 @@ class ToolLoop[M: BaseModel]:
         # The lowest ratio over the models seen: after a fallback the next call may go
         # to either, so estimate for the one that counts more tokens.
         ratio = self.calibration.ratio(None)
+        # A provider sends back only its own thinking blocks, and the next call may go
+        # to any provider on the route, so estimate for the one that would send most.
+        providers: list[str | None] = [*self.llm.providers_for(self.agent, self.task_id)]
+        provider = max(
+            providers or [None],
+            key=lambda p: estimate_tokens(self.system, messages, specs, ratio, provider=p),
+        )
         if not self.compactor.needs_compaction(
-            self.system, messages, budget, specs, anchor=self._anchor, chars_per_token=ratio
+            self.system,
+            messages,
+            budget,
+            specs,
+            anchor=self._anchor,
+            chars_per_token=ratio,
+            provider=provider,
         ):
             return messages
         result = await self.compactor.compact(
@@ -289,6 +310,7 @@ class ToolLoop[M: BaseModel]:
             tools=specs,
             anchor=self._anchor,
             chars_per_token=ratio,
+            provider=provider,
         )
         self._usage = self._usage + result.usage
         if result.steps:

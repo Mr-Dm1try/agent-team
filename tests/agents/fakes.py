@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any
 
 from agent_team.agents.compaction import sent_json
@@ -204,11 +204,14 @@ class FakeFeedback:
     async def add(self, run_id: str, feedback: Feedback) -> None:
         self.items.append((run_id, feedback))
 
-    async def for_artifact(self, run_id: str, kind: str) -> list[Feedback]:
+    async def for_work(
+        self, run_id: str, *, refs: Sequence[ArtifactRef], task_ids: Sequence[str]
+    ) -> list[Feedback]:
         return [
             f
             for r, f in self.items
-            if r == run_id and f.artifact is not None and f.artifact.kind == kind
+            if r == run_id
+            and (f.artifact in refs or (f.task_id is not None and f.task_id in task_ids))
         ]
 
 
@@ -282,6 +285,8 @@ class FakeLLM:
         self.requests: list[LLMRequest] = []
         self.budget = budget
         self.overrides: dict[str, Any] = {}
+        #: The route the next call may take, as the gateway reports it.
+        self.providers = ["fake"]
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         self.requests.append(request)
@@ -310,6 +315,9 @@ class FakeLLM:
 
     def context_budget(self, agent: AgentName) -> int:
         return self.budget
+
+    def providers_for(self, agent: AgentName, task_id: str | None) -> list[str]:
+        return self.providers
 
     def use_stronger_model(self, task_id: str) -> object:
         self.overrides[task_id] = "stronger"

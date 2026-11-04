@@ -22,6 +22,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import anthropic
+import httpx2
 from anthropic.types.beta import BetaMessage, BetaThinkingDroppedInputTransformation
 
 from agent_team.core.config import AnthropicConfig
@@ -116,8 +117,9 @@ def from_wire_message(
 
 def translate_error(exc: Exception, provider: str) -> Exception:
     """Map SDK errors: rate limits, timeouts, connection errors and 5xx become
-    TransientLLMError; everything else is returned unchanged."""
-    if isinstance(exc, anthropic.APIConnectionError):  # includes APITimeoutError
+    TransientLLMError; everything else is returned unchanged. A stream that stalls or
+    drops mid-reply raises the HTTP client's own error, which is transient too."""
+    if isinstance(exc, anthropic.APIConnectionError | httpx2.TransportError):
         return TransientLLMError(f"{type(exc).__name__}: {exc}", provider=provider)
     if isinstance(exc, anthropic.APIStatusError) and (
         exc.status_code in (408, 409, 429) or exc.status_code >= 500
@@ -184,10 +186,16 @@ class AnthropicProvider:
     async def complete(
         self, request: LLMRequest, *, model: str, effort: Effort | None = None
     ) -> LLMResponse:
-        """One Messages API call."""
+        """One Messages API call. A call that may write a long reply is streamed and
+        returns the final message, so the timeout bounds each read, not the whole reply."""
+        params = self._params(request, model, effort)
         try:
-            msg = await self._api.create(**self._params(request, model, effort))
-        except anthropic.AnthropicError as exc:
+            if request.max_tokens > self.config.stream_above_tokens:
+                async with self._api.stream(**params) as s:
+                    msg = await s.get_final_message()
+            else:
+                msg = await self._api.create(**params)
+        except (anthropic.AnthropicError, httpx2.TransportError) as exc:
             raise translate_error(exc, self.name) from exc
         return from_wire_message(msg, provider=self.name)
 
@@ -200,6 +208,6 @@ class AnthropicProvider:
                 async for text in s.text_stream:
                     yield StreamChunk(text=text)
                 final = await s.get_final_message()
-        except anthropic.AnthropicError as exc:
+        except (anthropic.AnthropicError, httpx2.TransportError) as exc:
             raise translate_error(exc, self.name) from exc
         yield StreamChunk(done=True, response=from_wire_message(final, provider=self.name))

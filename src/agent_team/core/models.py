@@ -86,6 +86,7 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.WAITING,
             TaskStatus.READY,  # resumed after a crash or a pause
             TaskStatus.SUPERSEDED,  # a change made its inputs stale mid-attempt
+            TaskStatus.DONE,  # a check (auditor task) ends with its verdict
         }
     ),
     TaskStatus.AUDITING: frozenset(
@@ -123,6 +124,7 @@ class TaskOrigin(StrEnum):
     CHANGE_REQUEST = "change_request"
     FIX = "fix"  # a later task's end-of-task check found the fault in this task's output
     USER_RERUN = "user_rerun"
+    CHECK = "check"  # an auditor task that checks another task's output, or the run
 
 
 class RunStatus(StrEnum):
@@ -208,6 +210,9 @@ class Run(Contract):
     # Tokens and cost spent so far, saved with the run so a resumed run keeps counting
     # against its budget instead of starting from zero.
     usage: Usage = Field(default_factory=Usage)
+    #: The run's one trace, and its root span: every span of the run hangs under it.
+    trace_id: str = Field(default_factory=lambda: uuid4().hex)
+    span_id: str = Field(default_factory=lambda: uuid4().hex[:16])
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -259,7 +264,11 @@ class Feedback(Contract):
     answer, review comment, or a note from the auditor or QA."""
 
     id: str = Field(default_factory=lambda: new_id("fb"))
+    #: The artifact version it is about. Sibling artifacts of one kind (one per work
+    #: package or research question) each get their own.
     artifact: ArtifactRef | None
+    #: The task it is for, which may have no output yet.
+    task_id: str | None = None
     source: FeedbackSource
     text: str
     question_id: str | None = None  # set when this answers an agent question

@@ -13,6 +13,7 @@ import hashlib
 import json
 import sqlite3
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import TypeAdapter
@@ -322,14 +323,12 @@ class SqliteCheckpointStore:
         db: Database,
         runs_dir: str | Path,
         *,
-        bus: EventBus | None = None,
         inline_limit: int = 20_000,
         preview_chars: int = 2_000,
     ) -> None:
         """Use ``db`` for rows and ``runs_dir`` for blobs of results over ``inline_limit``."""
         self.db = db
         self.runs_dir = Path(runs_dir)
-        self.bus = bus
         self.inline_limit = inline_limit
         self.preview_chars = preview_chars
 
@@ -349,17 +348,6 @@ class SqliteCheckpointStore:
             "VALUES (?, ?, ?, ?, ?)",
             (task_id, attempt, step, utcnow().isoformat(), _MESSAGES.dump_json(stored).decode()),
         )
-        if self.bus is not None:
-            await self.bus.emit(
-                Event(
-                    name=EventName.CHECKPOINT_SAVED,
-                    run_id=run_id,
-                    task_id=task_id,
-                    attempt=attempt,
-                    level="debug",
-                    data={"step": step, "messages": len(messages)},
-                )
-            )
 
     async def _offload(self, run_id: str, task_id: str, attempt: int, message: Message) -> Message:
         """Move large tool results to blob files, leaving a preview and the path."""
@@ -446,7 +434,8 @@ class SqliteDecisionLog:
 
 
 class SqliteFeedbackStore:
-    """User answers, comments and findings per artifact kind. Implements ``FeedbackStore``."""
+    """User answers, comments and findings per artifact version and task. Implements
+    ``FeedbackStore``."""
 
     def __init__(self, db: Database) -> None:
         """Use ``db`` for feedback rows."""
@@ -454,18 +443,27 @@ class SqliteFeedbackStore:
 
     async def add(self, run_id: str, feedback: Feedback) -> None:
         """Store one piece of feedback for a run."""
-        kind = feedback.artifact.kind if feedback.artifact else None
+        ref = str(feedback.artifact) if feedback.artifact else None
         await self.db.execute(
-            f"INSERT INTO feedback (id, run_id, artifact_kind, seq, data) VALUES (?, ?, ?, "
-            f"{_seq('feedback')}, ?)",
-            (feedback.id, run_id, kind, feedback.model_dump_json()),
+            f"INSERT INTO feedback (id, run_id, artifact, task_id, seq, data) VALUES (?, ?, ?, "
+            f"?, {_seq('feedback')}, ?)",
+            (feedback.id, run_id, ref, feedback.task_id, feedback.model_dump_json()),
         )
 
-    async def for_artifact(self, run_id: str, kind: str) -> list[Feedback]:
-        """Feedback on one artifact kind, oldest first."""
+    async def for_work(
+        self, run_id: str, *, refs: Sequence[ArtifactRef], task_ids: Sequence[str]
+    ) -> list[Feedback]:
+        """Feedback on any of ``refs`` or for any of ``task_ids``, oldest first."""
+        wanted_refs = sorted({str(r) for r in refs})
+        wanted_tasks = sorted(set(task_ids))
+        if not wanted_refs and not wanted_tasks:
+            return []
+        marks = ", ".join("?" for _ in wanted_refs) or "NULL"
+        task_marks = ", ".join("?" for _ in wanted_tasks) or "NULL"
         rows = await self.db.fetchall(
-            "SELECT data FROM feedback WHERE run_id = ? AND artifact_kind = ? ORDER BY seq",
-            (run_id, kind),
+            f"SELECT data FROM feedback WHERE run_id = ? AND (artifact IN ({marks}) "
+            f"OR task_id IN ({task_marks})) ORDER BY seq",
+            (run_id, *wanted_refs, *wanted_tasks),
         )
         return [Feedback.model_validate_json(r["data"]) for r in rows]
 

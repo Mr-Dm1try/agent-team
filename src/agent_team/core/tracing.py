@@ -18,7 +18,7 @@ import json
 import threading
 import traceback
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,7 +29,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_team.core.interfaces import EventBus
-from agent_team.core.models import AgentName, Event, EventName, utcnow
+from agent_team.core.models import AgentName, Event, EventName, Run, utcnow
 
 SpanKind = Literal["run", "phase", "task", "attempt", "llm", "tool", "audit", "other"]
 SpanStatus = Literal["ok", "error", "open"]
@@ -241,6 +241,43 @@ class Tracer:
             await self._close(span, None)
         finally:
             _current.reset(token)
+
+    @staticmethod
+    def root(run: Run) -> Span:
+        """The run's root span, rebuilt from the ids saved on the run, so any process
+        can hang spans under it or close it."""
+        return Span(
+            run_id=run.id,
+            trace_id=run.trace_id,
+            span_id=run.span_id,
+            parent_span_id=None,
+            name="run",
+            kind="run",
+            start=run.created_at,
+            attrs={"title": run.title},
+        )
+
+    async def start_root(self, run: Run) -> None:
+        """Open the run's root span. It stays open until ``finish_root``, across
+        processes, so a run that never finished shows as open."""
+        span = self.root(run)
+        await self.bus.emit(span._event(EventName.SPAN_STARTED, span.start, {}))
+
+    async def finish_root(self, run: Run) -> None:
+        """Close the run's root span once the run is done."""
+        await self._close(self.root(run), None)
+
+    def in_run(
+        self, run: Run, name: str, kind: SpanKind = "other", **kw: Any
+    ) -> AbstractAsyncContextManager[Span]:
+        """A span under the current one, or under the run's root span when no span of
+        this run is open (a new process, or work started outside the drive loop)."""
+        parent = _current.get()
+        if parent is not None and parent.run_id == run.id:
+            return self.span(run.id, name, kind, **kw)
+        return self.span(
+            run.id, name, kind, trace_id=run.trace_id, parent_span_id=run.span_id, **kw
+        )
 
     async def _close(self, span: Span, exc: BaseException | None) -> None:
         """Emit span_finished with timing, status, attrs and any error."""

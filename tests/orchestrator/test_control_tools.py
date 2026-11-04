@@ -14,7 +14,7 @@ from orchestrator.harness import make_team
 
 
 async def _ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     run = await team.tasks.get_run(reply.run_id)
@@ -26,7 +26,9 @@ async def _ctx(tmp_path: Path):  # type: ignore[no-untyped-def]
 async def test_read_tools_show_run_state(tmp_path: Path) -> None:
     _team, tools, ctx = await _ctx(tmp_path)
     listing = await tools["list_tasks"]({"phase": "prd"}, ctx)
-    assert "product done" in listing.content and listing.data == {"count": 1}
+    # The PRD task and the check of its output.
+    assert "product done" in listing.content and "auditor done" in listing.content
+    assert listing.data == {"count": 2}
     art = await tools["get_artifact"]({"ref": "prd"}, ctx)
     assert '"REQ-1"' in art.content
     art = await tools["get_artifact"]({"ref": "spec@v1"}, ctx)

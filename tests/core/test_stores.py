@@ -12,7 +12,7 @@ from agent_team.core.artifacts import (
     Plan,
     Requirement,
 )
-from agent_team.core.db import Database
+from agent_team.core.db import SCHEMA_VERSION, Database, SchemaMismatch
 from agent_team.core.errors import InvalidTransition
 from agent_team.core.events import InMemoryEventBus
 from agent_team.core.models import (
@@ -214,14 +214,12 @@ async def test_artifact_needs_run_id(db: Database, tmp_path: Path) -> None:
 
 
 async def test_checkpoints_keep_latest_and_offload_large_results(
-    db: Database, bus: InMemoryEventBus, events: list[Event], tmp_path: Path
+    db: Database, tmp_path: Path
 ) -> None:
     tasks = SqliteTaskStore(db)
     run = await tasks.create_run(make_run(tmp_path))
     task = await tasks.create_task(make_task(run))
-    store = SqliteCheckpointStore(
-        db, tmp_path / "runs", bus=bus, inline_limit=100, preview_chars=50
-    )
+    store = SqliteCheckpointStore(db, tmp_path / "runs", inline_limit=100, preview_chars=50)
 
     assert await store.load_latest(task.id, 1) is None
     big = "x" * 500
@@ -244,7 +242,6 @@ async def test_checkpoints_keep_latest_and_offload_large_results(
     assert str(tmp_path / "runs" / run.id / "blobs") in result.stored_at
     assert len(result.content) < len(big)
     assert isinstance(back[0].content[0], TextBlock)
-    assert [e.data["step"] for e in events if e.name is EventName.CHECKPOINT_SAVED] == [1, 2, 1]
     # The full result is written once even though steps keep resaving the history.
     await store.save_step(task.id, 1, 3, msgs)
     blobs = await asyncio.to_thread(lambda: list((tmp_path / "runs" / run.id / "blobs").iterdir()))
@@ -297,16 +294,24 @@ async def test_decision_log_records_and_emits(
     assert emitted[0].data["id"] == d1.id and emitted[0].data["kind"] == "plan"
 
 
-async def test_feedback_by_artifact_kind(db: Database) -> None:
+async def test_feedback_by_artifact_version_and_task(db: Database) -> None:
     store = SqliteFeedbackStore(db)
-    prd = ArtifactRef(kind="prd", version=1)
-    f1 = Feedback(artifact=prd, source=FeedbackSource.USER_COMMENT, text="add auth")
-    f2 = Feedback(artifact=None, source=FeedbackSource.USER_ANSWER, text="yes")
-    f3 = Feedback(artifact=prd, source=FeedbackSource.AUDITOR, text="REQ-2 untested")
-    for f in (f1, f2, f3):
+    pkg_a = ArtifactRef(kind="code_change", version=1)
+    pkg_b = ArtifactRef(kind="code_change", version=2)
+    f1 = Feedback(artifact=pkg_a, source=FeedbackSource.USER_COMMENT, text="add auth")
+    f2 = Feedback(artifact=None, task_id="t_new", source=FeedbackSource.USER_ANSWER, text="yes")
+    f3 = Feedback(artifact=pkg_b, source=FeedbackSource.AUDITOR, text="REQ-2 untested")
+    f4 = Feedback(artifact=pkg_a, task_id="t_a", source=FeedbackSource.AUDITOR, text="S2")
+    for f in (f1, f2, f3, f4):
         await store.add("r", f)
-    assert [f.id for f in await store.for_artifact("r", "prd")] == [f1.id, f3.id]
-    assert await store.for_artifact("r", "spec") == []
+    # One work package's feedback never reaches its sibling of the same kind.
+    found = await store.for_work("r", refs=[pkg_a], task_ids=["t_a"])
+    assert [f.id for f in found] == [f1.id, f4.id]
+    assert [f.id for f in await store.for_work("r", refs=[pkg_b], task_ids=[])] == [f3.id]
+    # Feedback for a task with no output yet is found by the task.
+    assert [f.id for f in await store.for_work("r", refs=[], task_ids=["t_new"])] == [f2.id]
+    assert await store.for_work("r", refs=[], task_ids=[]) == []
+    assert await store.for_work("other", refs=[pkg_a], task_ids=["t_a"]) == []
 
 
 async def test_verdicts_per_task(db: Database) -> None:
@@ -363,3 +368,21 @@ async def test_failed_transaction_rolls_back_and_db_stays_usable(db: Database) -
     assert await db.fetchone("SELECT id FROM runs WHERE id = 'x'") is None
     await db.execute("INSERT INTO runs (id, status, created_at, data) VALUES ('y', 'a', 't', '{}')")
     assert await db.fetchone("SELECT id FROM runs WHERE id = 'y'") is not None
+
+
+def test_a_database_from_another_schema_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE runs (id TEXT PRIMARY KEY, data TEXT)")  # no version stamp
+    old.commit()
+    old.close()
+    with pytest.raises(SchemaMismatch, match="move the file aside"):
+        Database(path)
+    fresh = tmp_path / "fresh.db"
+    Database(fresh).close()
+    Database(fresh).close()  # reopening its own schema is fine
+    newer = sqlite3.connect(fresh)
+    newer.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    newer.close()
+    with pytest.raises(SchemaMismatch):
+        Database(fresh)

@@ -1,11 +1,11 @@
-"""The orchestrator with the audit package's real verdict policy and tool-call log,
-over the fake stores, to check the two agree on decision and event shapes."""
+"""The orchestrator with the audit package's real verdict policy (the composition
+root's default) and tool-call log, over the fake stores, to check the two agree on
+decision and event shapes."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from agent_team.audit.policy import CodeVerdictPolicy
 from agent_team.audit.toollog import tool_call_from_event
 from agent_team.core.artifacts import ArtifactRef
 from agent_team.core.models import (
@@ -19,18 +19,7 @@ from agent_team.core.models import (
     TaskStatus,
     Verdict,
 )
-from orchestrator.harness import Team, make_team
-
-
-def _with_policy(team: Team) -> Team:
-    """Swap the fallback policy for the audit package's own."""
-    team.orch.policy = CodeVerdictPolicy(
-        tasks=team.tasks,
-        artifacts=team.artifacts,
-        decisions=team.decisions,
-        verdicts=team.verdicts,
-    )
-    return team
+from orchestrator.harness import make_team
 
 
 def _blocker(rule: str, item: str) -> Verdict:
@@ -44,7 +33,7 @@ def _blocker(rule: str, item: str) -> Verdict:
 
 
 async def test_failed_task_is_retried_by_the_real_policy(tmp_path: Path) -> None:
-    team = _with_policy(make_team(tmp_path))
+    team = await make_team(tmp_path, code_policy=True)
     team.auditor.fail_next["prd"].append(_blocker("R3", "REQ-1"))
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "done", reply.text
@@ -55,7 +44,7 @@ async def test_failed_task_is_retried_by_the_real_policy(tmp_path: Path) -> None
 
 
 async def test_qa_finding_on_code_is_fixed_by_the_real_policy(tmp_path: Path) -> None:
-    team = _with_policy(make_team(tmp_path))
+    team = await make_team(tmp_path, code_policy=True)
     team.auditor.fail_next["qa_report"].append(_blocker("S2", "app.py"))
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "done", reply.text
@@ -73,7 +62,7 @@ async def test_qa_finding_on_code_is_fixed_by_the_real_policy(tmp_path: Path) ->
 
 
 async def test_qa_finding_on_the_spec_reopens_it(tmp_path: Path) -> None:
-    team = _with_policy(make_team(tmp_path))
+    team = await make_team(tmp_path, code_policy=True)
     gap = Finding(
         rule_id="R10",
         severity=Severity.BLOCKER,
@@ -96,7 +85,7 @@ async def test_qa_finding_on_the_spec_reopens_it(tmp_path: Path) -> None:
 
 
 async def test_tool_events_read_back_as_tool_calls(tmp_path: Path) -> None:
-    team = make_team(tmp_path)
+    team = await make_team(tmp_path)
     await team.orch.handle("Build a books API")
     after = [e for e in team.bus.events if e.name is EventName.TOOL_CALL_AFTER]
     calls = [tool_call_from_event(e) for e in after]
@@ -106,7 +95,7 @@ async def test_tool_events_read_back_as_tool_calls(tmp_path: Path) -> None:
 
 
 async def test_a_dangerous_action_cannot_be_kept_as_it_is(tmp_path: Path) -> None:
-    team = _with_policy(make_team(tmp_path))
+    team = await make_team(tmp_path, code_policy=True)
     team.auditor.fail_next["prd"].append(_blocker("S5", "run_command"))
     reply = await team.orch.handle("Build a books API")
     assert reply.kind == "stopped" and reply.run_id, reply.text

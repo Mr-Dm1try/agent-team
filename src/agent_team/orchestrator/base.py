@@ -7,11 +7,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_team.core.artifacts import Artifact, ArtifactRef
+from agent_team.core.artifacts import Artifact
 from agent_team.core.errors import BudgetExceeded, RunStopped
 from agent_team.core.interfaces import (
     ArtifactStore,
-    Auditor,
     CheckpointStore,
     DecisionLog,
     Dispatcher,
@@ -28,19 +27,19 @@ from agent_team.core.models import (
     Decision,
     Event,
     EventName,
-    Finding,
+    Feedback,
+    FeedbackSource,
     Phase,
     RequestKind,
     ReviewMode,
-    RuleScope,
     Run,
     RunStatus,
-    Severity,
     Task,
     TaskOrigin,
     TaskStatus,
     Verdict,
 )
+from agent_team.core.tracing import Tracer
 from agent_team.llm.types import LLMClient
 from agent_team.orchestrator.lineage import reopen
 from agent_team.orchestrator.policy import SimplePolicy
@@ -69,6 +68,8 @@ class OrchestratorConfig:
     runs_dir: Path
     review_mode: ReviewMode = ReviewMode.AUTO_ASSUMPTIONS
     max_attempts: int = 3
+    #: Attempts of each check (auditor task) before it fails closed.
+    max_check_attempts: int = 3
     max_upstream_reruns: int = 2
     max_loops: int = 500  # safety valve for drive()
 
@@ -87,7 +88,6 @@ class OrchestratorBase:
         verdicts: VerdictStore,
         bus: EventBus,
         llm: LLMClient,
-        auditor: Auditor,
         dispatcher: Dispatcher,
         config: OrchestratorConfig,
         policy: VerdictPolicy | None = None,
@@ -101,7 +101,6 @@ class OrchestratorBase:
         self.verdicts = verdicts
         self.bus = bus
         self.llm = llm
-        self.auditor = auditor
         self.dispatcher = dispatcher
         self.config = config
         self.policy: VerdictPolicy = policy or SimplePolicy()
@@ -141,8 +140,8 @@ class OrchestratorBase:
             if t.agent is AgentName.USER
         ]
 
-    async def _save_verdict(self, verdict: Verdict) -> None:
-        """Store a verdict and emit audit_verdict for it."""
+    async def _save_verdict(self, verdict: Verdict, *, check: Task | None = None) -> None:
+        """Store a verdict and emit audit_verdict for it, naming the check that made it."""
         await self.verdicts.save(verdict)
         await self.bus.emit(
             Event(
@@ -153,6 +152,7 @@ class OrchestratorBase:
                 level="info" if verdict.passed else "warning",
                 data={
                     "verdict_id": verdict.id,
+                    "check_task_id": check.id if check else None,
                     "scope": verdict.scope.value,
                     "phase": verdict.phase.value if verdict.phase else None,
                     "passed": verdict.passed,
@@ -186,7 +186,6 @@ class OrchestratorBase:
         await self.decisions.record(decision)
 
     async def _set_status(self, run_id: str, status: RunStatus) -> Run:
-        # Re-read first, so fields others keep up to date (usage) aren't overwritten.
         """Change the run's status, re-reading it first so fields others keep up to date (usage)
         aren't overwritten."""
         run = await self.tasks.get_run(run_id)
@@ -194,18 +193,31 @@ class OrchestratorBase:
             return run
         return await self.tasks.update_run(run.model_copy(update={"status": status}))
 
+    async def _run_done(self, run: Run, data: dict[str, object]) -> Run:
+        """Mark the run done, close its root span and emit run_finished."""
+        run = await self._set_status(run.id, RunStatus.DONE)
+        await Tracer(self.bus).finish_root(run)
+        await self.bus.emit(Event(name=EventName.RUN_FINISHED, run_id=run.id, data=dict(data)))
+        return run
+
     async def _pause(self, run_id: str, exc: Exception) -> None:
         """Stop on RunStopped, pause on BudgetExceeded; either way the run can resume."""
         status = RunStatus.STOPPED if isinstance(exc, RunStopped) else RunStatus.PAUSED
         await self._set_status(run_id, status)
 
-    async def _feedback_ref(self, run: Run, task: Task) -> ArtifactRef:
-        """Feedback is looked up by artifact kind, so feedback on a task that has no
-        output yet points at the latest version of its kind (or v1 before any)."""
-        if task.output is not None:
-            return task.output
-        latest = await self.artifacts.latest(run.id, task.output_kind)
-        return ArtifactRef(kind=task.output_kind, version=latest.version if latest else 1)
+    @staticmethod
+    def _feedback(
+        task: Task, source: FeedbackSource, text: str, *, question_id: str | None = None
+    ) -> Feedback:
+        """Feedback for ``task``'s next attempt: on its output when it has one, and for
+        the task itself either way, so a task with no output yet still gets it."""
+        return Feedback(
+            artifact=task.output,
+            task_id=task.id,
+            source=source,
+            text=text,
+            question_id=question_id,
+        )
 
     async def _emit_task(self, name: EventName, task: Task, data: dict[str, object]) -> None:
         """Emit an event about one task."""
@@ -231,15 +243,4 @@ def can_keep(task: Task, verdict: Verdict | None) -> bool:
         return False
     return not any(
         f.rule_id == AUDIT_RULE or f.rule_id in DANGEROUS_ACTION_RULES for f in verdict.blockers
-    )
-
-
-def failed_verdict(run: Run, message: str, *, task_id: str | None = None) -> Verdict:
-    """A failing verdict with one AUDIT blocker, used when no real verdict can be had."""
-    return Verdict(
-        run_id=run.id,
-        scope=RuleScope.TASK if task_id else RuleScope.RUN,
-        task_id=task_id,
-        passed=False,
-        findings=[Finding(rule_id=AUDIT_RULE, severity=Severity.BLOCKER, message=message)],
     )

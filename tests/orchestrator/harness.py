@@ -1,3 +1,6 @@
+"""The team as tests build it: the composition root over fake stores, a scripted model
+and an auditor that passes unless told otherwise."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,15 +20,19 @@ from agents.fakes import (
 )
 from agents.scenario import team_script
 
-from agent_team.agents import default_agents
+from agent_team.app import App, Stores, build_app
+from agent_team.core.config import load_config
 from agent_team.core.interfaces import VerdictPolicy
 from agent_team.core.models import AgentName, ReviewMode
-from agent_team.orchestrator import Dispatcher, Orchestrator, OrchestratorConfig
-from agent_team.tools import file_tools
+from agent_team.orchestrator import Dispatcher, Orchestrator
+from agent_team.orchestrator.policy import SimplePolicy
 
 
 @dataclass
 class Team:
+    """The built app with its fakes, typed, so tests can script and inspect them."""
+
+    app: App
     orch: Orchestrator
     dispatcher: Dispatcher
     tasks: FakeTaskStore
@@ -39,48 +46,43 @@ class Team:
     auditor: PassAuditor
 
 
-def make_team(
+async def make_team(
     tmp_path: Path,
     *,
     kind: str = "build",
     script: dict[AgentName, Any] | None = None,
     review_mode: ReviewMode = ReviewMode.AUTO_ASSUMPTIONS,
     policy: VerdictPolicy | None = None,
+    code_policy: bool = False,
 ) -> Team:
+    """Build the app over fakes. ``policy`` decides on verdicts; without one,
+    ``code_policy`` keeps the audit package's policy and otherwise the orchestrator's
+    simple fallback decides."""
     tasks, artifacts = FakeTaskStore(), FakeArtifactStore()
     checkpoints, decisions = FakeCheckpoints(), FakeDecisionLog()
     feedback, verdicts, bus = FakeFeedback(), FakeVerdicts(), FakeBus()
     llm = FakeLLM(script if script is not None else team_script(kind))
     auditor = PassAuditor()
-    dispatcher = Dispatcher(
-        tasks=tasks,
-        artifacts=artifacts,
-        checkpoints=checkpoints,
-        bus=bus,
-        llm=llm,
-        agents=default_agents(),
-        tools=file_tools(),
-        feedback=feedback,
-        verdicts=verdicts,
-        timeout_s=5,
+    config = load_config(
+        overrides={
+            "paths": {"runs_dir": str(tmp_path / "runs"), "db": str(tmp_path / "team.db")},
+            "review": review_mode.value,
+            "limits": {"task_timeout_s": 5},
+            "hooks": [],
+        }
     )
-    orch = Orchestrator(
-        tasks=tasks,
-        artifacts=artifacts,
-        checkpoints=checkpoints,
-        decisions=decisions,
-        feedback=feedback,
-        verdicts=verdicts,
+    app = await build_app(
+        config,
+        stores=Stores(tasks, artifacts, checkpoints, decisions, feedback, verdicts),
         bus=bus,
         llm=llm,
         auditor=auditor,
-        dispatcher=dispatcher,
-        config=OrchestratorConfig(runs_dir=tmp_path / "runs", review_mode=review_mode),
-        policy=policy,
+        policy=policy or (None if code_policy else SimplePolicy()),
     )
     return Team(
-        orch,
-        dispatcher,
+        app,
+        app.orchestrator,
+        app.dispatcher,
         tasks,
         artifacts,
         checkpoints,

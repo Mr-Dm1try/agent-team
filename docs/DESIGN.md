@@ -186,9 +186,9 @@ Every agent action leaves a structured log line tied to a trace, and every error
 
 **Log trail.** Every event goes to one JSON Lines file, runs/\<run\_id>/logs/events.jsonl. A line carries the timestamp, run, trace, span and parent span ids, agent, task, attempt, event name, level, and data such as tokens, cost, tool arguments and duration. Because each line is tagged with its agent, `agent-team logs <run_id> --agent researcher` (or a plain grep) shows one agent's own trail, and the unfiltered file keeps the whole run in time order.
 
-**Tracing.** Spans nest in this order: run, phase, task, attempt, then each model call, tool call or audit. A span is not a separate file: opening one writes a span\_started event and closing it writes a span\_finished event with status, duration, tokens, cost and any traceback, both in the same events.jsonl and tagged like every other line. `agent-team trace <run_id>` rebuilds the tree from those events and prints it. A span that started but never finished, because the process died, shows as open. Adding `--task <id>` shows one task's whole story, including any tracebacks.
+**Tracing.** Each run is one trace. Spans nest in this order: the run, each pass through a phase, task, attempt, then each model call, tool call or check. A task's check is an auditor task, so its attempts sit under the task next to the producer's, and each holds the auditor's model calls. A message you send about a run is a span in that run too. The run keeps its trace id and root span id, so a run resumed in a new process adds to the same tree. A span is not a separate file: opening one writes a span\_started event and closing it writes a span\_finished event with status, duration, tokens, cost and any traceback, both in the same events.jsonl and tagged like every other line. `agent-team logs <run_id> --spans` rebuilds the tree from those events and prints it. A span that started but never finished, because the process died, shows as open; the run's own span stays open until the run is done. `agent-team logs <run_id> --task <id>` shows one task's whole story, including any tracebacks.
 
-**Decision log.** Every choice the orchestrator makes is a decision event with its inputs, the option chosen and the reason: the plan, each delegation, every retry, escalation and upstream re-run, which phase a change reopens, and when to ask you. Choices made by code record the rule that applied, and choices made by the model record its stated reason. `agent-team trace --decisions` lists them, so you can see why a run went the way it did.
+**Decision log.** Every choice the orchestrator makes is a decision event with its inputs, the option chosen and the reason: the plan, each delegation, every retry, escalation and upstream re-run, which phase a change reopens, and when to ask you. Choices made by code record the rule that applied, and choices made by the model record its stated reason. They are decision lines in the run's log, so `agent-team logs <run_id>` shows why a run went the way it did.
 
 | Error | Example | Handling |
 | --- | --- | --- |
@@ -239,7 +239,7 @@ Each rule has an id, a scope (task or run), the agents whose tasks it applies to
 
 **Keeping the judge steady.** A blocker the model raises without helper evidence gets a second, independent check before it fails a step, so one flaky judgment can't trap the run in a loop.
 
-**The auditor itself.** Each sweep runs as an auditor task through the dispatcher, with its own log trail, timeout and retries. It fails closed: if no valid verdict comes back, the task stays unpassed and is escalated, never waved through. A verdict lists each finding with its rule id, severity, the artifact and item at fault, the evidence and a suggested fix. Warnings don't block, but they show in the phase review and the final report.
+**The auditor itself.** Each sweep runs as an auditor task through the dispatcher, with its own log trail, timeout and retries. An auditor that crashes, times out or returns no valid verdict uses the check's attempts (3 by default), never the attempts of the work it checks. It fails closed: once the check's attempts run out, the work stays unpassed and you are asked, and work that was never checked can't be kept as it is. A verdict lists each finding with its rule id, severity, the artifact and item at fault, the evidence and a suggested fix. Warnings don't block, but they show in the phase review and the final report.
 
 **Safety findings.** The auditor works at two points. Before each tool call, its pre-check blocks clear violations with code and asks the auditor model about unclear ones, so most tool calls add no model call. After each step, its sweep catches subtler risks. A dangerous pattern in code goes back to the Engineer like any other finding. A dangerous agent action stops the run and asks you, since it has already happened.
 
@@ -260,7 +260,7 @@ You can steer every phase: agents ask you questions when they need to, and you c
 
 - **Agent questions.** Every artifact has a questions field. When an agent can't proceed safely, such as the Researcher not knowing which database you want, it returns questions instead of guessing. The orchestrator asks you, and your answers go back to that agent on its next attempt.
 - **Phase reviews.** Once every task in a phase has passed its check, the orchestrator shows you a short summary and the artifact, and you approve it or comment. A comment on the PRD goes to Product, a comment on the spec goes to the Architect, and so on.
-- **What each agent reads.** On every attempt an agent receives its previous version, your answers and comments on it, and the auditor's findings. Feedback is stored per artifact version in a feedback table, so nothing is lost between attempts.
+- **What each agent reads.** On every attempt an agent receives its previous version, your answers and comments on it, and the auditor's findings. Feedback is stored per artifact version, and per task for work with no output yet, in a feedback table. An attempt reads the feedback of its own line of work: the task, the tasks it was reopened from and the versions they wrote. So nothing is lost between attempts, and feedback on one work package or research brief never reaches a sibling of the same kind.
 - **You are a task assignee.** A review is a task assigned to you in the tracker, with its own waiting state, logs and trace, so reviews appear in the run history like any other step.
 - **Revisions flow down.** Your comment creates a new version of that artifact, and everything built from the old version is updated to match, the same as a change request.
 - **Review modes.** The config sets `review` to `every_phase`, `questions_only` or `auto_assumptions`. In auto\_assumptions mode agents don't wait: they record assumptions instead of asking, and you review at the end. In `questions_only` mode agents still stop and ask you when they need to, but phases move on without your review, and you review once at the end. `every_phase` adds a review of each phase before the next one starts. The auto\_assumptions mode keeps a live demo moving, and its final review lists every assumption so you can correct any of them.
@@ -337,6 +337,8 @@ All model calls go through one small interface with three providers, and a confi
 - **Ollama:** its OpenAI-compatible endpoint on localhost:11434, with the context window raised to 16k to 32k tokens. Ollama silently cuts the start of a prompt that overflows the window, so the reply's max\_tokens is cut to what's left, a prompt that leaves less than a minimum reply is refused and the call falls back, and the config is checked at load so an agent routed to Ollama has a prompt budget that leaves that room. As a fallback for an agent with a bigger budget, Ollama takes only the prompts that fit. The agent's effort goes out as reasoning\_effort (low, medium or high), which gpt-oss uses. Claude's thinking blocks are left out, since Ollama can't read them and thinks afresh on each call.
 - **Fake:** scripted responses for tests, with fault injection for bad JSON, timeouts and rate limits.
 
+**Long replies.** A call that may write a long reply must not hit a timeout meant for short ones. Anthropic calls whose max\_tokens is over `stream_above_tokens` (4096 by default) are streamed, so the timeout applies to each read instead of the whole call. Ollama's timeout grows with max\_tokens, at the slowest generation speed planned for (`min_tokens_per_s`).
+
 **Structured output.** Each agent declares a Pydantic output model. We validate every response ourselves, whatever the provider promises, and run the repair loop when it fails.
 
 **Routing.** One file sets the default, per-agent overrides, the fallback order and the budget:
@@ -376,10 +378,10 @@ Generated code runs only inside a Docker container, and you drive everything fro
 
 **CLI:**
 
-- `agent-team run "<task>"` starts a run and streams the orchestrator's replies as they're written, with a live tree of phases and tasks. Adding --context \<folder> gives the Researcher files to work from.
+- `agent-team run "<task>"` starts a run and prints the orchestrator's replies. While the run waits on you, each line you type is sent as a message: an answer, a comment, a question or a change. Ending the input (Ctrl-D) leaves the run waiting, and `agent-team resume <run_id>` picks it up, after a crash too. `--chaos` injects model faults. The target is a streaming view with a live tree of phases and tasks, and `--context <folder>` to give the Researcher files to work from.
 - At the end you get a summary, the audit report, QA's evidence for each acceptance criterion and the test results. You accept the run or ask for changes, and the session stays open.
 - You can then ask things like "show the PRD", "list the files" or "why did the spec retry?", or ask for a change in plain words.
-- `agent-team trace`, `agent-team resume` and `agent-team memory search` cover inspection, crash recovery and memory.
+- `agent-team logs <run_id>` prints the run's events, filtered with `--agent` or `--task`, and `--spans` prints its trace tree. `agent-team memory search` will cover memory.
 - `agent-team stats` shows tokens, cost, time, retries and the first-pass audit rate per run and per agent, for the performance part of the demo.
 - The workflow itself is driven only through the orchestrator's streaming session, as the brief requires. The other commands only read the store, apart from resume and stop, which the session also offers.
 
@@ -394,7 +396,8 @@ agent-team/
   pyproject.toml
   config/default.yaml
   src/agent_team/
-    cli.py            streaming CLI and review session
+    app.py            composition root: builds the whole team from the config
+    cli.py            run, resume and logs commands
     orchestrator/     phase state machine, planning, change requests
     agents/           base agent, researcher, product, architect, engineer, qa
     audit/            auditor, evidence helpers, rule catalog, pre-check

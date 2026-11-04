@@ -12,7 +12,7 @@ context classes are plain dataclasses: they only bundle the services passed in.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -178,11 +178,15 @@ class FeedbackStore(Protocol):
     agents, handed to the next attempt that revises the artifact."""
 
     async def add(self, run_id: str, feedback: Feedback) -> None:
-        """Store one piece of feedback, keyed by the kind of artifact it is about."""
+        """Store one piece of feedback, keyed by the artifact version and the task it is
+        for."""
         ...
 
-    async def for_artifact(self, run_id: str, kind: str) -> list[Feedback]:
-        """All feedback on any version of ``kind`` in the run, oldest first."""
+    async def for_work(
+        self, run_id: str, *, refs: Sequence[ArtifactRef], task_ids: Sequence[str]
+    ) -> list[Feedback]:
+        """Feedback on any of these artifact versions or for any of these tasks, oldest
+        first: what the next attempt of one line of work reads."""
         ...
 
 
@@ -338,4 +342,10 @@ class Dispatcher(Protocol):
     async def dispatch(self, task: Task) -> AgentResult:
         """Build the envelope, run the agent with a timeout, catch and classify errors,
         save the artifact, move the task to auditing (or retry/escalated)."""
+        ...
+
+    async def check(self, check: Task, subject: Task | None, artifact: Artifact | None) -> Verdict:
+        """Run a check (an auditor task) on ``subject``'s output, or on the whole run
+        when ``subject`` is None, with the check's own timeout and attempts. Returns
+        the verdict, failed closed when no attempt produced one."""
         ...
