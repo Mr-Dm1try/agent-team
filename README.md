@@ -7,7 +7,9 @@ for changes.
 
 Built for the AI Engineer Challenge: Research Agent Teams.
 
-> **Status:** design done, implementation starting. Nothing runs yet.
+> **Status:** the team, the auditor, the gateway and the CLI run end to end (the tests
+> drive a whole build with a scripted model). The Docker sandbox and memory are not
+> built yet, so a real build can't run its tests and fails rule R6 until the sandbox lands.
 
 ## What it does
 
@@ -15,8 +17,8 @@ Built for the AI Engineer Challenge: Research Agent Teams.
   delegates every piece of work through a dispatcher, and decides retries and re-runs.
 - **Five expert agents:** Researcher (files and web), Product (PRD), Architect
   (spec), Engineer (code and unit tests) and QA (reviews and runs the solution).
-- **Auditor** that sweeps every task and phase gate against rules stored in
-  SQLite, covering process errors and dangerous code or agent actions.
+- **Auditor** that checks the end of every task and the whole run against rules
+  stored in SQLite, covering process errors and dangerous code or agent actions.
 - **Task tracker** with a full lifecycle, versioned artifacts with lineage,
   checkpoints, crash resume, and re-runs that update work instead of rebuilding it.
 - **Per-agent log trails, traces and tracebacks**, plus a decision log that
@@ -37,13 +39,17 @@ The full design is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Quick start
 
-Planned usage once the CLI lands:
-
 ```bash
 uv sync
 export ANTHROPIC_API_KEY=...
 uv run agent-team run "Build a REST API for a small library inventory"
+uv run agent-team resume <run_id>              # continue a waiting or crashed run
+uv run agent-team logs <run_id> --agent qa      # one agent's events
+uv run agent-team logs <run_id> --spans         # the run's trace tree
 ```
+
+While a run waits on you, type your answer and press Enter. Ctrl-D leaves the run
+waiting for `resume`.
 
 ## License
 
