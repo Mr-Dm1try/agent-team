@@ -61,10 +61,10 @@ def _run_id(output: str) -> str:
 
 def test_run_answers_questions_from_stdin(config_file: Path) -> None:
     result = CliRunner().invoke(
-        cli.app, ["run", "Build a books API", "-c", str(config_file)], input="20 per page\n"
+        cli.app, ["run", "Build a books API", "-c", str(config_file)], input="\n\n20 per page\n"
     )
     assert result.exit_code == 0, result.output
-    assert "Paginate the list?" in result.output
+    assert result.output.count("Paginate the list?") == 1  # blank lines don't repeat it
     assert "'Build a books API' is done." in result.output
 
 

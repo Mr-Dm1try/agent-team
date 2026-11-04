@@ -88,6 +88,30 @@ CREATE INDEX IF NOT EXISTS verdicts_by_task ON verdicts (task_id, seq);
 
 Params = Sequence[Any]
 
+#: Raised whenever a table changes shape. There are no migrations yet, so a database
+#: written with another schema is refused with a clear error instead of misread.
+SCHEMA_VERSION = 1
+
+
+class SchemaMismatch(RuntimeError):
+    """The database file was written with another schema version."""
+
+
+def _ensure_schema(conn: sqlite3.Connection, path: str) -> None:
+    """Create the tables in a new database, or check an existing one's version."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    has_runs = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+    ).fetchone()
+    if version == SCHEMA_VERSION or (version == 0 and not has_runs):
+        conn.executescript(SCHEMA)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        return
+    raise SchemaMismatch(
+        f"{path} has schema version {version}, this version of agent-team needs "
+        f"{SCHEMA_VERSION}; move the file aside to start with a fresh database"
+    )
+
 
 class Database:
     """Thin async wrapper around one sqlite3 connection."""
@@ -102,7 +126,11 @@ class Database:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.executescript(SCHEMA)
+        try:
+            _ensure_schema(self._conn, self.path)
+        except SchemaMismatch:
+            self._conn.close()
+            raise
         self._lock = threading.Lock()
 
     @property

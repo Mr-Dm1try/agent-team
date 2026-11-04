@@ -186,7 +186,6 @@ class OrchestratorBase:
         await self.decisions.record(decision)
 
     async def _set_status(self, run_id: str, status: RunStatus) -> Run:
-        # Re-read first, so fields others keep up to date (usage) aren't overwritten.
         """Change the run's status, re-reading it first so fields others keep up to date (usage)
         aren't overwritten."""
         run = await self.tasks.get_run(run_id)

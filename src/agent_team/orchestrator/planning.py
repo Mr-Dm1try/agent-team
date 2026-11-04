@@ -35,9 +35,16 @@ def expand_plan(
     run: Run,
     planning_task: Task,
     *,
+    previous: list[Task] | None = None,
     max_attempts: int = 3,
 ) -> list[Task]:
-    """Tasks from the plan up to the Spec (build) or the answer (research question)."""
+    """Tasks from the plan up to the Spec (build) or the answer (research question).
+
+    ``previous`` are superseded tasks from before the plan was reopened: a new task
+    for the same work (the same research question, or the PRD, spec or answer) points
+    back at the old one, so it runs as a revision with that work's output and
+    feedback instead of from scratch."""
+    old_work = {_work_key(t): t for t in sorted(previous or [], key=lambda t: t.created_at)}
 
     def task(
         phase: Phase,
@@ -47,7 +54,9 @@ def expand_plan(
         deps: list[str],
         reason: str,
     ) -> Task:
-        """A new ready-to-schedule task that depends on the planning task and ``deps``."""
+        """A new ready-to-schedule task that depends on the planning task and ``deps``,
+        revising the superseded task that did the same work, if any."""
+        old = old_work.get((agent, kind, objective if kind == "research_brief" else None))
         return Task(
             id=new_id("task"),
             run_id=run.id,
@@ -59,8 +68,8 @@ def expand_plan(
             # Everything depends on the planner, so re-opening the plan supersedes it.
             depends_on=[planning_task.id, *deps],
             max_attempts=max_attempts,
-            origin=TaskOrigin.PLAN,
-            parent_task_id=planning_task.id,
+            origin=TaskOrigin.REVISION if old else TaskOrigin.PLAN,
+            parent_task_id=old.id if old else planning_task.id,
             reason=reason,
         )
 
@@ -104,6 +113,13 @@ def expand_plan(
         "pipeline: spec after the PRD",
     )
     return [*research, prd, spec]
+
+
+def _work_key(task: Task) -> tuple[AgentName, str, str | None]:
+    """What a pipeline task is for: its agent and output, and for research its
+    question, since a plan has one research task per question."""
+    question = task.objective if task.output_kind == "research_brief" else None
+    return (task.agent, task.output_kind, question)
 
 
 def package_of(task: Task) -> str | None:

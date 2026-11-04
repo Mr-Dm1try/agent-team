@@ -285,6 +285,8 @@ class FakeLLM:
         self.requests: list[LLMRequest] = []
         self.budget = budget
         self.overrides: dict[str, Any] = {}
+        #: The route the next call may take, as the gateway reports it.
+        self.providers = ["fake"]
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         self.requests.append(request)
@@ -314,8 +316,8 @@ class FakeLLM:
     def context_budget(self, agent: AgentName) -> int:
         return self.budget
 
-    def next_provider(self, agent: AgentName, task_id: str | None) -> str:
-        return "fake"
+    def providers_for(self, agent: AgentName, task_id: str | None) -> list[str]:
+        return self.providers
 
     def use_stronger_model(self, task_id: str) -> object:
         self.overrides[task_id] = "stronger"

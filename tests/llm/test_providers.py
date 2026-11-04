@@ -144,6 +144,15 @@ async def test_anthropic_streams_calls_that_may_write_a_long_reply() -> None:
     assert long.text == "hi" and messages.calls[0]["max_tokens"] == 16_000
 
 
+@pytest.mark.parametrize(
+    "dropped", [httpx2.ReadTimeout("stalled"), httpx2.RemoteProtocolError("peer closed")]
+)
+async def test_a_stream_that_stalls_or_drops_is_transient(dropped: Exception) -> None:
+    provider = ap.AnthropicProvider(client=anthropic_client(StubAnthropicMessages(dropped)))
+    with pytest.raises(TransientLLMError):
+        await provider.complete(request(max_tokens=16_000), model="claude-haiku-5-5")
+
+
 async def test_anthropic_without_binding_uses_the_plain_api_and_no_effort() -> None:
     plain = StubAnthropicMessages(sdk_message())
     provider = ap.AnthropicProvider(

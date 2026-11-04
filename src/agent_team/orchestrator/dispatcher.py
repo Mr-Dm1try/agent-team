@@ -176,7 +176,9 @@ class Dispatcher:
         run = await self.tasks.get_run(check.run_id)
         while True:
             check = await self.tasks.get_task(check.id)
-            resume = check.last_error == INTERRUPTED and check.attempt > 0
+            # Still running means the process that ran it died: continue that attempt.
+            stopped = check.last_error == INTERRUPTED or check.status is TaskStatus.RUNNING
+            resume = stopped and check.attempt > 0
             attempt = check.attempt if resume else check.attempt + 1
             async with Tracer(self.bus).in_run(
                 run,
@@ -231,9 +233,10 @@ class Dispatcher:
         check = await self.tasks.update_task(check)
         if check.status in (TaskStatus.PENDING, TaskStatus.RETRY):
             check = await self.tasks.transition(check.id, TaskStatus.READY, reason="check due")
-        check = await self.tasks.transition(
-            check.id, TaskStatus.RUNNING, reason=f"started check attempt {check.attempt}"
-        )
+        if check.status is not TaskStatus.RUNNING:
+            check = await self.tasks.transition(
+                check.id, TaskStatus.RUNNING, reason=f"started check attempt {check.attempt}"
+            )
         await self._emit(EventName.TASK_STARTED, check, {"resume": resume})
         timeout = self.timeouts.get(AgentName.AUDITOR, self.timeout_s)
         task_id = subject.id if subject else None

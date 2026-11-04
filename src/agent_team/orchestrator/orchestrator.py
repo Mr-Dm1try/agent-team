@@ -45,7 +45,7 @@ from agent_team.orchestrator.conversation import ConversationMixin
 from agent_team.orchestrator.decisions import DecisionsMixin
 from agent_team.orchestrator.dispatcher import INTERRUPTED, PAUSING_ERRORS
 from agent_team.orchestrator.lineage import ancestry
-from agent_team.orchestrator.phases import PhaseMachine, expert_tasks, reviewed
+from agent_team.orchestrator.phases import PhaseMachine, expert_tasks, is_work, reviewed
 from agent_team.orchestrator.planning import RULE as PIPELINE
 from agent_team.orchestrator.planning import expand_plan, implementation_tasks
 from agent_team.orchestrator.policy import SimplePolicy
@@ -197,11 +197,7 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
         for t in await self.tasks.list_tasks(run_id, status=TaskStatus.READY):
             found.setdefault(t.id, t)
         # Checks (auditor tasks) run inside the audit of the task they check, not here.
-        return [
-            t
-            for t in found.values()
-            if t.phase is phase and t.agent not in (AgentName.USER, AgentName.AUDITOR)
-        ]
+        return [t for t in found.values() if t.phase is phase and is_work(t)]
 
     def _kind(self, tasks: list[Task]) -> RequestKind:
         """The run's request kind, read back from the planning task's objective."""
@@ -288,7 +284,17 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
     async def _after_plan(self, run: Run, task: Task, plan: Plan) -> None:
         """Expand a passed plan into the fixed pipeline of tasks."""
         assert task.output is not None
-        new_tasks = expand_plan(plan, task.output, run, task, max_attempts=self.config.max_attempts)
+        previous = [
+            t
+            for t in await self.tasks.list_tasks(run.id)
+            if t.status is TaskStatus.SUPERSEDED
+            and is_work(t)
+            and t.agent is not AgentName.ORCHESTRATOR
+            and t.phase is not Phase.IMPLEMENTATION
+        ]
+        new_tasks = expand_plan(
+            plan, task.output, run, task, previous=previous, max_attempts=self.config.max_attempts
+        )
         for t in new_tasks:
             await self.tasks.create_task(t)
         await self._record_pipeline(

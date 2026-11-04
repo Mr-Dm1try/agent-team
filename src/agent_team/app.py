@@ -2,7 +2,7 @@
 
 The CLI and the end-to-end tests both start here. Any collaborator can be swapped
 (scripted providers, in-memory stores, a scripted auditor) and the rest is still built
-the same way, so no caller keeps its own copy of the wiring.
+the same way, so no caller builds its own copy.
 """
 
 from __future__ import annotations

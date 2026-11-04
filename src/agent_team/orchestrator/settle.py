@@ -23,6 +23,7 @@ from agent_team.orchestrator.base import (
     can_keep,
 )
 from agent_team.orchestrator.control import create_user_task
+from agent_team.orchestrator.phases import is_work
 from agent_team.orchestrator.replies import plain_agent, upper_first
 
 
@@ -35,7 +36,7 @@ class SettleMixin(OrchestratorBase):
         changed = False
         by_id = {t.id: t for t in tasks}
         for task in tasks:
-            if task.agent in (AgentName.USER, AgentName.AUDITOR):
+            if not is_work(task):
                 continue  # user tasks are answered; checks run inside their task's audit
             if task.status is TaskStatus.RETRY:
                 await self.tasks.transition(task.id, TaskStatus.READY, reason="retry with feedback")

@@ -108,12 +108,13 @@ async def _talk(config: Config, *, request: str | None = None, run_id: str | Non
             if reply.kind in ("stopped", "error") and not reply.pending:
                 return 1
             line = await _read_line()
+            while line == "":
+                line = await _read_line()
             if line is None:
                 if run_id:
                     typer.echo(f"Run {run_id} is waiting. Continue: agent-team resume {run_id}")
                 return 0
-            if line:
-                reply = await team.orchestrator.handle(line, run_id=run_id)
+            reply = await team.orchestrator.handle(line, run_id=run_id)
 
 
 async def _read_line() -> str | None:

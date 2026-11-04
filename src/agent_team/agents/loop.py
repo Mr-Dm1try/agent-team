@@ -15,7 +15,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from agent_team.agents.compaction import Compactor, sent_json
+from agent_team.agents.compaction import Compactor, estimate_tokens, sent_json
 from agent_team.core.errors import OutputValidationError, ToolError
 from agent_team.core.interfaces import CheckpointStore, EventBus, Tool, ToolContext
 from agent_team.core.models import AgentName, Event, EventName, Run, ToolResult, Usage
@@ -280,9 +280,13 @@ class ToolLoop[M: BaseModel]:
         # The lowest ratio over the models seen: after a fallback the next call may go
         # to either, so estimate for the one that counts more tokens.
         ratio = self.calibration.ratio(None)
-        # Thinking blocks from another provider (left by a fallback) are dropped by the
-        # one the next call goes to, so they don't count.
-        provider = self.llm.next_provider(self.agent, self.task_id)
+        # A provider sends back only its own thinking blocks, and the next call may go
+        # to any provider on the route, so estimate for the one that would send most.
+        providers: list[str | None] = [*self.llm.providers_for(self.agent, self.task_id)]
+        provider = max(
+            providers or [None],
+            key=lambda p: estimate_tokens(self.system, messages, specs, ratio, provider=p),
+        )
         if not self.compactor.needs_compaction(
             self.system,
             messages,

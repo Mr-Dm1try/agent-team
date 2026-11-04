@@ -12,7 +12,7 @@ from agent_team.core.artifacts import (
     Plan,
     Requirement,
 )
-from agent_team.core.db import Database
+from agent_team.core.db import SCHEMA_VERSION, Database, SchemaMismatch
 from agent_team.core.errors import InvalidTransition
 from agent_team.core.events import InMemoryEventBus
 from agent_team.core.models import (
@@ -368,3 +368,21 @@ async def test_failed_transaction_rolls_back_and_db_stays_usable(db: Database) -
     assert await db.fetchone("SELECT id FROM runs WHERE id = 'x'") is None
     await db.execute("INSERT INTO runs (id, status, created_at, data) VALUES ('y', 'a', 't', '{}')")
     assert await db.fetchone("SELECT id FROM runs WHERE id = 'y'") is not None
+
+
+def test_a_database_from_another_schema_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE runs (id TEXT PRIMARY KEY, data TEXT)")  # no version stamp
+    old.commit()
+    old.close()
+    with pytest.raises(SchemaMismatch, match="move the file aside"):
+        Database(path)
+    fresh = tmp_path / "fresh.db"
+    Database(fresh).close()
+    Database(fresh).close()  # reopening its own schema is fine
+    newer = sqlite3.connect(fresh)
+    newer.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    newer.close()
+    with pytest.raises(SchemaMismatch):
+        Database(fresh)

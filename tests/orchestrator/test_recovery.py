@@ -3,6 +3,7 @@ during audits, re-opened plans and questions left open by a re-open."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections import Counter
 from pathlib import Path
@@ -249,3 +250,58 @@ async def test_answer_to_an_escalation_without_output_reaches_the_agent(tmp_path
     prd = next(t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd")
     assert answer.artifact is None and answer.task_id == prd.id  # no output yet: keyed by task
     assert "Keep it to one endpoint" in calls[-1].messages[0].content[0].text  # type: ignore[union-attr]
+
+
+async def test_answers_survive_a_plan_reopen(tmp_path: Path) -> None:
+    script = team_script()
+    calls: list[LLMRequest] = []
+
+    def product(request: LLMRequest) -> str:
+        """Ask once, then write a plain PRD."""
+        calls.append(request)
+        asked = dict(PRD, questions=[{"id": "Q-1", "text": "Paginate?", "why": "list size"}])
+        return json.dumps(asked if len(calls) == 1 else PRD)
+
+    script[AgentName.PRODUCT] = product
+    team = await make_team(tmp_path, script=script, review_mode=ReviewMode.QUESTIONS_ONLY)
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "waiting" and reply.run_id
+    reply = await team.orch.answer(reply.run_id, "20 per page")
+    assert reply.kind == "done", reply.text
+    seen = len(calls)
+    reply = await team.orch.request_change(reply.run_id, "Also list authors", target="plan")
+    assert reply.kind == "done", reply.text
+    prds = [t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd"]
+    old, new = prds
+    # The rebuilt PRD revises the old one, so it sees the answer and its last version.
+    assert new.origin is TaskOrigin.REVISION and new.parent_task_id == old.id
+    rebuilt = calls[seen].messages[0].content[0].text  # type: ignore[union-attr]
+    assert "20 per page" in rebuilt and len(calls) == seen + 1
+
+
+class _Crash(BaseException):
+    """Stands in for the process dying mid-check."""
+
+
+async def test_a_check_left_running_by_a_crash_continues_on_its_attempt(tmp_path: Path) -> None:
+    team = await make_team(tmp_path)
+    passing = team.auditor.audit_task
+    crashed: list[str] = []
+
+    async def audit(task: Task, artifact: Artifact | None, run: Run) -> Verdict:
+        if task.output_kind == "prd" and not crashed:
+            crashed.append(task.id)
+            raise _Crash
+        return await passing(task, artifact, run)
+
+    team.auditor.audit_task = audit  # type: ignore[method-assign]
+    with contextlib.suppress(_Crash):
+        await team.orch.handle("Build a books API")
+    [run] = await team.tasks.list_runs()
+    [check] = [t for t in await team.tasks.list_tasks(run.id) if t.parent_task_id == crashed[0]]
+    assert check.status is TaskStatus.RUNNING
+    # A new process picks the run up from a message, without an explicit resume.
+    reply = await (await _fresh_orchestrator(team)).drive(run.id)
+    assert reply.kind == "done", reply.text
+    check = await team.tasks.get_task(check.id)
+    assert check.status is TaskStatus.DONE and check.attempt == 1

@@ -97,10 +97,9 @@ class Gateway:
         """Max prompt tokens for the agent's model, from the routing file."""
         return self.config.context_budget(agent)
 
-    def next_provider(self, agent: AgentName, task_id: str | None) -> str:
-        """The provider the next call for this agent and task tries first."""
-        override = self._overrides.get(task_id) if task_id else None
-        return (override or self.config.route_for(agent)).provider
+    def providers_for(self, agent: AgentName, task_id: str | None) -> list[str]:
+        """The providers the next call for this agent and task may go to, in order."""
+        return [provider for provider, _ in self._chain(agent, task_id)]
 
     def set_override(self, task_id: str, route: Route | Mapping[str, Any] | None) -> None:
         """Route one task's calls elsewhere, e.g. one attempt on the stronger model.
@@ -120,8 +119,12 @@ class Gateway:
 
     def _primary(self, request: LLMRequest) -> Route:
         """The task's override route, else the agent's route."""
-        override = self._overrides.get(request.task_id) if request.task_id else None
-        return override or self.config.route_for(request.agent)
+        return self._route(request.agent, request.task_id)
+
+    def _route(self, agent: AgentName, task_id: str | None) -> Route:
+        """The task's override route, else the agent's route."""
+        override = self._overrides.get(task_id) if task_id else None
+        return override or self.config.route_for(agent)
 
     def _effort(self, request: LLMRequest, primary: Route) -> Effort | None:
         """The primary route's effort; an override without one (e.g. the stronger
@@ -132,7 +135,12 @@ class Gateway:
 
     def routes(self, request: LLMRequest) -> list[tuple[str, str]]:
         """(provider, model) pairs to try, in order, limited to known providers."""
-        primary = self._primary(request)
+        return self._chain(request.agent, request.task_id)
+
+    def _chain(self, agent: AgentName, task_id: str | None) -> list[tuple[str, str]]:
+        """The route for this agent and task, then the fallbacks, limited to known
+        providers."""
+        primary = self._route(agent, task_id)
         chain = [(primary.provider, primary.model)]
         for name in self.config.fallbacks:
             if name == primary.provider:
