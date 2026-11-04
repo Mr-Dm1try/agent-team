@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from agents.scenario import CODE, Responder, team_script
+from agents.scenario import CODE, PRD, Responder, team_script
 from sandbox.fakes import FakeRunner
 
 from agent_team.app import App, build_app
@@ -129,6 +129,23 @@ def e2e_script() -> dict[AgentName, Responder]:
         team_script(),
         **{AgentName.RESEARCHER: researcher_with_notes, AgentName.ENGINEER: engineer_with_tests},
     )
+
+
+QUESTION = [{"id": "Q-1", "text": "Paginate the list?", "why": "list size"}]
+
+
+def asking_script() -> dict[AgentName, Responder]:
+    """``e2e_script`` with a Product that asks one question before writing the PRD."""
+    script = e2e_script()
+    calls: list[int] = []
+
+    def product(request: LLMRequest) -> str:
+        """Ask on the first attempt, then write a plain PRD."""
+        calls.append(1)
+        return json.dumps(dict(PRD, questions=QUESTION) if len(calls) == 1 else PRD)
+
+    script[AgentName.PRODUCT] = product
+    return script
 
 
 async def scripted_app(

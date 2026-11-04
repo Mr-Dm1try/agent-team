@@ -64,18 +64,23 @@ _ORDER = {"answer_pending": 0, "start_run": 0, "request_change": 1, "stop_run": 
 class ConversationMixin(OrchestratorBase):
     """Everything the orchestrator does with a user message."""
 
-    async def handle(self, message: str, *, run_id: str | None = None) -> Reply:
+    async def handle(
+        self, message: str, *, run_id: str | None = None, context_dirs: list[str] | None = None
+    ) -> Reply:
         """One user message. An orchestrator tool loop works out what it means from the
         run's state and picks actions; code then carries them out. If the loop fails,
         nothing is acted on and the user is asked again. A message about a run is a
-        span in that run's trace."""
+        span in that run's trace. ``context_dirs`` are the read-only folders a run the
+        message starts gets."""
         run = await self.tasks.get_run(run_id) if run_id else None
         if run is None:
-            return await self._handle(message, None)
+            return await self._handle(message, None, context_dirs or [])
         async with Tracer(self.bus).in_run(run, "user message", "other", agent=AgentName.USER):
             return await self._handle(message, run)
 
-    async def _handle(self, message: str, run: Run | None) -> Reply:
+    async def _handle(
+        self, message: str, run: Run | None, context_dirs: list[str] | None = None
+    ) -> Reply:
         """Read one message and carry out what it means; see ``handle``."""
         await self.bus.emit(
             Event(
@@ -120,7 +125,7 @@ class ConversationMixin(OrchestratorBase):
             meant = None
         if meant is None:
             return self._didnt_catch(run, waiting)
-        return await self._carry_out(run, message, meant)
+        return await self._carry_out(run, message, meant, context_dirs or [])
 
     async def _paused_while_reading(self, run: Run | None, exc: Exception) -> Reply:
         """The budget ran out or the run was stopped while reading the message: pause the
@@ -136,7 +141,13 @@ class ConversationMixin(OrchestratorBase):
             text = "The run was stopped before I could read that. Resume it and send it again."
         return Reply(kind="stopped", text=text, run_id=run.id if run else None)
 
-    async def _carry_out(self, run: Run | None, message: str, meant: Interpretation) -> Reply:
+    async def _carry_out(
+        self,
+        run: Run | None,
+        message: str,
+        meant: Interpretation,
+        context_dirs: list[str] | None = None,
+    ) -> Reply:
         """Carry out the loop's actions (answers first, then changes, a stop last, so a
         change sees the run as the answers left it), log each as a decision, then drive
         what they touched and reply in plain words. Once the run is stopped, the rest of
@@ -148,7 +159,11 @@ class ConversationMixin(OrchestratorBase):
         for action in sorted(meant.actions, key=lambda a: _ORDER[a.tool]):
             args = action.args
             if action.tool == "start_run":
-                started = await self.start_run(args["request"], kind=RequestKind(args["kind"]))
+                started = await self.start_run(
+                    args["request"],
+                    kind=RequestKind(args["kind"]),
+                    context_dirs=context_dirs,
+                )
                 await self._log_action(started.id, message, meant, action)
                 continue
             assert run is not None  # the tools refuse these without a run

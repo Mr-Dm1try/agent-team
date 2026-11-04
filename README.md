@@ -43,13 +43,17 @@ The full design is in [docs/DESIGN.md](docs/DESIGN.md).
 uv sync
 export ANTHROPIC_API_KEY=...
 uv run agent-team run "Build a REST API for a small library inventory"
-uv run agent-team resume <run_id>              # continue a waiting or crashed run
+uv run agent-team run "..." --plain --context ./docs  # line output; a read-only folder
+uv run agent-team resume <run_id>              # continue a waiting, stopped or crashed run
+uv run agent-team stop <run_id>                # stop at the next model call
+uv run agent-team stats [run_id]               # tokens, cost, time, retries, first-pass rate
 uv run agent-team logs <run_id> --agent qa      # one agent's events
 uv run agent-team logs <run_id> --spans         # the run's trace tree
 ```
 
 While a run waits on you, type your answer and press Enter. Ctrl-D leaves the run
-waiting for `resume`.
+waiting for `resume`. When it is done, type `accept` or describe a change; after the
+change re-runs, you see what changed before you accept.
 
 ## License
 

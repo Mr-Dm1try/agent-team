@@ -358,7 +358,7 @@ budget: {max_usd_per_run: 1.00, max_minutes_per_run: 30}
 - **Rate limits:** caps concurrent calls and requests per minute for each provider, and queues the rest.
 - **Budgets:** tracks tokens, cost and time per run and per agent, and blocks any call past a cap.
 - **Tool checks:** every tool call passes the auditor's pre-check before it runs.
-- **Kill switch:** `agent-team stop <run_id>` halts a run cleanly at its next call and saves its state.
+- **Kill switch:** `agent-team stop <run_id>` halts a run cleanly at its next call and saves its state. The session holds a lock on a run while the team works on it and lets go while it waits on you, so `stop` knows whether a session will see the flag at its next model call. If none will, `stop` marks the run stopped itself. Either way the reason goes to the decision log, and resuming lifts the stop.
 - **Usage report:** `agent-team gateway status` shows calls, tokens, cost and blocked calls for a run.
 
 The budget guard hook and the auditor's pre-check, both in the Hooks section, are how the gateway enforces these rules.
@@ -380,11 +380,12 @@ Generated code runs only inside a Docker container, and you drive everything fro
 
 **CLI:**
 
-- `agent-team run "<task>"` starts a run and prints the orchestrator's replies. While the run waits on you, each line you type is sent as a message: an answer, a comment, a question or a change. Ending the input (Ctrl-D) leaves the run waiting, and `agent-team resume <run_id>` picks it up, after a crash too. `--chaos` injects model faults. The target is a streaming view with a live tree of phases and tasks, and `--context <folder>` to give the Researcher files to work from.
-- At the end you get a summary, the audit report, QA's evidence for each acceptance criterion and the test results. You accept the run or ask for changes, and the session stays open.
+- `agent-team run "<task>"` starts a run and shows it live: a tree of phases and tasks, each with its agent, status, attempt and current tool call, under a token and cost ticker. The view only listens to the event bus, and if drawing fails it logs once and falls back to plain lines, so a UI bug never fails a run. `--plain` prints one line per event instead, for CI and logs.
+- The orchestrator's replies print under the view. While the run waits on you, each line you type is sent as a message: an answer, a comment, a question or a change. Ending the input (Ctrl-D) leaves the run waiting, and `agent-team resume <run_id>` picks it up, after a crash too. `--chaos` injects model faults, and `--context <folder>` gives the Researcher files to read but never write.
+- At the end you get a summary, the run audit's findings, QA's evidence for each acceptance criterion, the test results and every assumption. You type accept or describe a change, and the session stays open. After a change re-runs, the next review starts with what changed: a section diff of each artifact that got a new version, with list items matched by id, and the git diff between the code versions' tags.
 - You can then ask things like "show the PRD", "list the files" or "why did the spec retry?", or ask for a change in plain words.
 - `agent-team logs <run_id>` prints the run's events, filtered with `--agent` or `--task`, and `--spans` prints its trace tree. `agent-team memory search` will cover memory.
-- `agent-team stats` shows tokens, cost, time, retries and the first-pass audit rate per run and per agent, for the performance part of the demo.
+- `agent-team stats [run_id]` shows tokens, cost, time, retries and the first-pass audit rate per run and per agent, for the performance part of the demo. A run's time counts only while tasks were working, not while it waited on you. The first-pass rate counts planned work whose first audit passed; retries, revisions and fixes don't count toward it.
 - The workflow itself is driven only through the orchestrator's streaming session, as the brief requires. The other commands only read the store, apart from resume and stop, which the session also offers.
 
 **Change requests.** The orchestrator works out which artifact the change touches first. A new endpoint changes the PRD, while a renamed function changes only the code. It creates a new version from that point, asks each later agent to update its own artifact, and shows you a diff of what changed. Before anything re-runs, it tells you which artifact it will reopen and which tasks will re-run, and waits for your go-ahead.
@@ -399,7 +400,8 @@ agent-team/
   config/default.yaml
   src/agent_team/
     app.py            composition root: builds the whole team from the config
-    cli.py            run, resume and logs commands
+    cli.py            run, resume, stop, stats and logs commands
+    ui/               live run view, end-of-run summary, change diffs, run stats
     orchestrator/     phase state machine, planning, change requests
     agents/           base agent, researcher, product, architect, engineer, qa
     audit/            auditor, evidence helpers, rule catalog, pre-check
