@@ -180,7 +180,7 @@ class Dispatcher:
             attempt = check.attempt if resume else check.attempt + 1
             async with Tracer(self.bus).in_run(
                 run,
-                f"attempt {attempt}",
+                f"check attempt {attempt}",
                 "attempt",
                 task_id=check.id,
                 agent=AgentName.AUDITOR,
@@ -238,7 +238,8 @@ class Dispatcher:
         timeout = self.timeouts.get(AgentName.AUDITOR, self.timeout_s)
         task_id = subject.id if subject else None
         try:
-            async with Tracer(self.bus).span(run.id, "check", "audit", task_id=check.id):
+            name = f"check of {subject.output_kind}" if subject else "check of the run"
+            async with Tracer(self.bus).span(run.id, name, "audit", task_id=check.id):
                 pending = (
                     self.auditor.audit_task(subject, artifact, run)
                     if subject is not None

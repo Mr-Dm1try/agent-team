@@ -101,6 +101,14 @@ class App:
         while self._closers:
             self._closers.pop()()
 
+    def __enter__(self) -> App:
+        """Use the app in a ``with`` block that closes it."""
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Close the app at the end of the ``with`` block."""
+        self.close()
+
 
 def _make_dirs(config: Config) -> Path:
     """Create the runs folder and the database's folder; return the runs folder."""
