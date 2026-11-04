@@ -91,13 +91,13 @@ The team is one orchestrator, five experts and an auditor, and every expert retu
 | Researcher | Gathers facts from files and the web | A research question, plus any folders you point it at | Research brief with all the context the task needs: facts, file excerpts, constraints and open questions, each with sources | read\_file, list\_dir, grep, web\_search, web\_fetch |
 | Product | Turns the request and research into a PRD | Request, research notes | PRD with numbered requirements and acceptance criteria | memory\_search |
 | Architect | Turns the PRD into a technical design | PRD, research notes | Spec with components, file plan, interfaces and test plan | memory\_search |
-| Engineer | Writes the code and its unit tests, file by file | Spec | Source files and unit tests in the workspace | write\_file, read\_file, run\_command |
-| QA | Reviews the code and the whole solution against the PRD, and runs it end to end where possible | PRD, spec, finished code | A review report with a result and evidence for each acceptance criterion, plus issues to fix | read\_file, list\_dir, run\_command |
+| Engineer | Writes the code and its unit tests, file by file | Spec | Source files and unit tests in the workspace | write\_file, read\_file, run\_command, install\_deps |
+| QA | Reviews the code and the whole solution against the PRD, and runs it end to end where possible | PRD, spec, finished code | A review report with a result and evidence for each acceptance criterion, plus issues to fix | read\_file, list\_dir, run\_command, install\_deps |
 | Auditor | Checks each step for process errors and for anything dangerous in the code or in what agents did | Artifacts, code diffs, the tool-call log and task records | A verdict with findings | Evidence helpers and read-only access to the run; it runs no code |
 
 - Each artifact is a Pydantic model, so code checks its shape and the auditor's evidence helpers can read exact fields such as requirement ids.
 - The Engineer writes the unit tests. QA reviews the finished solution against the PRD and runs it end to end where it can, such as starting the API and calling each endpoint. That keeps an independent check on what was asked, not just what was built, and QA's blocking issues go back to the Engineer like audit findings.
-- run\_command only works inside the Docker sandbox.
+- run\_command and install\_deps only work inside the Docker sandbox. install\_deps is the one step with the network on, and it takes only plain package specifiers, so the pre-check sees every package it installs.
 
 Context is gathered up front, but not only once. If the Architect or Engineer hits a gap, it returns a research request instead of guessing, and the orchestrator turns that into a new Researcher task.
 
@@ -196,7 +196,7 @@ Every agent action leaves a structured log line tied to a trace, and every error
 | ContextTooLong | A prompt too big for a local model's window, found before sending | Fall back to the next provider at once; if none is left, compact and retry the attempt |
 | OutputValidationError | JSON that doesn't match the schema | Send the validation errors back to the model, up to 2 times |
 | ToolError | File not found, command exits non-zero | Returned to the agent as a tool result so it can adapt |
-| SandboxError | Docker missing, container timeout | Task is escalated with the cause, and the orchestrator tells you |
+| SandboxError | Docker missing, a container that can't be created or is lost | Missing Docker stops the run at start with how to fix it. A container failure during a command comes back to the model as a tool error it can retry; a command that runs past its timeout is killed and reports exit 124 |
 | AuditFailure | A blocker rule fails | Retry with findings, then escalate (see the auditor section) |
 | BudgetExceeded | Run passes its token, cost or time cap | Stop cleanly and save state so the run can resume |
 | Any other exception | A bug in our code | Caught at the dispatcher, traceback stored, counts as a failed attempt, so it retries and then escalates |
@@ -369,12 +369,14 @@ Generated code runs only inside a Docker container, and you drive everything fro
 
 **Sandbox:**
 
-- Each run gets its own workspace folder, mounted into a python:3.12-slim container.
-- Dependencies install in one step with the network on. The code and tests then run with the network off, CPU and memory limits, and a timeout.
+- Each run gets its own workspace folder, mounted into a python:3.12-slim container. Each command gets a fresh container that runs as your user, with every capability dropped, a read-only root filesystem and the workspace's .git mounted read-only.
+- Dependencies install in one step with the network on, into a .deps folder in the workspace that later commands see. The code and tests then run with the network off, CPU, memory and process limits, and a timeout.
+- Containers carry labels naming the run and task. Each is removed when its command ends, any left over when the task or run ends, and those of a crashed process at the next start.
+- Each Engineer version that passes its check is committed to a git repository in the workspace and tagged with its version, such as code\_change-v2, so a change request can show the diff between versions. The .gitignore keeps .deps and caches out.
 - File tools reject any path outside the workspace, except folders you pass with --context, which agents can read but never write.
-- Without Docker, a plain subprocess fallback runs with a timeout and a clear warning.
+- Without Docker, the run fails at start with a clear error. The subprocess fallback was trimmed.
 
-**Research and the network.** Research never runs in the sandbox. The Researcher's web tools run in the harness with normal network access, through the gateway. Only model-written code runs in the container, which is why its network is off. If a generated app truly needs the internet, the spec lists the hosts it needs and the sandbox allows only those through a small proxy. That is built only if a task needs it, since neither demo task does.
+**Research and the network.** Research never runs in the sandbox. The Researcher's web tools run in the harness with normal network access. web\_fetch reaches only public addresses: it checks the address it connects to on every redirect hop, so neither a redirect nor a changed DNS answer can reach an internal host. Fetched text comes back marked as untrusted content. Only model-written code runs in the container, which is why its network is off. If a generated app truly needs the internet, the spec lists the hosts it needs and the sandbox allows only those through a small proxy. That is built only if a task needs it, since neither demo task does.
 
 **CLI:**
 
@@ -404,7 +406,7 @@ agent-team/
     core/             tasks, artifacts, events and hooks, errors, tracing, budget
     llm/              interface, gateway, anthropic, ollama, fake, structured output
     memory/           store, embeddings, retrieval, writer
-    sandbox/          docker runner, subprocess fallback
+    sandbox/          docker runner, cleanup hooks, workspace git
     tools/            file tools, web tools
   tests/              unit tests and fault-injection scenarios
   docs/DESIGN.md      this doc, exported
