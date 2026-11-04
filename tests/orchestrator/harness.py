@@ -19,6 +19,7 @@ from agents.fakes import (
     PassAuditor,
 )
 from agents.scenario import team_script
+from sandbox.fakes import FakeRunner
 
 from agent_team.app import App, Stores, build_app
 from agent_team.core.config import load_config
@@ -78,6 +79,7 @@ async def make_team(
         llm=llm,
         auditor=auditor,
         policy=policy or (None if code_policy else SimplePolicy()),
+        runner=FakeRunner(),
     )
     return Team(
         app,

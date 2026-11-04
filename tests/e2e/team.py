@@ -11,16 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from agents.scenario import CODE, Responder, team_script
+from sandbox.fakes import FakeRunner
 
 from agent_team.app import App, build_app
 from agent_team.audit.auditor import SECOND_CHECK_PROMPT
 from agent_team.audit.precheck import PRECHECK_PROMPT
 from agent_team.core.config import Config, deep_merge, load_config
-from agent_team.core.interfaces import Tool, ToolContext
-from agent_team.core.models import AgentName, Event, EventName, ToolResult, Usage
+from agent_team.core.models import AgentName, Event, EventName, Usage
 from agent_team.llm.fake import FakeProvider
-from agent_team.llm.types import LLMRequest, LLMResponse, ToolResultBlock, ToolSpec, ToolUseBlock
-from agent_team.tools import file_tools
+from agent_team.llm.types import LLMRequest, LLMResponse, ToolResultBlock, ToolUseBlock
 
 PASS = {"summary": "fine", "findings": []}
 NOTES = "SQLite needs no server.\n"
@@ -92,30 +91,6 @@ def _audit(request: LLMRequest, auditor: AuditorModel) -> Any:
     return auditor(swept.group(1), swept.group(2)) if swept else auditor(None, None)
 
 
-class PassingTests:
-    """A stand-in for the sandbox's ``run_command``: every test command passes."""
-
-    spec: ToolSpec = ToolSpec(
-        name="run_command",
-        description="Run a shell command in the workspace.",
-        input_schema={
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
-        },
-    )
-    safe_to_repeat: bool = False
-
-    async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        """Report one passing test."""
-        return ToolResult(content="1 passed in 0.01s", data={"exit_code": 0})
-
-
-def e2e_tools() -> dict[str, Tool]:
-    """The file tools and the passing test runner."""
-    return {**file_tools(), "run_command": PassingTests()}
-
-
 def _tool_results(request: LLMRequest) -> int:
     """How many tool results the conversation holds so far."""
     return sum(isinstance(b, ToolResultBlock) for m in request.messages for b in m.content)
@@ -132,13 +107,17 @@ TESTS = {"command": "pytest -q", "passed": 1, "failed": 0, "exit_code": 0, "outp
 
 
 def engineer_with_tests(request: LLMRequest) -> Any:
-    """The scripted Engineer: write the module, run the tests, report both."""
+    """The scripted Engineer: write the module, install pytest, run the tests, report
+    them."""
     done = _tool_results(request)
     if done == 0:
         args = {"path": "app.py", "content": "print('books')\n"}
         return [ToolUseBlock(id="call_write", name="write_file", arguments=args)]
     if done == 1:
-        args = {"command": "pytest -q"}
+        args = {"packages": ["pytest==8.3.3"]}
+        return [ToolUseBlock(id="call_deps", name="install_deps", arguments=args)]
+    if done == 2:
+        args = {"argv": ["pytest", "-q"]}
         return [ToolUseBlock(id="call_tests", name="run_command", arguments=args)]
     return json.dumps(dict(CODE, tests=TESTS))
 
@@ -157,11 +136,13 @@ async def scripted_app(
     *,
     script: dict[AgentName, Responder] | None = None,
     auditor: AuditorModel = passing_auditor,
+    runner: FakeRunner | None = None,
 ) -> App:
-    """The real app from ``config`` over a scripted model. Each new run's workspace
-    starts with the notes the Researcher reads."""
+    """The real app from ``config`` over a scripted model, with the real command tools
+    over a fake runner. Each new run's workspace starts with the notes the Researcher
+    reads."""
     provider = scripted_provider(script or e2e_script(), auditor)
-    app = await build_app(config, providers={"fake": provider}, tools=e2e_tools())
+    app = await build_app(config, providers={"fake": provider}, runner=runner or FakeRunner())
 
     async def seed(event: Event) -> None:
         """Put the project notes in the new run's workspace."""
@@ -177,7 +158,10 @@ async def e2e_app(
     *,
     script: dict[AgentName, Responder] | None = None,
     auditor: AuditorModel = passing_auditor,
+    runner: FakeRunner | None = None,
     **config: Any,
 ) -> App:
     """``scripted_app`` over ``e2e_config(tmp_path, **config)``."""
-    return await scripted_app(e2e_config(tmp_path, **config), script=script, auditor=auditor)
+    return await scripted_app(
+        e2e_config(tmp_path, **config), script=script, auditor=auditor, runner=runner
+    )

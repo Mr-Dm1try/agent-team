@@ -11,6 +11,8 @@ Tool args are read leniently: ``command``/``cmd``/``argv`` for shell commands,
 
 from __future__ import annotations
 
+import contextlib
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
@@ -37,6 +39,7 @@ from agent_team.core.models import (
     Task,
 )
 from agent_team.llm.types import LLMClient
+from agent_team.tools.commands import requirement_lines
 
 WRITE_TOOLS = frozenset({"write_file", "edit_file", "append_file"})
 FILE_TOOLS = frozenset({"read_file", "list_dir", "grep", *WRITE_TOOLS})
@@ -206,6 +209,12 @@ def classify(
         if patterns.is_unclear_command(command):
             unclear.append(("S5", f"unusual command: {command[:200]}"))
 
+    if tool == "install_deps":
+        for target in _install_targets(args, run):
+            known = patterns.lookalike_of(patterns.requirement_name(target))
+            if known:
+                unclear.append(("S4", f"installs '{target}', which looks like '{known}'"))
+
     if tool in FILE_TOOLS or paths:
         for path in paths:
             if patterns.touches_credentials(path):
@@ -224,6 +233,24 @@ def classify(
         if args.get("body") or args.get("data"):
             unclear.append(("S7", "web request carries a body"))
     return blocked, unclear
+
+
+def _install_targets(args: dict[str, Any], run: Run) -> list[str]:
+    """The packages an install_deps call would install: its ``packages`` and the lines
+    of its ``requirements`` file, read from the workspace."""
+    raw_packages = args.get("packages")
+    if isinstance(raw_packages, str):
+        raw_packages = [raw_packages]
+    targets = [p for p in raw_packages or [] if isinstance(p, str)]
+    raw = args.get("requirements")
+    if isinstance(raw, str):
+        workspace = Path(run.workspace).resolve()
+        path = (workspace / raw).resolve()  # an absolute raw replaces the workspace
+        if patterns.inside(str(path), str(workspace)):
+            # The tool itself reports an unreadable file.
+            with contextlib.suppress(OSError, UnicodeDecodeError):
+                targets += requirement_lines(path.read_text(encoding="utf-8")[:200_000])
+    return targets
 
 
 def make_precheck_hook(auditor: Prechecker, tasks: TaskStore) -> BeforeHook:

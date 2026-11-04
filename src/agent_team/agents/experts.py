@@ -129,6 +129,7 @@ class Engineer(BaseAgent):
         "list_dir",
         "grep",
         "run_command",
+        "install_deps",
     )
 
     async def check(self, artifact: ArtifactBase, envelope: TaskEnvelope) -> list[str]:
@@ -155,7 +156,13 @@ class QA(BaseAgent):
     name: AgentName = AgentName.QA
     output_kind = "qa_report"
     role_prompt: ClassVar[str] = prompts.QA
-    tool_names: ClassVar[tuple[str, ...]] = ("read_file", "list_dir", "grep", "run_command")
+    tool_names: ClassVar[tuple[str, ...]] = (
+        "read_file",
+        "list_dir",
+        "grep",
+        "run_command",
+        "install_deps",
+    )
 
     async def check(self, artifact: ArtifactBase, envelope: TaskEnvelope) -> list[str]:
         """Every PRD acceptance criterion has a result, and no result names an unknown one."""

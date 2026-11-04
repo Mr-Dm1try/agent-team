@@ -17,6 +17,11 @@ def test_event_parsing_is_lenient() -> None:
         _event("r", "t", "run_command", arguments={"command": "ls"}, content="x", blocked=True)
     )
     assert call is not None and call.args == {"command": "ls"} and call.blocked
+    assert call.data == {}
+    detailed = tool_call_from_event(
+        _event("r", "t", "run_command", args={"argv": ["ls"]}, data={"exit_code": 2})
+    )
+    assert detailed is not None and detailed.data == {"exit_code": 2}
     nameless = Event(name=EventName.TOOL_CALL_AFTER, run_id="r", data={})
     assert tool_call_from_event(nameless) is None
 

@@ -519,6 +519,9 @@ def sources_opened(ctx: AuditContext, rule: Rule) -> HelperResult:
             value = call.args.get(key)
             if isinstance(value, str):
                 opened.add(patterns.normalize_source(value, ws))
+        final = call.data.get("final_url")  # where web_fetch ended up after redirects
+        if isinstance(final, str):
+            opened.add(patterns.normalize_source(final, ws))
     res = HelperResult(notes=[f"opened in this task: {sorted(opened)}"])
     for ref in sorted(set(cited)):
         norm = patterns.normalize_source(ref, ws)
@@ -783,6 +786,31 @@ def tests_ran(ctx: AuditContext, rule: Rule) -> HelperResult:
                     item=task.id,
                     artifact=change,
                     fix="run the tests with run_command and report that result",
+                )
+            )
+            continue
+        # The run the report describes: the last one of exactly that command, else the
+        # last that contains it. A later narrower run (one file, -k) doesn't replace it.
+        reported = " ".join(tests.command.split())
+        exact = [c for c in ran if " ".join(patterns.command_text(c.args).split()) == reported]
+        last = (exact or ran)[-1]
+        res.notes.append(
+            f"runs of '{tests.command}' in the tool log: "
+            + "; ".join(
+                f"{patterns.command_text(c.args)} -> {c.data.get('exit_code')}" for c in ran
+            )
+        )
+        logged = last.data.get("exit_code")
+        if isinstance(logged, int) and logged != tests.exit_code:
+            res.findings.append(
+                hit(
+                    rule,
+                    f"the last run of '{tests.command}' in the tool log exited {logged}, "
+                    f"but the change reports exit {tests.exit_code}",
+                    item=task.id,
+                    artifact=change,
+                    evidence=last.result[-500:],
+                    fix="fix the code until the tests pass, run them again and report that run",
                 )
             )
     return res

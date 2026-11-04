@@ -439,9 +439,14 @@ class CountingLLM(FakeLLM):
     repeats) and are served by ``providers`` in a cycle."""
 
     def __init__(
-        self, script: dict[AgentName, Any], *, reported: list[int], providers: list[str]
+        self,
+        script: dict[AgentName, Any],
+        *,
+        reported: list[int],
+        providers: list[str],
+        budget: int = 10_000,
     ) -> None:
-        super().__init__(script, budget=10_000)
+        super().__init__(script, budget=budget)
         self.reported = reported
         self.providers = providers
 
@@ -493,8 +498,11 @@ async def test_a_provider_switch_drops_the_anchor(tmp_path: Path) -> None:
                 _summary(r) or (script.pop(0) if script else json.dumps(CODE))
             )
         },
-        reported=[100, 9_000],
+        reported=[100, 18_000],
         providers=["p", "q"],
+        # Room for the full estimate of the history, which a large count also
+        # calibrates (per model) to the fewest chars per token; the anchor would not fit.
+        budget=20_000,
     )
     bus = FakeBus()
     await Engineer(compactor=Compactor(keep_last=2)).run(env, ctx(llm, bus))

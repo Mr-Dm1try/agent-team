@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.scenario import PRD, team_script
+from sandbox.fakes import FakeRunner
 
 from agent_team.app import build_app
 from agent_team.core.artifacts import Artifact
@@ -42,6 +43,7 @@ async def _fresh_orchestrator(team: Team) -> Orchestrator:
         llm=team.llm,
         auditor=team.auditor,
         policy=SimplePolicy(),
+        runner=FakeRunner(),
     )
     return app.orchestrator
 
