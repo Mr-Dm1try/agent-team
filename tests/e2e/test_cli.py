@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from agent_team import cli
 from agent_team.app import App
@@ -42,6 +42,11 @@ def config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path.write_text(yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8")
     monkeypatch.setattr(cli, "_factory", _asking_team())
     return path
+
+
+def _plain(result: Result) -> str:
+    """The command's output without colour codes, which CI may force on."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", result.output)
 
 
 def _run_id(output: str) -> str:
@@ -184,7 +189,7 @@ def test_stats_of_one_run_and_of_all_runs(config_file: Path) -> None:
     wide = {"COLUMNS": "140"}
     one = runner.invoke(cli.app, ["stats", run_id, "-c", str(config_file)], env=wide)
     assert one.exit_code == 0, one.output
-    lines = one.output.splitlines()
+    lines = _plain(one).splitlines()
     assert lines[0].split() == [
         "calls",
         "tokens",
@@ -201,7 +206,7 @@ def test_stats_of_one_run_and_of_all_runs(config_file: Path) -> None:
     assert lines[1].startswith(f"run {run_id} (waiting)")
     assert any(line.startswith("  product ") for line in lines), one.output
     every = runner.invoke(cli.app, ["stats", "-c", str(config_file)], env=wide)
-    assert any(line.startswith("all runs") for line in every.output.splitlines())
+    assert any(line.startswith("all runs") for line in _plain(every).splitlines())
     unknown = runner.invoke(cli.app, ["stats", "run_nope", "-c", str(config_file)])
     assert unknown.exit_code == 1 and "No run run_nope." in unknown.output
 
@@ -215,4 +220,4 @@ def test_context_folders_reach_the_run_read_only(config_file: Path, tmp_path: Pa
     missing = CliRunner().invoke(
         cli.app, ["run", "x", "-c", str(config_file), "--context", str(tmp_path / "nope")]
     )
-    assert missing.exit_code == 2 and "Invalid value for '--context'" in missing.output
+    assert missing.exit_code == 2 and "Invalid value for '--context'" in _plain(missing)
