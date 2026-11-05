@@ -7,9 +7,9 @@ for changes.
 
 Built for the AI Engineer Challenge: Research Agent Teams.
 
-> **Status:** the team, the auditor, the gateway, the Docker sandbox and the CLI run end
-> to end (the tests drive a whole build with a scripted model). A real build needs Docker
-> running; memory is not built yet.
+> **Status:** the team, the auditor, the gateway, the Docker sandbox, long-term memory
+> and the CLI run end to end (the tests drive a whole build with a scripted model). A
+> real build needs Docker running.
 
 ## What it does
 
@@ -36,6 +36,8 @@ The full design is in [docs/DESIGN.md](docs/DESIGN.md).
 - Python 3.12 and [uv](https://docs.astral.sh/uv/)
 - Docker (Docker Desktop, OrbStack or Colima)
 - An Anthropic API key, and optionally [Ollama](https://ollama.com) for local models
+  and memory embeddings (`ollama pull nomic-embed-text`; without it, memory search
+  uses keywords alone)
 
 ## Quick start
 
@@ -49,6 +51,7 @@ uv run agent-team stop <run_id>                # stop at the next model call
 uv run agent-team stats [run_id]               # tokens, cost, time, retries, first-pass rate
 uv run agent-team logs <run_id> --agent qa      # one agent's events
 uv run agent-team logs <run_id> --spans         # the run's trace tree
+uv run agent-team memory search "FastAPI tests"  # what earlier runs learned
 ```
 
 While a run waits on you, type your answer and press Enter. Ctrl-D leaves the run

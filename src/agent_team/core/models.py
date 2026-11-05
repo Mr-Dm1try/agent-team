@@ -27,6 +27,11 @@ def new_id(prefix: str) -> str:
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
 
+#: The run id for what happens with no run in progress, such as a message before the
+#: first run.
+SESSION = "session"
+
+
 def utcnow() -> datetime:
     """The current time in UTC, timezone-aware. Every timestamp in the store uses it."""
     return datetime.now(UTC)
@@ -433,6 +438,8 @@ class DecisionKind(StrEnum):
     ASK_USER = "ask_user"
     NO_PROGRESS = "no_progress"
     STOP = "stop"
+    #: The user stated a preference; the memory writer saves it from this decision.
+    REMEMBER = "remember"
 
 
 class Decision(Contract):
@@ -449,6 +456,59 @@ class Decision(Contract):
     made_by: Literal["code", "model"]
     rule: str | None = None  # the policy or rule that applied, for code-made choices
     created_at: datetime = Field(default_factory=utcnow)
+
+
+# --- memory ----------------------------------------------------------------------
+
+
+class MemoryKind(StrEnum):
+    """What a long-term memory records (docs/DESIGN.md, "Memory")."""
+
+    RUN_SUMMARY = "run_summary"
+    DECISION = "decision"
+    LESSON = "lesson"
+    PREFERENCE = "preference"
+    RESEARCH_FACT = "research_fact"
+
+
+class MemorySource(Contract):
+    """Where a memory came from: the run and task, and for a research fact the URL or
+    file it cites."""
+
+    run_id: str
+    task_id: str | None = None
+    ref: str | None = None
+
+
+class Memory(Contract):
+    """One saved memory. The first source is where it was first saved from; a
+    near-duplicate saved later keeps this id and adds its source to the list."""
+
+    id: str = Field(default_factory=lambda: new_id("mem"))
+    kind: MemoryKind
+    text: str = Field(min_length=1)
+    sources: list[MemorySource] = Field(min_length=1)
+    created_at: datetime = Field(default_factory=utcnow)
+    #: Times a task that was given this memory passed its check on the first try.
+    usefulness: int = 0
+
+    @property
+    def origin(self) -> MemorySource:
+        """The source the memory was first saved from."""
+        return self.sources[0]
+
+
+class MemoryMatch(Contract):
+    """A memory a search found, with its raw scores: ``cosine`` is None when the query
+    or the memory has no vector, ``bm25`` is SQLite's score made positive (higher is
+    better, 0 when no query term matched) and ``words`` the share of words the two
+    have in common, 0 to 1, which still counts when there are too few memories for
+    BM25 to weigh terms."""
+
+    memory: Memory
+    cosine: float | None = None
+    bm25: float = 0.0
+    words: float = 0.0
 
 
 class EventName(StrEnum):
@@ -473,6 +533,7 @@ class EventName(StrEnum):
     REVIEW_REQUESTED = "review_requested"
     USER_MESSAGE = "user_message"
     MEMORY_FETCHED = "memory_fetched"
+    MEMORY_SAVED = "memory_saved"
     CHECKPOINT_SAVED = "checkpoint_saved"
     CONTEXT_COMPACTED = "context_compacted"
     SPAN_STARTED = "span_started"

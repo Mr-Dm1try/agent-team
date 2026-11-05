@@ -67,7 +67,10 @@ KIND_PHASE: dict[str, Phase] = {
 }
 
 MAX_FILE_BYTES = 200_000
-READ_TOOLS = frozenset({"read_file", "list_dir", "grep", "web_fetch", "fetch", "open_url"})
+#: Tools whose results bring outside text in; S6 looks for instructions planted in it.
+READ_TOOLS = frozenset(
+    {"read_file", "list_dir", "grep", "web_fetch", "fetch", "open_url", "memory_search"}
+)
 OUTGOING_TOOLS = frozenset({"web_fetch", "web_search", "fetch", "http_request", "open_url"})
 
 

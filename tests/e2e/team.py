@@ -20,6 +20,7 @@ from agent_team.core.config import Config, deep_merge, load_config
 from agent_team.core.models import AgentName, Event, EventName, Usage
 from agent_team.llm.fake import FakeProvider
 from agent_team.llm.types import LLMRequest, LLMResponse, ToolResultBlock, ToolUseBlock
+from agent_team.memory.embed import FakeEmbedder
 
 PASS = {"summary": "fine", "findings": []}
 NOTES = "SQLite needs no server.\n"
@@ -155,11 +156,16 @@ async def scripted_app(
     auditor: AuditorModel = passing_auditor,
     runner: FakeRunner | None = None,
 ) -> App:
-    """The real app from ``config`` over a scripted model, with the real command tools
-    over a fake runner. Each new run's workspace starts with the notes the Researcher
-    reads."""
+    """The real app from ``config`` over a scripted model and the fake embedder, with
+    the real command tools over a fake runner. Each new run's workspace starts with the
+    notes the Researcher reads."""
     provider = scripted_provider(script or e2e_script(), auditor)
-    app = await build_app(config, providers={"fake": provider}, runner=runner or FakeRunner())
+    app = await build_app(
+        config,
+        providers={"fake": provider},
+        runner=runner or FakeRunner(),
+        embedder=FakeEmbedder(),
+    )
 
     async def seed(event: Event) -> None:
         """Put the project notes in the new run's workspace."""

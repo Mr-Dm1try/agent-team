@@ -4,9 +4,10 @@
 Users don't know the team's internals. They say "make it paginate" or "yes, Postgres",
 so one orchestrator tool loop reads the run (the read-only control tools) and turns the
 message into actions: answer a pending item, propose a change, start or stop a run,
-and a reply in plain words. Code validates every action call, and a bad call goes back
-to the model as a tool error. Actions are only collected during the loop; the
-orchestrator carries them out after it ends, so a loop that fails does nothing.
+keep a preference the user stated, and a reply in plain words. Code validates every
+action call, and a bad call goes back to the model as a tool error. Actions are only
+collected during the loop; the orchestrator carries them out after it ends, so a loop
+that fails does nothing.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from pydantic import Field
 
 from agent_team.agents.loop import LoopSettings, ToolLoop
 from agent_team.agents.prompts import MESSAGES
+from agent_team.audit.patterns import injection_markers
 from agent_team.core.artifacts import PLAIN_KINDS, plain_kind
 from agent_team.core.base import Contract
 from agent_team.core.errors import ToolError
@@ -33,6 +35,7 @@ from agent_team.core.interfaces import (
     VerdictStore,
 )
 from agent_team.core.models import (
+    SESSION,
     AgentName,
     Phase,
     RequestKind,
@@ -51,6 +54,9 @@ from agent_team.orchestrator.replies import plain_agent
 CONFIRM_CHANGE = "confirm_change"
 #: Artifacts a change can start from, in pipeline order.
 CHANGE_TARGETS = ("plan", "prd", "spec", "code_change")
+#: Preferences one message may state, and the longest one kept.
+MAX_PREFERENCES = 3
+MAX_PREFERENCE_CHARS = 300
 #: About six tool turns: each turn is a model step and a tool step, plus the reply.
 SETTINGS = LoopSettings(max_steps=13, max_repairs=1)
 
@@ -73,7 +79,9 @@ _REFS = re.compile(rf"\b({'|'.join(PLAIN_KINDS)})@v\d+\b")
 class Action:
     """One validated action call, carried out after the loop ends."""
 
-    tool: Literal["answer_pending", "request_change", "start_run", "stop_run"]
+    tool: Literal[
+        "answer_pending", "request_change", "start_run", "stop_run", "remember_preference"
+    ]
     args: dict[str, str]
 
 
@@ -194,6 +202,16 @@ class _Actions:
                 self.stop_run,
                 safe=False,
             ),
+            _Tool(
+                _spec(
+                    "remember_preference",
+                    "Keep a lasting preference the user stated (how they want the team "
+                    "to work) for later runs, in one short sentence.",
+                    {"text": {"type": "string"}},
+                ),
+                self.remember_preference,
+                safe=False,
+            ),
         ]
         return {t.spec.name: t for t in made}
 
@@ -240,6 +258,22 @@ class _Actions:
         if self.run is None:
             raise ToolError("no run is in progress", tool=name)
         return self._queue(name, reason=reason)
+
+    def remember_preference(self, args: dict[str, Any]) -> ToolResult:
+        """One short sentence, not already kept in this message, with nothing in it
+        that reads like instructions to an agent, and a few per message at most."""
+        name = "remember_preference"
+        text = " ".join(required_str(args, "text", name).split())
+        if len(text) > MAX_PREFERENCE_CHARS:
+            raise ToolError(f"keep it under {MAX_PREFERENCE_CHARS} characters", tool=name)
+        if injection_markers(text):
+            raise ToolError("a preference can't hold instructions for the agents", tool=name)
+        kept = [a.args["text"].lower() for a in self.actions if a.tool == name]
+        if text.lower() in kept:
+            raise ToolError("that preference is already kept in this message", tool=name)
+        if len(kept) >= MAX_PREFERENCES:
+            raise ToolError(f"at most {MAX_PREFERENCES} preferences per message", tool=name)
+        return self._queue(name, text=text)
 
 
 class _Tool:
@@ -289,7 +323,7 @@ async def interpret(
     """Run the message loop. Returns the actions and reply, or None if the loop failed,
     in which case nothing may be acted on."""
     actions = _Actions(run, [t for t, _ in pending], targets)
-    context_run = run or Run(id="session", title="session", request="", workspace=workspace)
+    context_run = run or Run(id=SESSION, title=SESSION, request="", workspace=workspace)
     probe = Task(
         id=new_id("msg"),
         run_id=context_run.id,

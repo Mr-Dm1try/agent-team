@@ -25,6 +25,7 @@ from agent_team.app import App, Stores, build_app
 from agent_team.core.config import load_config
 from agent_team.core.interfaces import VerdictPolicy
 from agent_team.core.models import AgentName, ReviewMode
+from agent_team.memory.embed import FakeEmbedder
 from agent_team.orchestrator import Dispatcher, Orchestrator
 from agent_team.orchestrator.policy import SimplePolicy
 
@@ -80,6 +81,7 @@ async def make_team(
         auditor=auditor,
         policy=policy or (None if code_policy else SimplePolicy()),
         runner=FakeRunner(),
+        embedder=FakeEmbedder(),
     )
     return Team(
         app,

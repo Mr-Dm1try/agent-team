@@ -11,7 +11,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from agent_team.core.models import AgentName, Effort, ReviewMode
+from agent_team.core.models import AgentName, Effort, MemoryKind, ReviewMode
 from agent_team.llm.tokens import CHARS_PER_TOKEN
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[3] / "config" / "default.yaml"
@@ -178,6 +178,74 @@ class WebConfig(_Cfg):
     user_agent: str = "agent-team/0.1 (research tool)"
 
 
+class EmbedderConfig(_Cfg):
+    """The embedding model for memory: nomic-embed-text through Ollama's
+    OpenAI-compatible endpoint, called once when a memory is saved and once per search."""
+
+    model: str = "nomic-embed-text"
+    #: None uses ``providers.ollama.base_url``.
+    base_url: str | None = None
+    timeout_s: float = 10.0
+    #: After a failed call, search uses BM25 alone for this long before trying again.
+    retry_after_s: float = 60.0
+    #: nomic-embed-text wants a task prefix on each text.
+    query_prefix: str = "search_query: "
+    document_prefix: str = "search_document: "
+
+
+class MemoryWeights(_Cfg):
+    """How a memory's score is made: meaning (cosine) and keyword (BM25) match, how
+    recent it is and how often it helped."""
+
+    cosine: float = Field(default=0.5, ge=0)
+    bm25: float = Field(default=0.3, ge=0)
+    recency: float = Field(default=0.1, ge=0)
+    usefulness: float = Field(default=0.1, ge=0)
+
+    @model_validator(mode="after")
+    def _some_text_weight(self) -> MemoryWeights:
+        """Text match must count, or every memory would match every query."""
+        if self.cosine + self.bm25 <= 0:
+            raise ValueError("memory.weights: cosine + bm25 must be above 0")
+        return self
+
+
+def _default_memory_kinds() -> dict[AgentName, list[MemoryKind]]:
+    """The memory kinds each agent is given before its tasks."""
+    k = MemoryKind
+    return {
+        AgentName.ORCHESTRATOR: [k.RUN_SUMMARY, k.PREFERENCE, k.LESSON],
+        AgentName.RESEARCHER: [k.RESEARCH_FACT, k.PREFERENCE, k.LESSON],
+        AgentName.PRODUCT: [k.PREFERENCE, k.DECISION, k.RESEARCH_FACT, k.RUN_SUMMARY],
+        AgentName.ARCHITECT: [k.DECISION, k.PREFERENCE, k.LESSON, k.RESEARCH_FACT],
+        AgentName.ENGINEER: [k.LESSON, k.DECISION, k.PREFERENCE],
+        AgentName.QA: [k.LESSON, k.PREFERENCE],
+    }
+
+
+class MemoryConfig(_Cfg):
+    """Long-term memory (docs/DESIGN.md, "Memory"): what each agent is given before a
+    task, how matches are ranked, and when two memories count as one."""
+
+    enabled: bool = True
+    #: Caps on the "Relevant memory" block of one task.
+    max_items: int = Field(default=10, ge=0)
+    max_tokens: int = Field(default=500, ge=0)
+    #: Text match (0 to 1) below which a memory is too weak to give.
+    min_relevance: float = Field(default=0.3, ge=0, le=1)
+    #: Text match a decision or research fact from another run needs to be given.
+    strong_match: float = Field(default=0.6, ge=0, le=1)
+    #: Cosine at or above which a new memory merges into an existing one.
+    merge_similarity: float = Field(default=0.92, ge=0, le=1)
+    #: A memory's recency score halves every this many days.
+    recency_half_life_days: float = Field(default=30.0, gt=0)
+    #: Matches taken from each of the keyword and vector searches before ranking.
+    candidates: int = Field(default=50, ge=1)
+    weights: MemoryWeights = Field(default_factory=MemoryWeights)
+    kinds: dict[AgentName, list[MemoryKind]] = Field(default_factory=_default_memory_kinds)
+    embedder: EmbedderConfig = Field(default_factory=EmbedderConfig)
+
+
 class PathsConfig(_Cfg):
     """Where runs and the database live."""
 
@@ -203,6 +271,7 @@ class Config(_Cfg):
     chaos: ChaosSettings = Field(default_factory=ChaosSettings)
     review: ReviewMode = ReviewMode.AUTO_ASSUMPTIONS
     hooks: list[str] = Field(default_factory=list)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     web: WebConfig = Field(default_factory=WebConfig)

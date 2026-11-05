@@ -97,5 +97,12 @@ class RunStopped(AgentTeamError):
     """The kill switch (`agent-team stop`) halted the run at a safe point."""
 
 
+class EmbedderUnavailable(AgentTeamError):
+    """The embedding model can't be reached or gave no vectors; memory search falls
+    back to BM25 alone."""
+
+    retryable = True
+
+
 class InvalidTransition(AgentTeamError):
     """A task state change that ALLOWED_TRANSITIONS doesn't permit. Always a bug."""

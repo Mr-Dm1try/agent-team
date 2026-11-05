@@ -49,12 +49,14 @@ class Question(Contract):
 
 
 class MemoryProposal(Contract):
-    """A fact an agent suggests keeping for future runs. The auditor decides
-    whether it is saved."""
+    """Something an agent suggests keeping for later runs. The memory writer saves a
+    decision, or a research fact with a source the output cites, once the output passes
+    its check; lessons and preferences come from the auditor and the user instead, so
+    those proposals are left out."""
 
     kind: Literal["decision", "lesson", "preference", "research_fact"]
     text: str
-    source: str | None = None  # URL or file for research facts
+    source: str | None = None  # the URL or file a research fact cites
 
 
 class ResearchRequest(Contract):

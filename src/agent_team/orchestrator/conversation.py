@@ -14,6 +14,7 @@ import traceback
 from agent_team.core.artifacts import plain_kind
 from agent_team.core.errors import BudgetExceeded
 from agent_team.core.models import (
+    SESSION,
     AgentName,
     Decision,
     DecisionKind,
@@ -57,8 +58,15 @@ from agent_team.orchestrator.messages import (
 from agent_team.orchestrator.phases import expert_tasks
 from agent_team.orchestrator.replies import Reply, pending_items
 
-#: The order actions are carried out in: answers and a new run, then changes, then a stop.
-_ORDER = {"answer_pending": 0, "start_run": 0, "request_change": 1, "stop_run": 2}
+#: The order actions are carried out in: answers and a new run, then preferences (kept
+#: under the new run when there is one), changes, and a stop last.
+_ORDER = {
+    "answer_pending": 0,
+    "start_run": 0,
+    "remember_preference": 1,
+    "request_change": 2,
+    "stop_run": 3,
+}
 
 
 class ConversationMixin(OrchestratorBase):
@@ -85,7 +93,7 @@ class ConversationMixin(OrchestratorBase):
         await self.bus.emit(
             Event(
                 name=EventName.USER_MESSAGE,
-                run_id=run.id if run else "session",
+                run_id=run.id if run else SESSION,
                 agent=AgentName.USER,
                 data={"text": message},
             )
@@ -113,7 +121,7 @@ class ConversationMixin(OrchestratorBase):
             await self.bus.emit(
                 Event(
                     name=EventName.ERROR,
-                    run_id=run.id if run else "session",
+                    run_id=run.id if run else SESSION,
                     agent=AgentName.ORCHESTRATOR,
                     data={
                         "error_type": type(exc).__name__,
@@ -153,7 +161,7 @@ class ConversationMixin(OrchestratorBase):
         what they touched and reply in plain words. Once the run is stopped, the rest of
         the actions on it are dropped (and logged as dropped); a new run still starts."""
         if not meant.actions:
-            await self._log_action(run.id if run else "session", message, meant, None)
+            await self._log_action(run.id if run else SESSION, message, meant, None)
         touched, started, stopped = False, None, None
         notes: list[str] = []
         for action in sorted(meant.actions, key=lambda a: _ORDER[a.tool]):
@@ -165,6 +173,9 @@ class ConversationMixin(OrchestratorBase):
                     context_dirs=context_dirs,
                 )
                 await self._log_action(started.id, message, meant, action)
+                continue
+            if action.tool == "remember_preference":
+                await self._remember(started or run, message, args["text"])
                 continue
             assert run is not None  # the tools refuse these without a run
             await self._log_action(run.id, message, meant, action, dropped=stopped is not None)
@@ -197,6 +208,20 @@ class ConversationMixin(OrchestratorBase):
                 Reply(kind="answer", text="", run_id=run.id if run else None, pending=items)
             )
         return self._say(message, [meant.reply, *notes], states)
+
+    async def _remember(self, run: Run | None, message: str, text: str) -> None:
+        """Record a preference the user stated as a ``remember`` decision; the memory
+        writer saves it from there. It needs no run, so it stands even after a stop."""
+        await self._record(
+            Decision(
+                run_id=run.id if run else SESSION,
+                kind=DecisionKind.REMEMBER,
+                inputs={"message": message[:500], "preference": text},
+                choice="remember preference",
+                reason="the user stated a preference",
+                made_by="model",
+            )
+        )
 
     async def _log_action(
         self,

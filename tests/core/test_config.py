@@ -1,11 +1,12 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from agent_team.core.config import DEFAULT_CONFIG, deep_merge, load_config
 from agent_team.core.control import KillSwitch
 from agent_team.core.errors import RunStopped
-from agent_team.core.models import AgentName, ReviewMode
+from agent_team.core.models import AgentName, MemoryKind, ReviewMode
 
 
 def test_default_config_loads() -> None:
@@ -122,3 +123,12 @@ def test_kill_switch(tmp_path: Path) -> None:
         ks.check("r1")
     ks.clear("r1")
     ks.check("r1")
+
+
+def test_memory_settings_load_and_reject_weights_with_no_text_match() -> None:
+    config = load_config()
+    assert config.memory.enabled and config.memory.max_items == 10
+    assert config.memory.max_tokens == 500 and config.memory.weights.cosine == 0.5
+    assert MemoryKind.LESSON in config.memory.kinds[AgentName.ENGINEER]
+    with pytest.raises(ValidationError, match="cosine \\+ bm25"):
+        load_config(overrides={"memory": {"weights": {"cosine": 0, "bm25": 0}}})

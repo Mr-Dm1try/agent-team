@@ -28,6 +28,7 @@ from agent_team.core.interfaces import (
     Auditor,
     CheckpointStore,
     DecisionLog,
+    Embedder,
     EventBus,
     FeedbackStore,
     TaskStore,
@@ -48,6 +49,7 @@ from agent_team.core.tracing import JsonlTracer, Tracer
 from agent_team.llm.chaos import Chaos
 from agent_team.llm.factory import build_gateway
 from agent_team.llm.types import LLMClient, Provider
+from agent_team.memory import MemoryParts, build_memory
 from agent_team.orchestrator import Dispatcher, Orchestrator, OrchestratorConfig
 from agent_team.sandbox import CommandRunner, DockerRunner, attach_cleanup, make_commit_hook
 from agent_team.tools import command_tools, file_tools, web_tools
@@ -91,6 +93,8 @@ class App:
     dispatcher: Dispatcher
     orchestrator: Orchestrator
     _closers: list[Callable[[], None]] = field(default_factory=list)
+    #: Long-term memory, or None when ``memory.enabled`` is off.
+    memory: MemoryParts | None = None
 
     @property
     def runs_dir(self) -> Path:
@@ -152,14 +156,16 @@ async def build_app(
     tools: dict[str, Tool] | None = None,
     policy: VerdictPolicy | None = None,
     runner: CommandRunner | None = None,
+    embedder: Embedder | None = None,
 ) -> App:
     """Build the team from ``config`` (the default config file when None). Each keyword
     replaces one collaborator; the rest is built from the config: SQLite stores in WAL
     mode, the event bus with the JSONL log and the configured hooks, the gateway over
     the configured (or given) providers, the auditor over the seeded rule catalog with
-    its pre-check on every tool call, the tools, the agents, the dispatcher and the
-    orchestrator. When the sandbox is enabled and neither ``tools`` nor ``runner`` is
-    given, this connects to Docker and raises SandboxError if it can't."""
+    its pre-check on every tool call, the tools, long-term memory (over the given or the
+    Ollama embedder), the agents, the dispatcher and the orchestrator. When the sandbox
+    is enabled and neither ``tools`` nor ``runner`` is given, this connects to Docker
+    and raises SandboxError if it can't."""
     config = config or load_config()
     runs_dir = _make_dirs(config)
     closers: list[Callable[[], None]] = []
@@ -206,6 +212,25 @@ async def build_app(
             raise
     if runner is not None:
         attach_cleanup(bus, runner)
+    tools = dict(tools)
+    memory: MemoryParts | None = None
+    if config.memory.enabled:
+        try:
+            memory = await build_memory(
+                config,
+                bus=bus,
+                llm=llm,
+                tasks=stores.tasks,
+                artifacts=stores.artifacts,
+                verdicts=stores.verdicts,
+                embedder=embedder,
+            )
+        except BaseException:
+            while closers:
+                closers.pop()()
+            raise
+        closers.append(memory.close)
+        tools.update(memory.tools)
     dispatcher = Dispatcher(
         tasks=stores.tasks,
         artifacts=stores.artifacts,
@@ -216,6 +241,7 @@ async def build_app(
         tools=tools,
         feedback=stores.feedback,
         verdicts=stores.verdicts,
+        memory=memory.fetch if memory else None,
         timeout_s=config.limits.task_timeout_s,
         auditor=auditor,
     )
@@ -251,4 +277,6 @@ async def build_app(
         ),
         policy=policy,
     )
-    return App(config, bus, stores, llm, auditor, kill_switch, dispatcher, orchestrator, closers)
+    return App(
+        config, bus, stores, llm, auditor, kill_switch, dispatcher, orchestrator, closers, memory
+    )
