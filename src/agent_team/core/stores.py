@@ -164,7 +164,16 @@ class SqliteTaskStore:
                     agent=task.agent,
                     trace_id=task.trace_id,
                     span_id=task.span_id,
-                    data={"from": src.value, "to": to.value, "reason": reason},
+                    data={
+                        "from": src.value,
+                        "to": to.value,
+                        "reason": reason,
+                        # So a live view can draw the task without reading the store.
+                        "phase": task.phase.value,
+                        "kind": task.output_kind,
+                        "objective": task.objective[:120],
+                        "origin": task.origin.value,
+                    },
                 )
             )
         return task

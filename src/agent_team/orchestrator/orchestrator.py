@@ -116,17 +116,7 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
 
     async def stop(self, run_id: str, reason: str = "stopped by the user") -> None:
         """The kill switch: the run halts at the next safe point and can be resumed."""
-        await self._set_status(run_id, RunStatus.STOPPED)
-        await self._record(
-            Decision(
-                run_id=run_id,
-                kind=DecisionKind.STOP,
-                choice="stop",
-                reason=reason,
-                made_by="code",
-                rule="kill_switch",
-            )
-        )
+        await self._halt(run_id, stopped=True, reason=reason)
 
     # --- the drive loop -------------------------------------------------------------
 
@@ -236,10 +226,8 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
         async with Tracer(self.bus).in_run(run, name, "task", task_id=task.id, agent=task.agent):
             result = await self.dispatcher.dispatch(task)
             if result.status is ResultStatus.ERROR and result.error_type in PAUSING_ERRORS:
-                status = (
-                    RunStatus.STOPPED if result.error_type == "RunStopped" else RunStatus.PAUSED
-                )
-                await self._set_status(run.id, status)
+                stopped = result.error_type == "RunStopped"
+                await self._halt(run.id, stopped=stopped, reason=result.error or "stopped")
                 return
             task = await self.tasks.get_task(task.id)
             if task.status is TaskStatus.AUDITING:  # not superseded while it ran

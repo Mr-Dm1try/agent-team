@@ -25,6 +25,7 @@ from agent_team.core.models import (
     DANGEROUS_ACTION_RULES,
     AgentName,
     Decision,
+    DecisionKind,
     Event,
     EventName,
     Feedback,
@@ -202,8 +203,14 @@ class OrchestratorBase:
 
     async def _pause(self, run_id: str, exc: Exception) -> None:
         """Stop on RunStopped, pause on BudgetExceeded; either way the run can resume."""
-        status = RunStatus.STOPPED if isinstance(exc, RunStopped) else RunStatus.PAUSED
-        await self._set_status(run_id, status)
+        await self._halt(run_id, stopped=isinstance(exc, RunStopped), reason=str(exc))
+
+    async def _halt(self, run_id: str, *, stopped: bool, reason: str) -> None:
+        """Mark the run stopped, with the reason in the decision log, or paused."""
+        if stopped:
+            await mark_stopped(self.tasks, self.decisions, run_id, reason)
+        else:
+            await self._set_status(run_id, RunStatus.PAUSED)
 
     @staticmethod
     def _feedback(
@@ -244,3 +251,23 @@ def can_keep(task: Task, verdict: Verdict | None) -> bool:
     return not any(
         f.rule_id == AUDIT_RULE or f.rule_id in DANGEROUS_ACTION_RULES for f in verdict.blockers
     )
+
+
+async def mark_stopped(tasks: TaskStore, decisions: DecisionLog, run_id: str, reason: str) -> Run:
+    """Mark a run stopped and log why, unless it is already done or stopped. Used by
+    the orchestrator and by ``agent-team stop`` for a run no session is driving."""
+    run = await tasks.get_run(run_id)
+    if run.status in (RunStatus.DONE, RunStatus.STOPPED):
+        return run
+    run = await tasks.update_run(run.model_copy(update={"status": RunStatus.STOPPED}))
+    await decisions.record(
+        Decision(
+            run_id=run_id,
+            kind=DecisionKind.STOP,
+            choice="stop",
+            reason=reason,
+            made_by="code",
+            rule="kill_switch",
+        )
+    )
+    return run

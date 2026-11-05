@@ -1,8 +1,9 @@
-"""Command-line entry point: start a run, resume one, read its logs.
+"""Command-line entry point: start, resume and stop runs, and read their logs and stats.
 
-``run`` and ``resume`` talk to the team until the run finishes. While the run waits on
-you, each line typed is sent as a message; end the input (Ctrl-D) to leave the run
-waiting, and pick it up later with ``resume``.
+``run`` and ``resume`` show the run live and talk to the team (see ui/session.py).
+While the run waits on you, each line typed is sent as a message; end the input
+(Ctrl-D) to leave the run waiting, and pick it up later with ``resume``. When it is
+done you accept it or describe a change.
 """
 
 from __future__ import annotations
@@ -10,20 +11,29 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from rich.console import Console
+from rich.table import Column, Table
 
 from agent_team import __version__
 from agent_team.app import App, build_app
 from agent_team.core.config import Config, load_config
+from agent_team.core.control import DriveLock, KillSwitch
+from agent_team.core.db import Database
 from agent_team.core.errors import SandboxError
-from agent_team.core.models import Event
-from agent_team.core.tracing import load_spans, read_events, render_tree, span_tree
+from agent_team.core.events import InMemoryEventBus
+from agent_team.core.models import Event, RunStatus
+from agent_team.core.stores import SqliteDecisionLog, SqliteTaskStore
+from agent_team.core.tracing import JsonlTracer, load_spans, read_events, render_tree, span_tree
 from agent_team.llm.chaos import parse_chaos
-from agent_team.orchestrator.replies import Reply
+from agent_team.orchestrator.base import mark_stopped
+from agent_team.ui.session import Session
+from agent_team.ui.stats import HEADER, overview_table, run_stats, run_table
 
 app = typer.Typer(help="Multi-agent harness: Planning, PRD, Spec and Implementation.")
 
@@ -50,16 +60,62 @@ def version() -> None:
     typer.echo(__version__)
 
 
-@app.command()
-def run(request: str, config: ConfigOption = None, chaos: ChaosOption = None) -> None:
-    """Start a run for REQUEST and answer its questions from stdin until it is done."""
-    raise typer.Exit(asyncio.run(_talk(_config(config, chaos), request=request)))
+PlainOption = Annotated[
+    bool, typer.Option("--plain", help="Print one line per event instead of the live view.")
+]
+ContextOption = Annotated[
+    list[Path] | None,
+    typer.Option(
+        "--context",
+        help="A folder the Researcher may read but never write; repeat for more.",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+    ),
+]
 
 
 @app.command()
-def resume(run_id: str, config: ConfigOption = None, chaos: ChaosOption = None) -> None:
+def run(
+    request: str,
+    config: ConfigOption = None,
+    chaos: ChaosOption = None,
+    plain: PlainOption = False,
+    context: ContextOption = None,
+) -> None:
+    """Start a run for REQUEST, show it live and talk to it until it is done."""
+    folders = [str(p.resolve()) for p in context or []]
+    raise typer.Exit(
+        asyncio.run(_talk(_config(config, chaos), plain=plain, request=request, context=folders))
+    )
+
+
+@app.command()
+def resume(
+    run_id: str, config: ConfigOption = None, chaos: ChaosOption = None, plain: PlainOption = False
+) -> None:
     """Continue RUN_ID after a stop, a crash or a question left open."""
-    raise typer.Exit(asyncio.run(_talk(_config(config, chaos), run_id=run_id)))
+    raise typer.Exit(asyncio.run(_talk(_config(config, chaos), plain=plain, run_id=run_id)))
+
+
+@app.command()
+def stop(
+    run_id: str,
+    reason: Annotated[str, typer.Option(help="Why, for the decision log.")] = "stopped by the user",
+    config: ConfigOption = None,
+) -> None:
+    """Stop RUN_ID. A session driving it stops at its next model call; a run nobody is
+    driving is marked stopped now. Either way, ``resume`` continues it."""
+    raise typer.Exit(asyncio.run(_stop(load_config(config), run_id, reason)))
+
+
+@app.command()
+def stats(
+    run_id: Annotated[str | None, typer.Argument(help="One run; all runs if left out.")] = None,
+    config: ConfigOption = None,
+) -> None:
+    """Tokens, cost, time, retries and first-pass audit rate, per run and per agent."""
+    raise typer.Exit(asyncio.run(_stats(load_config(config), run_id)))
 
 
 @app.command()
@@ -92,49 +148,95 @@ def _config(path: Path | None, chaos: str | None) -> Config:
     return config
 
 
-async def _talk(config: Config, *, request: str | None = None, run_id: str | None = None) -> int:
-    """Send the request (or resume the run), then pass each typed line on while the run
-    waits. Returns the exit code: 0 once the run is done or left waiting, 1 when it
-    stopped or failed with nothing to answer, or the sandbox couldn't start."""
+def _console() -> Console:
+    """A console on the current stdout (tests replace it)."""
+    return Console(file=sys.stdout, soft_wrap=True)
+
+
+async def _talk(
+    config: Config,
+    *,
+    plain: bool = False,
+    request: str | None = None,
+    run_id: str | None = None,
+    context: list[str] | None = None,
+) -> int:
+    """Start the request (or resume the run) in a session. Returns the exit code: 0
+    once the run is done or left waiting, 1 when it stopped or failed with nothing to
+    answer, or the sandbox couldn't start."""
     try:
         team = await _factory(config)
     except SandboxError as exc:
         typer.echo(f"Can't start: {exc}", err=True)
         return 1
     with team:
+        session = Session(team, _console(), plain=plain)
         if run_id is not None:
-            reply = await team.orchestrator.resume(run_id)
-        else:
-            reply = await team.orchestrator.handle(request or "")
-        while True:
-            _show(reply)
-            run_id = reply.run_id or run_id
-            if reply.kind == "done":
-                return 0
-            if reply.kind in ("stopped", "error") and not reply.pending:
+            return await session.resume(run_id)
+        return await session.start(request or "", context_dirs=context)
+
+
+@contextmanager
+def _stores(config: Config) -> Iterator[tuple[SqliteTaskStore, SqliteDecisionLog]]:
+    """The run and decision stores over the config's database, without the team.
+    Decisions also go to the run's events.jsonl, as the team's do."""
+    db = Database(config.paths.db)
+    bus = InMemoryEventBus()
+    JsonlTracer(config.paths.runs_dir).attach(bus)
+    try:
+        yield SqliteTaskStore(db), SqliteDecisionLog(db, bus)
+    finally:
+        db.close()
+
+
+async def _stop(config: Config, run_id: str, reason: str) -> int:
+    """Stop one run; see ``stop``."""
+    runs_dir = config.paths.runs_dir
+    with _stores(config) as (tasks, decisions):
+        try:
+            run = await tasks.get_run(run_id)
+        except KeyError:
+            typer.echo(f"No run {run_id}.", err=True)
+            return 1
+        if run.status is RunStatus.DONE:
+            typer.echo(f"Run {run_id} is already done.")
+            return 0
+        KillSwitch(runs_dir).stop(run_id, reason)
+        if DriveLock(runs_dir).is_driven(run_id):
+            typer.echo(f"Asked the session driving {run_id} to stop at its next model call.")
+            return 0
+        await mark_stopped(tasks, decisions, run_id, reason)
+    typer.echo(f"Stopped run {run_id}. Continue: agent-team resume {run_id}")
+    return 0
+
+
+async def _stats(config: Config, run_id: str | None) -> int:
+    """Print the stats of one run, or of every run; see ``stats``."""
+    runs_dir = config.paths.runs_dir
+    with _stores(config) as (tasks, _):
+        if run_id is not None:
+            try:
+                rows = run_table(await run_stats(run_id, tasks, runs_dir))
+            except KeyError:
+                typer.echo(f"No run {run_id}.", err=True)
                 return 1
-            line = await _read_line()
-            while line == "":
-                line = await _read_line()
-            if line is None:
-                if run_id:
-                    typer.echo(f"Run {run_id} is waiting. Continue: agent-team resume {run_id}")
+        else:
+            runs = await tasks.list_runs()
+            if not runs:
+                typer.echo("No runs yet.")
                 return 0
-            reply = await team.orchestrator.handle(line, run_id=run_id)
-
-
-async def _read_line() -> str | None:
-    """One line from stdin without blocking the event loop; None at end of input."""
-    typer.echo("> ", nl=False)
-    line = await asyncio.to_thread(sys.stdin.readline)
-    return line.strip() if line else None
-
-
-def _show(reply: Reply) -> None:
-    """Print a reply, with the run id the first time it is known."""
-    typer.echo(reply.text)
-    if reply.run_id:
-        typer.echo(f"[run {reply.run_id}: {reply.kind}]")
+            rows = overview_table([await run_stats(r.id, tasks, runs_dir) for r in runs])
+    name, *numbers = HEADER
+    # Numbers never wrap; on a narrow terminal the names fold instead.
+    columns = [
+        Column(name, overflow="fold"),
+        *(Column(h, justify="right", no_wrap=True) for h in numbers),
+    ]
+    table = Table(*columns, box=None, pad_edge=False)
+    for r in rows:
+        table.add_row(*r)
+    _console().print(table)
+    return 0
 
 
 def format_event(event: Event) -> str:
