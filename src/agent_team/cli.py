@@ -22,7 +22,6 @@ from typing import Annotated
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.table import Column, Table
 
 from agent_team import __version__
 from agent_team.app import App, build_app
@@ -47,7 +46,7 @@ from agent_team.memory import open_search
 from agent_team.memory.rank import line
 from agent_team.orchestrator.base import mark_stopped
 from agent_team.ui.session import Session
-from agent_team.ui.stats import FOOTNOTE, HEADER, heading, overview_table, run_stats, run_table
+from agent_team.ui.stats import FOOTNOTE, heading, layout, overview_table, run_stats, run_table
 
 app = typer.Typer(help="Multi-agent harness: Planning, PRD, Spec and Implementation.")
 memory_app = typer.Typer(help="Long-term memory from earlier runs.")
@@ -311,25 +310,17 @@ async def _stats(config: Config, run_id: str | None) -> int:
                 return 1
             console.print(heading(one), highlight=False, markup=False)
             rows = run_table(one)
-            extra: tuple[str, ...] = ()
+            titled = False
         else:
             runs = await tasks.list_runs()
             if not runs:
                 typer.echo(f"No runs yet in {config.paths.db_file()}.")
                 return 0
             rows = overview_table([await run_stats(r.id, tasks, runs_dir) for r in runs])
-            extra = ("title",)
-    name, *numbers = HEADER
-    # Ids, names and numbers never wrap; on a narrow terminal only a title is cut.
-    columns = [
-        Column(name, no_wrap=True),
-        *(Column(h, justify="right", no_wrap=True) for h in numbers),
-        *(Column(h, no_wrap=True, overflow="ellipsis") for h in extra),
-    ]
-    table = Table(*columns, box=None, pad_edge=False, collapse_padding=True)
-    for r in rows:
-        table.add_row(*r)
-    console.print(table)
+            titled = True
+    # Ids, names and numbers never wrap or cut; only a title is cut, or moves below.
+    for part in layout(rows, console.width, titled=titled):
+        console.print(part, highlight=False, markup=False)
     console.print(FOOTNOTE, style="dim", highlight=False, markup=False)
     return 0
 

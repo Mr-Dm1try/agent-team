@@ -3,8 +3,11 @@ retries and the first-pass audit rate, which leaves fixes out."""
 
 from __future__ import annotations
 
+import io
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+from rich.console import Console
 
 from agent_team.core.models import (
     AgentName,
@@ -15,7 +18,7 @@ from agent_team.core.models import (
     Task,
     TaskOrigin,
 )
-from agent_team.ui.stats import compute, heading, overview_table, run_table
+from agent_team.ui.stats import Stats, compute, heading, layout, overview_table, row, run_table
 
 T0 = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
 RUN = Run(id="run_1", title="Books API", request="Build a books API", workspace="/w")
@@ -142,12 +145,12 @@ def test_tables_show_each_run_and_agent() -> None:
     stats = compute(RUN, TASKS, EVENTS)
     assert heading(stats) == "run run_1 (active): Books API"
     rows = run_table(stats)
-    assert rows[0] == ("total", "4", "5,500", "550", "$0.0510", "2m00s", "4", "1", "67%")
+    assert rows[0] == ("total", "4", "5.5k", "550", "$0.0510", "2m00s", "4", "1", "67%")
     assert [r[0] for r in rows[1:]] == ["  auditor", "  engineer", "  orchestrator", "  product"]
     assert rows[3][-1] == "-"  # the orchestrator has no audited work
     overview = overview_table([stats, stats])
     assert overview[0][0] == "run_1" and overview[0][-1] == "Books API"
-    assert overview[2][:3] == ("all runs", "8", "11,000")
+    assert overview[2][:3] == ("all runs", "8", "11k")
 
 
 def test_a_run_with_no_events_has_zero_time() -> None:
@@ -168,3 +171,39 @@ def test_an_output_that_failed_validation_is_not_a_first_pass() -> None:
     assert (engineer.audited, engineer.first_pass) == (1, 0)
     # A pause isn't the agent's output failing.
     assert (product.audited, product.first_pass) == (1, 1)
+
+
+def test_token_counts_are_short() -> None:
+    shown = [row("r", Stats(input_tokens=n)).__getitem__(2) for n in (950, 5_500, 812_400)]
+    assert shown == ["950", "5.5k", "812k"]
+    assert [row("r", Stats(input_tokens=n))[2] for n in (1_150_000, 20_396_212)] == ["1.1M", "20M"]
+
+
+def test_the_all_runs_table_never_cuts_numbers_at_80_columns() -> None:
+    big = Stats(
+        calls=1234,
+        input_tokens=260_396_212,
+        output_tokens=1_512_334,
+        cost_usd=12.6912,
+        seconds=7385,
+        tasks=40,
+        retries=12,
+        audited=3,
+        first_pass=2,
+    )
+    title = "Build a library REST API with tests, then answer a long question about it"
+    rows = [(*row(f"run_3f855756d562{i:04d}", big), title) for i in range(13)]
+    rows += [(*row("all runs", big), ""), (*row("  orchestrator", big), "")]
+    for width in (80, 120, 160):
+        console = Console(width=width, record=True, file=io.StringIO(), color_system=None)
+        for part in layout(rows, width, titled=True):
+            console.print(part)
+        lines = console.export_text().splitlines()
+        assert all(len(line.rstrip()) <= width for line in lines)
+        for r in rows:
+            shown = next(line for line in lines if line.startswith(r[0] + " "))
+            assert shown[len(r[0]) :].split()[: len(r) - 2] == list(r[1:-1]), shown
+        if width == 80:  # no room for titles: each goes on its own line, cut to fit
+            assert sum(title[:20] in line for line in lines) == 13
+        else:
+            assert all(title[:20] in line for line in lines if line.startswith("run_"))

@@ -205,20 +205,9 @@ def test_stats_of_one_run_and_of_all_runs(config_file: Path) -> None:
     assert one.exit_code == 0, one.output
     lines = _plain(one).splitlines()
     assert lines[0].startswith(f"run {run_id} (waiting): ")
-    assert lines[1].split() == [
-        "calls",
-        "tokens",
-        "in",
-        "tokens",
-        "out",
-        "cost",
-        "time",
-        "tasks",
-        "retries",
-        "1st",
-        "pass",
-    ]
-    assert lines[2].startswith("total ")
+    assert lines[1].split() == ["tokens", "tokens", "1st"]
+    assert lines[2].split() == ["calls", "in", "out", "cost", "time", "tasks", "retries", "pass"]
+    assert lines[3].startswith("total ")
     assert any(line.startswith("  product ") for line in lines), one.output
     assert lines[-1].startswith("time: inside each agent's attempts")
     # At the default width the run id and agent names stay whole.
