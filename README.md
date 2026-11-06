@@ -54,6 +54,11 @@ uv run agent-team logs <run_id> --spans         # the run's trace tree
 uv run agent-team memory search "FastAPI tests"  # what earlier runs learned
 ```
 
+`config/default.yaml` runs the Researcher on local gpt-oss through Ollama. For a live
+demo, use `--config config/demo.yaml`: it is the same except that the Researcher runs on
+Claude Haiku, which is faster and steadier than local gpt-oss. In rehearsals a short
+research question took 1 to 2.5 minutes on Haiku against 4.5 to 21 on gpt-oss.
+
 `agent-team` reads `.env` from the folder you run it in. A variable already set in
 your shell wins over the file.
 

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from agent_team.core.config import DEFAULT_CONFIG, deep_merge, load_config
@@ -20,6 +21,32 @@ def test_default_config_loads() -> None:
     assert cfg.review is ReviewMode.AUTO_ASSUMPTIONS
     assert cfg.retry.delays_s == [1, 2, 4]
     assert cfg.prices["claude-haiku-5-5"].input_per_mtok == 0.10
+
+
+DEMO_CONFIG = DEFAULT_CONFIG.with_name("demo.yaml")
+
+
+def test_demo_config_differs_from_the_default_only_in_the_researcher_route() -> None:
+    default = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    demo = yaml.safe_load(DEMO_CONFIG.read_text(encoding="utf-8"))
+    assert demo["agents"].pop("researcher") == {
+        "provider": "anthropic",
+        "model": "claude-haiku-5-5",
+        "effort": "low",
+    }
+    default["agents"].pop("researcher")
+    assert demo == default
+
+
+def test_demo_config_loads_with_the_researcher_on_haiku() -> None:
+    cfg = load_config(DEMO_CONFIG)
+    route = cfg.route_for(AgentName.RESEARCHER)
+    assert (route.provider, route.model, route.effort) == ("anthropic", "claude-haiku-5-5", "low")
+    assert cfg.context_budget(AgentName.RESEARCHER) == cfg.defaults.context_budget
+    default = load_config(DEFAULT_CONFIG)
+    for agent in AgentName:
+        if agent is not AgentName.RESEARCHER:
+            assert cfg.route_for(agent) == default.route_for(agent)
 
 
 def test_default_config_turns_thinking_on_with_effort_per_agent() -> None:
