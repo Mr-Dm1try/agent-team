@@ -680,7 +680,7 @@ def _results(request: LLMRequest) -> list[ToolResultBlock]:
 
 
 def _keeps_reading() -> Responder:
-    """A model that reads the run's history call after call, as Haiku did in rehearsal,
+    """A model that reads the run's history call after call, as a small model can,
     and then tries to answer an escalation from long ago; it replies only when it may
     not call a tool, from what it read."""
     reads: list[tuple[str, dict[str, Any]]] = [
