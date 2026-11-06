@@ -106,6 +106,8 @@ class Dispatcher:
     research: ResearchLimits | None = None
     #: The tool calls of earlier attempts, summed up for a retry after an error.
     tool_log: ToolCallLog | None = None
+    #: The stronger model's name: a task on it gets a compact envelope.
+    stronger_model: str | None = None
 
     async def dispatch(self, task: Task) -> AgentResult:
         """Run one attempt of ``task`` and move it on; never raises for agent errors."""
@@ -353,15 +355,24 @@ class Dispatcher:
                 wanted = set(task.finding_ids)
                 findings = [f for f in verdict.findings if not wanted or f.id in wanted]
 
+        # The stronger model starts small, since it costs many times as much per token:
+        # the objective, inputs, last output, findings and feedback on them, without
+        # memories, the harness's notes, the last attempt's tool trail or upstream diffs.
+        compact = self.stronger_model is not None and task.model == self.stronger_model
         memories: list[str] = []
-        if self.memory is not None:
+        if self.memory is not None and not compact:
             memories = await self.memory(task, run, inputs)
         constraints = self.constraints(task, run) if self.constraints else []
+        if compact:
+            feedback = [fb for fb in feedback if fb.source is not FeedbackSource.HARNESS]
+        diff = None
+        if previous is not None and not compact:
+            diff = await self._upstream_diff(run.id, previous, inputs)
 
         return TaskEnvelope(
             task=task,
             run=run,
-            previous_attempt=await self._previous_attempt(task),
+            previous_attempt=None if compact else await self._previous_attempt(task),
             inputs=inputs,
             constraints=constraints,
             memories=memories,
@@ -369,7 +380,7 @@ class Dispatcher:
             input_feedback=input_feedback,
             findings=findings,
             previous_output=previous,
-            upstream_diff=await self._upstream_diff(run.id, previous, inputs) if previous else None,
+            upstream_diff=diff,
             research_allowed=self.research is None
             or self.research.refusal(task, all_tasks) is None,
             trace_id=task.trace_id or run.trace_id,

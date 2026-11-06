@@ -102,13 +102,17 @@ class Gateway:
     # --- routing -----------------------------------------------------------------------
 
     def context_budget(self, agent: AgentName, task_id: str | None = None) -> int:
-        """Max prompt tokens for the route the agent's next call tries first: its own
+        """Max prompt tokens for the route the agent's next call tries first: a task
+        override's own budget (such as the stronger model's cap), else the agent's own
         budget on its own route, else the budget of the fallback standing in for it
         (when its provider is down)."""
         primary = self._route(agent, task_id)
         chain = self._chain(agent, task_id)
         if chain and chain[0] != (primary.provider, primary.model):
             return self.config.fallback_budget(chain[0][0])
+        override = self._overrides.get(task_id) if task_id else None
+        if override is not None and override.context_budget is not None:
+            return override.context_budget
         return self.config.context_budget(agent)
 
     def providers_for(self, agent: AgentName, task_id: str | None) -> list[str]:

@@ -108,11 +108,19 @@ def test_ollama_route_must_leave_room_for_the_reply(tmp_path: Path) -> None:
         load_config(path)
 
 
-def test_ollama_stronger_model_is_checked_against_every_agents_budget(tmp_path: Path) -> None:
+def test_ollama_stronger_model_is_checked_against_the_budget_it_runs_with(
+    tmp_path: Path,
+) -> None:
+    # Its own budget caps its prompt; without one it runs with each agent's budget.
     path = tmp_path / "c.yaml"
     path.write_text(
         "defaults: {provider: fake, model: m, context_budget: 90000}\n"
         "stronger_model: {provider: ollama, model: o, context_budget: 20000}\n"
+    )
+    assert load_config(path).stronger_model is not None
+    path.write_text(
+        "defaults: {provider: fake, model: m, context_budget: 90000}\n"
+        "stronger_model: {provider: ollama, model: o}\n"
     )
     with pytest.raises(ValueError, match="context_budget 90000"):
         load_config(path)

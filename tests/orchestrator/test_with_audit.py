@@ -288,3 +288,20 @@ async def test_research_requests_and_the_stronger_model_stay_within_the_limit(
     assert all("can't ask for more research" in prompts[n] for n in (3, 4))
     kinds = [d.kind for d in team.decisions.items if d.task_id == planned.id]
     assert kinds.count(DecisionKind.STRONGER_MODEL) == 1
+
+
+async def test_the_stronger_model_decision_records_its_prompt_cap_and_cost(
+    tmp_path: Path,
+) -> None:
+    team = await make_team(tmp_path, code_policy=True)
+    for item in ("REQ-1", "REQ-2", "REQ-3"):
+        team.auditor.fail_next["prd"].append(_blocker("R3", item))
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "done", reply.text
+    [stronger] = [d for d in team.decisions.items if d.kind is DecisionKind.STRONGER_MODEL]
+    cap = team.llm.context_budget(AgentName.PRODUCT, stronger.task_id)
+    assert stronger.inputs["prompt_cap_tokens"] == cap
+    # The default routing file prices the stronger model at $2 per million prompt tokens.
+    assert stronger.inputs["max_prompt_usd"] == round(cap * 2.0 / 1_000_000, 4)
+    prd = next(t for t in await team.tasks.list_tasks(stronger.run_id) if t.output_kind == "prd")
+    assert prd.attempt == 4 and prd.max_attempts == 4 and prd.status is TaskStatus.DONE

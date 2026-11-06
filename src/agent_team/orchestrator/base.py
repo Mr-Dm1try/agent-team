@@ -86,6 +86,8 @@ class OrchestratorConfig:
     max_check_attempts: int = 3
     max_upstream_reruns: int = 2
     research: ResearchLimits = field(default_factory=ResearchLimits)
+    #: The stronger model's price per million prompt tokens, for its decision's cost.
+    stronger_input_usd_per_mtok: float | None = None
     max_loops: int = 500  # safety valve for drive()
 
 

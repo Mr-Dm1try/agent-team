@@ -252,9 +252,11 @@ async def build_app(
         auditor=auditor,
         research=research_limits,
         tool_log=tool_log,
+        stronger_model=config.stronger_model.model if config.stronger_model else None,
     )
+    stronger = config.stronger_model
+    stronger_price = config.prices.get(stronger.model) if stronger else None
     if policy is None:
-        stronger = config.stronger_model
         limits = PolicyLimits(
             max_upstream_reruns=config.limits.max_upstream_reruns,
             stronger_model=stronger.model if stronger else PolicyLimits.stronger_model,
@@ -283,6 +285,7 @@ async def build_app(
             max_check_attempts=config.limits.max_check_attempts,
             max_upstream_reruns=config.limits.max_upstream_reruns,
             research=research_limits,
+            stronger_input_usd_per_mtok=stronger_price.input_per_mtok if stronger_price else None,
         ),
         policy=policy,
     )

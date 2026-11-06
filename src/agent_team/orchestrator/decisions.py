@@ -33,9 +33,12 @@ class DecisionsMixin(OrchestratorBase):
 
     async def _apply(self, run: Run, d: Decision, verdict: Verdict | None = None) -> None:
         """Record the decision, then carry it out on the task store."""
-        await self._record(d)
         task_id = d.inputs.get("task_id") or d.task_id
         task = await self.tasks.get_task(task_id) if isinstance(task_id, str) else None
+        route: object = None
+        if d.kind is DecisionKind.STRONGER_MODEL and task is not None:
+            d, route = self._route_to_stronger(d, task)
+        await self._record(d)
 
         if d.kind is DecisionKind.RETRY and task is not None:
             if task.status is TaskStatus.AUDITING:
@@ -46,7 +49,6 @@ class DecisionsMixin(OrchestratorBase):
                 await self.tasks.transition(task.id, TaskStatus.ESCALATED, reason=d.reason)
                 await self._emit_task(EventName.TASK_ESCALATED, task, {"reason": d.reason})
         elif d.kind is DecisionKind.STRONGER_MODEL and task is not None:
-            route = self.llm.use_stronger_model(task.id)
             model = d.inputs.get("model")
             task.model = model if isinstance(model, str) else str(route)
             task.max_attempts = max(task.max_attempts, task.attempt + 1)
@@ -98,6 +100,18 @@ class DecisionsMixin(OrchestratorBase):
                 await self.tasks.update_task(task)
         elif d.kind is DecisionKind.STOP:
             await self._set_status(run.id, RunStatus.STOPPED)
+
+    def _route_to_stronger(self, d: Decision, task: Task) -> tuple[Decision, object]:
+        """Send the task's calls to the stronger model. Returns the route, and the
+        decision with what its attempt may cost: the prompt cap it runs with and, when
+        the model has a price, the most one call's prompt can cost."""
+        route = self.llm.use_stronger_model(task.id)
+        cap = self.llm.context_budget(task.agent, task.id)
+        inputs: dict[str, object] = {**d.inputs, "prompt_cap_tokens": cap}
+        price = self.config.stronger_input_usd_per_mtok
+        if price is not None:
+            inputs["max_prompt_usd"] = round(cap * price / 1_000_000, 4)
+        return d.model_copy(update={"inputs": inputs}), route
 
     async def _upstream_rerun(self, run: Run, d: Decision, task: Task | None) -> None:
         """Reopen the producer of a faulty upstream artifact, with the finding as feedback, and

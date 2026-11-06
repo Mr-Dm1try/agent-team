@@ -8,7 +8,9 @@ agents:
   researcher: {provider: ollama, model: "gpt-oss:20b", context_budget: 20000, effort: medium}
   architect: {provider: anthropic, model: claude-haiku-5-5, effort: medium}
   engineer: {provider: anthropic, model: claude-haiku-5-5, effort: medium}
-stronger_model: {provider: anthropic, model: claude-sonnet-5-5}
+# The stronger model gets one last attempt at a task that kept failing. Its prompt is
+# capped well below the defaults' budget, since it costs 20 times as much per token.
+stronger_model: {provider: anthropic, model: claude-sonnet-5-5, context_budget: 30000}
 fallbacks: [anthropic, ollama]
 # Model each provider uses when it stands in for another one.
 fallback_models: {anthropic: claude-haiku-5-5, ollama: "gpt-oss:20b"}

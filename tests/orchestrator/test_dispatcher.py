@@ -209,3 +209,50 @@ async def test_feedback_reaches_only_its_own_line_of_work(tmp_path: Path) -> Non
     assert [f.text for f in fix_view.feedback] == ["S2 on a.py", "keep the fix small"]
     b_view = await team.dispatcher.build_envelope(b, run)
     assert [f.text for f in b_view.feedback] == ["R6 on b"]
+
+
+async def test_the_stronger_model_gets_a_compact_envelope(tmp_path: Path) -> None:
+    from agent_team.core.models import Feedback, FeedbackSource
+
+    team = await make_team(tmp_path)
+    run = await team.orch.start_run("Build a books API")
+    team.dispatcher.stronger_model = "claude-sonnet-5-5"
+    remembered: list[str] = []
+
+    async def memory(task: Task, run: Any, inputs: Any) -> list[str]:
+        """One memory for every task; records who asked."""
+        remembered.append(task.id)
+        return ["an old lesson"]
+
+    team.dispatcher.memory = memory
+    failed = "OutputValidationError: no files"
+    task = await team.tasks.create_task(
+        Task(
+            run_id=run.id,
+            phase=Phase.PRD,
+            agent=AgentName.PRODUCT,
+            objective="PRD",
+            output_kind="prd",
+            attempt=3,
+            previous_error=failed,
+        )
+    )
+    for source, text in (
+        (FeedbackSource.HARNESS, "No more research will be run for this task"),
+        (FeedbackSource.USER_ANSWER, "Use SQLite"),
+        (FeedbackSource.AUDITOR, "R3 on REQ-1"),
+    ):
+        await team.feedback.add(
+            run.id, Feedback(artifact=None, task_id=task.id, source=source, text=text)
+        )
+
+    usual = await team.dispatcher.build_envelope(task, run)
+    assert usual.memories == ["an old lesson"] and usual.previous_attempt is not None
+    assert len(usual.feedback) == 3
+
+    task = await team.tasks.update_task(task.model_copy(update={"model": "claude-sonnet-5-5"}))
+    compact = await team.dispatcher.build_envelope(task, run)
+    assert compact.memories == [] and compact.previous_attempt is None
+    assert compact.upstream_diff is None
+    assert [f.text for f in compact.feedback] == ["Use SQLite", "R3 on REQ-1"]
+    assert remembered == [task.id]  # memory isn't even searched for the stronger model
