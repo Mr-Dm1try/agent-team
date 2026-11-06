@@ -136,6 +136,28 @@ async def test_time_cap(sleeps: Sleeps) -> None:
     assert info.value.limit == "max_minutes_per_run"
 
 
+async def test_no_retry_or_fallback_starts_after_the_time_cap(sleeps: Sleeps) -> None:
+    """A slow call that fails after the cap has tripped is not retried or handed to
+    the fallback: the run stops instead of spending more."""
+    clock = Clock()
+    config = make_config(budget={"max_minutes_per_run": 30}, fallbacks=["fake", "backup"])
+
+    class Slow(FakeProvider):
+        """Fails after the run's 30 minutes are up, as a long Ollama call can."""
+
+        async def complete(self, request: LLMRequest, *, model: str, effort: Effort | None = None):  # type: ignore[no-untyped-def]
+            """Move the clock past the cap, then fail."""
+            clock.now = 31 * 60
+            raise TransientLLMError("ReadTimeout", provider="fake")
+
+    backup = FakeProvider(["too late"], name="backup")
+    gw = Gateway(config, {"fake": Slow([]), "backup": backup}, sleep=sleeps, clock=clock)
+    with pytest.raises(BudgetExceeded) as info:
+        await gw.complete(request())
+    assert info.value.limit == "max_minutes_per_run"
+    assert backup.remaining == 1 and sleeps.calls == []
+
+
 async def test_custom_before_hook_can_block(sleeps: Sleeps, bus: InMemoryEventBus) -> None:
     from agent_team.core.models import HookOutcome
 

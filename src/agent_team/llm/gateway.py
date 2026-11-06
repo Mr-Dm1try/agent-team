@@ -241,6 +241,18 @@ class Gateway:
             data=data,
         )
 
+    def check_run(self, run_id: str) -> None:
+        """Raise RunStopped when the run has a stop flag, or BudgetExceeded once it has
+        reached a cap. Checked before every try, so a retry or fallback never starts
+        after the stop, and by the tool loop before it runs a reply's tool calls."""
+        if self.kill_switch is not None:
+            self.kill_switch.check(run_id)
+        hit = self.budget.exceeded(run_id)
+        if hit is not None:
+            self.budget.usage(run_id).blocked += 1
+            limit, reason = hit
+            raise BudgetExceeded(reason, limit=limit)
+
     async def _preflight(self, request: LLMRequest) -> list[tuple[str, str]]:
         """Check the kill switch, seed the run's spend, run before hooks; return the routes."""
         if self.kill_switch is not None:
@@ -352,6 +364,7 @@ class Gateway:
         if unreachable:
             await self._mark_down(request, provider, exc)
         if will_retry:
+            self.check_run(request.run_id)  # no wait for a retry the stop would block
             usage.retries += 1
             await self.sleep(self.config.retry.delays_s[try_no])
         return will_retry
@@ -420,8 +433,7 @@ class Gateway:
                 provider = self.providers[name]
                 try_no = 0
                 while True:
-                    if self.kill_switch is not None:
-                        self.kill_switch.check(request.run_id)
+                    self.check_run(request.run_id)
                     try:
                         async with self._global, self._slot(name):
                             fault = self._inject(request.run_id, name)
@@ -460,8 +472,7 @@ class Gateway:
                 provider = self.providers[name]
                 try_no = 0
                 while True:
-                    if self.kill_switch is not None:
-                        self.kill_switch.check(request.run_id)
+                    self.check_run(request.run_id)
                     sent = False
                     try:
                         async with self._global, self._slot(name):

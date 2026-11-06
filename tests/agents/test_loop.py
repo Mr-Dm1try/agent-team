@@ -10,6 +10,7 @@ from agent_team.agents import Engineer, Product
 from agent_team.agents.compaction import Compactor
 from agent_team.agents.loop import INTERRUPTED_NOTE, LoopSettings
 from agent_team.core.artifacts import CodeChange
+from agent_team.core.errors import BudgetExceeded
 from agent_team.core.interfaces import AgentContext
 from agent_team.core.models import (
     AgentName,
@@ -134,7 +135,7 @@ async def test_blocked_and_unknown_tools_return_errors(tmp_path: Path) -> None:
         {
             AgentName.ENGINEER: [
                 tool_call("write_file", {"path": "app.py", "content": "x"}),
-                tool_call("teleport", {}),
+                tool_call("search", {"q": "mcp"}),
                 "give up",
                 "give up",
                 "give up",
@@ -146,8 +147,24 @@ async def test_blocked_and_unknown_tools_return_errors(tmp_path: Path) -> None:
     assert isinstance(blocked, ToolResultBlock) and blocked.is_error
     assert "blocked by rule S5" in blocked.content
     unknown = llm.requests[2].messages[-1].content[0]
-    assert isinstance(unknown, ToolResultBlock) and "unknown tool" in unknown.content
+    assert isinstance(unknown, ToolResultBlock) and unknown.is_error
+    assert "unknown tool 'search'; available tools: " in unknown.content
+    assert "read_file" in unknown.content and "write_file" in unknown.content
     assert not (Path(env.run.workspace) / "app.py").exists()
+
+
+async def test_a_reply_after_the_budget_stop_starts_no_tool_turn(tmp_path: Path) -> None:
+    env = envelope(tmp_path, AgentName.ENGINEER, "code_change")
+    llm = FakeLLM({AgentName.ENGINEER: [tool_call("write_file", {"path": "a.py", "content": "x"})]})
+    llm.stop_tools = BudgetExceeded("run has been calling models for 30.2 min", limit="time")
+    checkpoints = FakeCheckpoints()
+    result = await Engineer().run(env, ctx(llm, FakeBus(), checkpoints))
+    assert result.status is ResultStatus.ERROR and result.error_type == "BudgetExceeded"
+    assert not (Path(env.run.workspace) / "a.py").exists()
+    # The reply isn't kept, so a resumed attempt asks again rather than finding
+    # tool calls that look interrupted.
+    saved = [m for steps in checkpoints.steps.values() for _, msgs in steps for m in msgs]
+    assert all(m.role == "user" for m in saved)
 
 
 async def test_auto_assumptions_mode_requires_assumptions(tmp_path: Path) -> None:

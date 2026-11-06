@@ -69,6 +69,9 @@ class FakeLLM:
         else:
             self.overrides[task_id] = route
 
+    def check_run(self, run_id: str) -> None:
+        pass
+
 
 class FakeTaskStore:
     def __init__(self) -> None:

@@ -170,3 +170,7 @@ class LLMClient(Protocol):
     def set_override(self, task_id: str, route: Any) -> None:
         """Set or, with ``None``, clear a per-task route override."""
         ...
+
+    def check_run(self, run_id: str) -> None:
+        """Raise RunStopped or BudgetExceeded when the run must stop; else nothing."""
+        ...

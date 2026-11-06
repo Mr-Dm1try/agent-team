@@ -66,6 +66,19 @@ def test_run_answers_questions_from_stdin(config_file: Path) -> None:
     assert "'Build a books API' is done." in result.output
 
 
+def test_a_run_out_of_budget_says_paused_as_the_stats_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.yaml"
+    config = e2e_config(tmp_path, budget={"max_tokens_per_run": 200})
+    path.write_text(yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8")
+    monkeypatch.setattr(cli, "_factory", _asking_team())
+    result = CliRunner().invoke(cli.app, ["run", "Build a books API", "-c", str(path)], input="")
+    output = _plain(result)
+    assert f"[run {_run_id(output)}: paused]" in output, output
+    assert ": stopped]" not in output
+
+
 def test_a_run_left_waiting_resumes_and_its_logs_read_back(config_file: Path) -> None:
     runner = CliRunner()
     first = runner.invoke(cli.app, ["run", "Build a books API", "-c", str(config_file)], input="")

@@ -367,6 +367,11 @@ class ToolLoop[M: BaseModel]:
 
             messages = await self._maybe_compact(messages)
             response = await self._complete(messages)
+            if response.tool_calls:
+                # A reply that arrived after the run stopped or ran out of budget starts
+                # no tool turn. It isn't kept either, so the resumed attempt asks again
+                # instead of finding tool calls that look interrupted.
+                self.llm.check_run(self.run.id)
             messages.append(Message(role="assistant", content=response.content))
             await self._save(messages)
 
