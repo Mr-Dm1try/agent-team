@@ -357,7 +357,8 @@ async def test_a_change_typed_while_the_team_works_waits_until_it_stops(
     assert code == 0, text
     held = text.index(HELD_REPLY)
     # Held while the team worked, then sent once the run was done and shown.
-    assert held < text.index("Audit report:") < text.index("> paginate the list")
+    report = text.index("Audit report:")
+    assert held < report < text.index("> paginate the list", report)
     assert "Go ahead? (yes or no)" in text
     assert "prd v1 → v2:" in text.split("What changed:\n", 1)[1]
     assert "Accepted. Run" in text

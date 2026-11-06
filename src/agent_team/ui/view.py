@@ -264,6 +264,18 @@ class RunView:
         except Exception:
             self._fall_back("start the live view")
 
+    def line_typed(self) -> None:
+        """The user pressed Enter under the live tree, and the terminal moved the
+        cursor down a line: move it back up, so the next redraw lands in place instead
+        of leaving the tree's top line behind."""
+        if self._live is None or not self.console.is_terminal:
+            return
+        try:
+            self.console.file.write("\x1b[1A")
+            self.console.file.flush()
+        except Exception:
+            self._fall_back("follow a typed line")
+
     def stop(self) -> None:
         """Stop redrawing, which clears the live frame, then print the tree once if it
         changed since it was last printed."""

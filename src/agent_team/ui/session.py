@@ -175,6 +175,8 @@ class Session:
                 if work.done():
                     return work.result()
                 line = self._take()
+                if line is not None:
+                    self.view.line_typed()
                 if line:
                     await self._guarded(line)
         finally:
@@ -199,7 +201,9 @@ class Session:
             await self._while_working(line, self._driving)
         except Exception:
             log.exception("couldn't handle a line typed while the team worked")
-            self._under_view("I couldn't read that just now. Send it again once the team stops.")
+            self._under_view(
+                line, "I couldn't read that just now. Send it again once the team stops."
+            )
 
     async def _while_working(self, line: str, run_id: str | None) -> None:
         """One line typed while the team works: "stop" stops the run at its next model
@@ -208,22 +212,24 @@ class Session:
         until the team stops."""
         if run_id is None:
             self._held.append(line)
-            self._under_view("I'll take that up as soon as the team stops.")
+            self._under_view(line, "I'll take that up as soon as the team stops.")
             return
         if says_stop(line):
             self.team.kill_switch.stop(run_id, STOP_REASON)
             self._stopping = run_id
-            self._under_view(STOPPING)
+            self._under_view(line, STOPPING)
             return
         reply = await self.team.orchestrator.handle_while_working(line, run_id)
         if reply.held:
             self._held.append(line)
-        self._under_view(reply.text)
+        self._under_view(line, reply.text)
 
-    def _under_view(self, text: str) -> None:
-        """Print text under the live view: the view stops (printing the tree once if it
-        changed), the text prints, and the view starts again."""
+    def _under_view(self, line: str, text: str) -> None:
+        """Print the typed line and the reply to it under the live view: the view stops
+        (printing the tree once if it changed), they print, and the view starts again.
+        The line is echoed because a redraw of the live view clears what was typed."""
         self.view.stop()
+        self.say(f"> {line}")
         self.say(text)
         self.view.start(hint=TYPE_HINT)
 
