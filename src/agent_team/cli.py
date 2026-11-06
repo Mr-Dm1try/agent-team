@@ -2,8 +2,8 @@
 search memory.
 
 ``run`` and ``resume`` show the run live and talk to the team (see ui/session.py).
-While the run waits on you, each line typed is sent as a message; end the input
-(Ctrl-D) to leave the run waiting, and pick it up later with ``resume``. When it is
+Each line typed is sent as a message, while the team works too ("stop" stops it); end
+the input (Ctrl-D) to leave the run waiting, and pick it up later with ``resume``. When it is
 done you accept it or describe a change.
 
 At startup ``entry`` reads ``.env`` from the current folder, so the API key can live
