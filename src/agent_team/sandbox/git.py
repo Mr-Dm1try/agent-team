@@ -25,14 +25,14 @@ from agent_team.core.artifacts import ArtifactRef
 from agent_team.core.errors import SandboxError
 from agent_team.core.interfaces import AfterHook, TaskStore
 from agent_team.core.models import AgentName, Event
-from agent_team.sandbox.base import DEPS_DIR, ensure_gitignore
+from agent_team.sandbox.base import ensure_gitignore
 
 log = logging.getLogger(__name__)
 
 #: ELF type of a core file (``ET_CORE``).
 _ET_CORE = 4
-#: Folders never searched for core dumps.
-_SKIP_DIRS = frozenset({".git", DEPS_DIR})
+#: Paths a core dump can have: ``core`` or ``core.*`` in any folder.
+_CORE_PATHS = (":(glob)**/core", ":(glob)**/core.*")
 
 
 def is_core_dump(path: Path) -> bool:
@@ -49,18 +49,6 @@ def is_core_dump(path: Path) -> bool:
         return False
     kind = int.from_bytes(head[16:18], "little" if head[5] == 1 else "big")
     return kind == _ET_CORE
-
-
-def core_dumps(workspace: Path) -> list[str]:
-    """The workspace-relative paths of the core dumps in the workspace."""
-    found: list[str] = []
-    for root, dirs, files in os.walk(workspace):
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
-        for name in files:
-            path = Path(root, name)
-            if is_core_dump(path):
-                found.append(path.relative_to(workspace).as_posix())
-    return sorted(found)
 
 
 _GIT_CONFIG = (
@@ -130,17 +118,30 @@ class WorkspaceGit:
         """Commit everything in the workspace for one artifact version, tag it and
         return the commit sha. A version with no file changes still gets a commit."""
         await self.ensure_repo()
-        await self._git("add", "-A")
-        dumps = await asyncio.to_thread(core_dumps, self.workspace)
+        dumps = await self.core_dumps()
+        await self._git("add", "-A", "--", ".", *(f":(exclude,literal){d}" for d in dumps))
         if dumps:
             log.warning("leaving core dumps out of the commit: %s", ", ".join(dumps))
-            await self._git("rm", "-q", "--cached", "--ignore-unmatch", "--", *dumps)
+            # One a version before this committed leaves the history from here on.
+            await self._git(
+                "rm", "-q", "--cached", "--ignore-unmatch", "--", *(f":(literal){d}" for d in dumps)
+            )
         message = f"{ref.kind} v{ref.version}: {subject}".strip()
         if body:
             message += f"\n\n{body}"
         await self._git("commit", "-q", "--allow-empty", "-m", message)
         await self._git("tag", "-f", version_tag(ref))
         return (await self._git("rev-parse", "HEAD")).strip()
+
+    async def core_dumps(self) -> list[str]:
+        """The workspace's core dumps that git would see (tracked, or untracked and not
+        ignored), found by name through git and confirmed by their ELF header, so
+        nothing is hashed or walked that the commit wouldn't touch."""
+        out = await self._git(
+            "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *_CORE_PATHS
+        )
+        names = {n for n in out.split("\0") if n}
+        return sorted(n for n in names if is_core_dump(self.workspace / n))
 
     async def diff(self, old: ArtifactRef, new: ArtifactRef) -> str:
         """The workspace diff between two committed versions."""

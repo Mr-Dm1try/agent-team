@@ -115,6 +115,10 @@ class OrchestratorBase:
         """The task sweep; the mixins call it and Orchestrator implements it."""
         raise NotImplementedError  # the task sweep lives in Orchestrator
 
+    async def _apply(self, run: Run, d: Decision, verdict: Verdict | None = None) -> None:
+        """Carry out one decision; the mixins call it and DecisionsMixin implements it."""
+        raise NotImplementedError  # decisions are applied in DecisionsMixin
+
     async def drive(self, run_id: str) -> Reply:
         """Run until the run is done, waits on the user, or stops; see Orchestrator."""
         raise NotImplementedError  # the drive loop lives in Orchestrator

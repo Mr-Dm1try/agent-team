@@ -453,7 +453,7 @@ def decide_error(
     """Decisions for a task the dispatcher escalated after an attempt whose own output
     failed validation: no attempts left, or the same failure as the attempt before (no
     progress). One last attempt on the stronger model, then the user is asked. Any
-    other error gets none, and the orchestrator asks the user as before."""
+    other error gets none, and the orchestrator asks the user."""
     error = task.last_error
     if task.status is not TaskStatus.ESCALATED or not is_own_output_error(error):
         return []

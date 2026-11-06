@@ -28,6 +28,7 @@ from agent_team.core.models import (
     Verdict,
 )
 from agent_team.llm.types import ContentBlock, LLMRequest
+from agent_team.orchestrator.policy import SimplePolicy
 from orchestrator.harness import make_team
 
 
@@ -228,7 +229,7 @@ async def test_research_requests_stop_at_the_run_cap(tmp_path: Path) -> None:
     assert "can't ask for more research" in second
 
 
-class UpstreamPolicy:
+class UpstreamPolicy(SimplePolicy):
     """Fails QA once and blames the spec, to drive an upstream re-run."""
 
     def __init__(self) -> None:
@@ -277,7 +278,7 @@ async def test_upstream_rerun_supersedes_and_rebuilds_downstream(tmp_path: Path)
     assert "Your previous output spec@v1" in arch[1].messages[0].content[0].text  # type: ignore[union-attr]
 
 
-class FixPolicy:
+class FixPolicy(SimplePolicy):
     """Sends QA's first finding back to the Engineer, and re-runs QA after the fix."""
 
     def __init__(self) -> None:

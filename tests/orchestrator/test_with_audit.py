@@ -17,8 +17,10 @@ from agent_team.core.models import (
     DecisionKind,
     EventName,
     Finding,
+    Phase,
     RuleScope,
     Severity,
+    Task,
     TaskOrigin,
     TaskStatus,
     Verdict,
@@ -205,3 +207,32 @@ async def test_invalid_output_after_the_stronger_model_asks_the_user(tmp_path: P
     assert asks[-1].rule == "policy.ask_after_stronger_model"
     question = next(t for t in tasks if t.agent is AgentName.USER and t.parent_task_id == code.id)
     assert question.id in code.depends_on
+
+
+async def test_an_escalation_left_by_a_crash_still_gets_the_stronger_model(
+    tmp_path: Path,
+) -> None:
+    # The process stopped right after the dispatcher escalated the task.
+    team = await make_team(tmp_path, code_policy=True)
+    run = await team.orch.start_run("Build a books API")
+    error = "OutputValidationError: output was cut off: files_written: no files listed"
+    task = await team.tasks.create_task(
+        Task(
+            run_id=run.id,
+            phase=Phase.IMPLEMENTATION,
+            agent=AgentName.ENGINEER,
+            objective="Build it",
+            output_kind="code_change",
+            attempt=2,
+            last_error=error,
+            previous_error=error,
+        )
+    )
+    for status in (TaskStatus.READY, TaskStatus.RUNNING, TaskStatus.ESCALATED):
+        await team.tasks.transition(task.id, status, reason="test")
+    assert await team.orch._settle(run, await team.tasks.list_tasks(run.id))
+    task = await team.tasks.get_task(task.id)
+    assert task.status is TaskStatus.READY and task.max_attempts == 3
+    kinds = [d.kind for d in team.decisions.items if d.task_id == task.id]
+    assert kinds == [DecisionKind.NO_PROGRESS, DecisionKind.STRONGER_MODEL]
+    assert task.id in team.llm.overrides

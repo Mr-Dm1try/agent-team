@@ -49,8 +49,8 @@ CUT_OFF_NOTE = (
 )
 #: The first repair error for a final reply cut off at the output token limit.
 CUT_OFF_REPLY = (
-    "the reply hit the output token limit; reply with shorter JSON that lists file "
-    "paths, not file contents"
+    "the reply hit the output token limit; reply with shorter JSON that reports what "
+    "you did, such as the paths of files you wrote, without repeating their contents"
 )
 INTERRUPTED_NOTE = (
     "This tool call was running when the process stopped. It was not repeated because "
@@ -437,6 +437,6 @@ def _repair_prompt(errors: list[str], model: type[BaseModel]) -> str:
     listed = "\n".join(f"- {e}" for e in errors[:20])
     return (
         f"Your final answer did not validate as {model.__name__}:\n{listed}\n"
-        "If fixing it needs a tool call first, such as writing a file, make that call. "
+        "If fixing it needs a tool call first, make that call. "
         "Then reply with only the corrected JSON object, no prose and no code fences."
     )

@@ -204,17 +204,19 @@ async def test_a_pypi_project_reads_as_its_versions(ctx: ToolContext) -> None:
     out = await tools["web_fetch"]({"url": "https://pypi.org/pypi/mcp/json"}, ctx)
     assert not out.is_error
     assert "PyPI project mcp: latest version 1.30.0 (requires Python >=3.10)" in out.content
-    assert "Released versions, oldest first (3): 1.2.0, 1.3.0 (yanked), 1.30.0" in out.content
+    assert "Released versions, newest first (3): 1.30.0, 1.3.0 (yanked), 1.2.0" in out.content
     assert "pyjwt[crypto]>=2.10" in out.content and "README" not in out.content
 
 
 def test_json_keeps_its_shape_and_a_cut_pypi_document_keeps_its_versions() -> None:
-    other = readable_json(json.dumps({"a": "x" * 1000, "b": [1, 2]}))
+    small = json.dumps({"a": "x" * 1000, "b": [1, 2]})
+    assert readable_json(small, 20_000) == small  # it fits: as it came
+    other = readable_json(small, 500)
     assert json.loads(other)["b"] == [1, 2] and "700 chars cut" in other
-    cut = json.dumps(PYPI)[:-40]  # the size cap stopped it mid-document
-    assert "latest version 1.30.0" in readable_json(cut)
-    assert "1.30.0, 1.2.0, 1.3.0" in readable_json(cut)
-    assert readable_json("not json") == "not json"
+    cut = json.dumps(PYPI)[:-40]  # the byte cap stopped it mid-document
+    assert "latest version 1.30.0" in readable_json(cut, 20_000)
+    assert "1.30.0, 1.2.0, 1.3.0" in readable_json(cut, 20_000)
+    assert readable_json("not json", 20_000) == "not json"
 
 
 async def test_fetch_errors_reach_the_model(ctx: ToolContext) -> None:

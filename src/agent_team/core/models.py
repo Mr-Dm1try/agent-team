@@ -526,12 +526,14 @@ class MemoryMatch(Contract):
     or the memory has no vector, ``bm25`` is SQLite's score made positive (higher is
     better, 0 when no query term matched) and ``words`` the share of words the two
     have in common, 0 to 1, which still counts when there are too few memories for
-    BM25 to weigh terms."""
+    BM25 to weigh terms. ``covered`` is the share of the memory's own words that the
+    query has, 0 to 1: how much of what it says is about this task."""
 
     memory: Memory
     cosine: float | None = None
     bm25: float = 0.0
     words: float = 0.0
+    covered: float = 0.0
 
 
 class EventName(StrEnum):

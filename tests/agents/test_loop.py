@@ -600,4 +600,7 @@ async def test_repair_prompt_allows_a_tool_call_first(tmp_path: Path) -> None:
     assert result.status is ResultStatus.OK
     repair = llm.requests[1].messages[-1].content[0]
     text = getattr(repair, "text", "")
-    assert "write the spec's files with write_file" in text and "tool call first" in text
+    assert (
+        "write the spec's files with write_file" in text
+        and "tool call first, make that call" in text
+    )

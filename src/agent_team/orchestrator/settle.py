@@ -1,6 +1,7 @@
 """Settling the run between dispatch rounds: retries go back to ready, agents'
 questions go to the user, research requests become Researcher tasks, and escalated
-tasks ask the user for guidance."""
+tasks get the policy's next step after a failed attempt, or ask the user for
+guidance."""
 
 from __future__ import annotations
 
@@ -69,7 +70,7 @@ class SettleMixin(OrchestratorBase):
                 elif task.status is TaskStatus.WAITING:
                     changed = await self._open_children(run, task) or changed
                 else:
-                    await self._ask_about_escalation(run, task)
+                    await self._escalated(run, task)
                     changed = True
         return changed
 
@@ -236,6 +237,16 @@ class SettleMixin(OrchestratorBase):
             await self.feedback.add(run.id, self._feedback(task, FeedbackSource.HARNESS, text))
         await self.tasks.update_task(task)
         return list(dict.fromkeys(waits))
+
+    async def _escalated(self, run: Run, task: Task) -> None:
+        """An escalated task with nothing open: the policy's next step after a failed
+        attempt (the stronger model, then the user), else ask the user. Done here, not
+        right after the attempt, so a crash in between still gets the same step."""
+        decisions = await self.policy.on_task_error(run, task)
+        for decision in decisions:
+            await self._apply(run, decision)
+        if not decisions:
+            await self._ask_about_escalation(run, task)
 
     async def _ask_about_escalation(self, run: Run, task: Task) -> None:
         """Ask the user how to get an escalated task unstuck."""

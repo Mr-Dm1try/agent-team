@@ -154,6 +154,10 @@ async def test_a_core_dump_is_never_committed(tmp_path: Path) -> None:
         "core.py",
         "src/core/__init__.py",
     ]
+    # Nor was it hashed into the object store on the way.
+    [blob] = git(ws, "hash-object", "core")
+    with pytest.raises(subprocess.CalledProcessError):
+        git(ws, "cat-file", "-e", blob)
     # One committed before is dropped from the next version.
     git(ws, "-c", "user.name=t", "-c", "user.email=t@t", "add", "-f", "core")
     git(ws, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "oops")

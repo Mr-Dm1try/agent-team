@@ -559,8 +559,12 @@ def sources_opened(ctx: AuditContext, rule: Rule) -> HelperResult:
     return res
 
 
-#: A version claim in research text: a package pinned or bounded with ==, ===, ~= or >=.
-_PIN = re.compile(r"(?<![\w.-])([A-Za-z][A-Za-z0-9._-]*)\s*(===|==|~=|>=)\s*(\d[\w.+!-]*\w|\d)")
+#: A version pin in research text, written as a requirement: a package name, ==, ===
+#: or ~= with no spaces, and a version with at least one dot (``mcp==2.3.0``). Prose
+#: such as ``status_code == 200`` or ``timeout>=30`` isn't one.
+_PIN = re.compile(r"(?<![\w.-])([A-Za-z][A-Za-z0-9._-]*)(===|==|~=)(\d+(?:\.\w+)+)(?!\w|\.\w)")
+#: Names a pin can't be about: the interpreter, not a package.
+_NOT_PACKAGES = frozenset({"python", "py"})
 #: Most characters read from one saved tool result when looking for a version.
 _MAX_SOURCE_CHARS = 2_000_000
 
@@ -604,7 +608,11 @@ def _unsourced_pins(
     """R2 for version claims: every pin the research states (``mcp==2.3.0``) shows up
     in a source the task opened, with the package's name in the same source. A pin
     the user's request already gives needs no source."""
-    pins = {(_package(m[1]), m[1], m[2], m[3]) for m in _PIN.finditer(_research_text(artifact))}
+    pins = {
+        (_package(m[1]), m[1], m[2], m[3])
+        for m in _PIN.finditer(_research_text(artifact))
+        if m[1].lower() not in _NOT_PACKAGES
+    }
     if not pins:
         return []
     texts = _source_texts(ctx)
@@ -613,8 +621,10 @@ def _unsourced_pins(
     for package, name, op, version in sorted(pins):
         if f"{name}{op}{version}".lower() in request.replace(" ", ""):
             continue
-        shown = re.compile(rf"(?<![\w.]){re.escape(version)}(?![\w]|\.\d)")
-        named = re.compile(rf"(?<![\w-]){re.escape(package).replace('-', '[-_.]+')}(?![\w-])", re.I)
+        # A release tag may read v2.3.0, and ==2.0 is the release 2.0.0.
+        shown = re.compile(rf"(?<![\w.])v?{re.escape(version)}(?:\.0)*(?![\w]|\.\d)")
+        spelled = "[-_.]+".join(re.escape(part) for part in package.split("-"))
+        named = re.compile(rf"(?<![\w.-]){spelled}(?![\w-])", re.IGNORECASE)
         if any(shown.search(t) and named.search(t) for t in texts):
             continue
         out.append(
