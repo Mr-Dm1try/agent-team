@@ -10,6 +10,8 @@ fsmonitor, no external diff drivers and no signing, so the user's git config can
 change or stall it. The command tools create the repository before the first command
 runs, so the container only ever sees ``.git`` read-only, and the file tools refuse to
 write there: agents can't rewrite the history or plant config the host's git would run.
+A core dump (a file named ``core`` or ``core.*`` that is an ELF core file) is never
+committed, should a crash leave one.
 """
 
 from __future__ import annotations
@@ -23,9 +25,43 @@ from agent_team.core.artifacts import ArtifactRef
 from agent_team.core.errors import SandboxError
 from agent_team.core.interfaces import AfterHook, TaskStore
 from agent_team.core.models import AgentName, Event
-from agent_team.sandbox.base import ensure_gitignore
+from agent_team.sandbox.base import DEPS_DIR, ensure_gitignore
 
 log = logging.getLogger(__name__)
+
+#: ELF type of a core file (``ET_CORE``).
+_ET_CORE = 4
+#: Folders never searched for core dumps.
+_SKIP_DIRS = frozenset({".git", DEPS_DIR})
+
+
+def is_core_dump(path: Path) -> bool:
+    """Whether ``path`` is a core dump: named ``core`` or ``core.*`` and an ELF core
+    file, so a ``core.py`` or a ``core`` package folder never counts."""
+    if not (path.name == "core" or path.name.startswith("core.")) or not path.is_file():
+        return False
+    try:
+        with path.open("rb") as f:
+            head = f.read(18)
+    except OSError:
+        return False
+    if len(head) < 18 or head[:4] != b"\x7fELF" or head[5] not in (1, 2):
+        return False
+    kind = int.from_bytes(head[16:18], "little" if head[5] == 1 else "big")
+    return kind == _ET_CORE
+
+
+def core_dumps(workspace: Path) -> list[str]:
+    """The workspace-relative paths of the core dumps in the workspace."""
+    found: list[str] = []
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for name in files:
+            path = Path(root, name)
+            if is_core_dump(path):
+                found.append(path.relative_to(workspace).as_posix())
+    return sorted(found)
+
 
 _GIT_CONFIG = (
     "-c",
@@ -95,6 +131,10 @@ class WorkspaceGit:
         return the commit sha. A version with no file changes still gets a commit."""
         await self.ensure_repo()
         await self._git("add", "-A")
+        dumps = await asyncio.to_thread(core_dumps, self.workspace)
+        if dumps:
+            log.warning("leaving core dumps out of the commit: %s", ", ".join(dumps))
+            await self._git("rm", "-q", "--cached", "--ignore-unmatch", "--", *dumps)
         message = f"{ref.kind} v{ref.version}: {subject}".strip()
         if body:
             message += f"\n\n{body}"

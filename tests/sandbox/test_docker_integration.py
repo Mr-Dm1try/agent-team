@@ -77,5 +77,10 @@ async def test_pytest_runs_in_the_container_with_the_network_off(
     )
     assert slow.is_error and slow.data and slow.data["timed_out"] and slow.data["exit_code"] == 124
 
+    # A crash leaves no core dump in the workspace.
+    crash = await tools["run_command"]({"argv": ["python", "-c", "import os; os.abort()"]}, ctx)
+    assert crash.data and crash.data["exit_code"] == 134, crash.content
+    assert not [p for p in ws.iterdir() if p.name.startswith("core")]
+
     # Every container was removed when its command ended.
     assert await docker_runner.cleanup(run_id=run.id) == 0
