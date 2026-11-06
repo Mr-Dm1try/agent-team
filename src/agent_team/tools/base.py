@@ -5,6 +5,9 @@ Path rules (docs/DESIGN.md, "Sandbox"): every path resolves inside the run's
 workspace, except folders passed with ``--context``, which tools may read but never
 write, and large tool results saved under ``runs/<id>/tool_results``, which are
 read-only too. Symlinks and ``..`` are resolved before the check, so neither can escape.
+Secrets files (``.env`` and ``.env.*``, but not ``.env.example``) in a ``--context``
+folder are refused, so pointing ``--context`` at a project never hands its API keys
+to the model.
 """
 
 from __future__ import annotations
@@ -21,6 +24,11 @@ MAX_INLINE_CHARS = 12_000
 def _inside(path: Path, root: Path) -> bool:
     """True when ``path`` is ``root`` or under it."""
     return path == root or root in path.parents
+
+
+def is_env_file(name: str) -> bool:
+    """True for ``.env`` and ``.env.*`` names other than ``.env.example``."""
+    return name == ".env" or (name.startswith(".env.") and name != ".env.example")
 
 
 def resolve_path(raw: str, run: Run, *, write: bool, tool: str) -> Path:
@@ -43,7 +51,13 @@ def resolve_path(raw: str, run: Run, *, write: bool, tool: str) -> Path:
             raise ToolError(f"{raw} is a saved tool result and is read-only", tool=tool)
         return resolved
     for ctx_dir in run.context_dirs:
-        if _inside(resolved, Path(ctx_dir).resolve()):
+        root = Path(ctx_dir).resolve()
+        if _inside(resolved, root):
+            # The name as asked too, so a symlink called .env is refused as well.
+            parts = resolved.relative_to(root).parts
+            named = (candidate.name,) if resolved != root else ()
+            if any(is_env_file(part) for part in (*named, *parts)):
+                raise ToolError(f"{raw} is a secrets file and can't be read", tool=tool)
             if write:
                 raise ToolError(
                     f"{raw} is in a read-only --context folder; write inside the workspace",

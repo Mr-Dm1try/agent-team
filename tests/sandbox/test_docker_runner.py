@@ -13,6 +13,7 @@ import pytest
 from agent_team.core.config import SandboxConfig
 from agent_team.core.errors import SandboxError
 from agent_team.sandbox import CommandSpec, DockerRunner
+from agent_team.sandbox.base import COMMAND_ENV
 from agent_team.sandbox.docker_runner import OWNER_LABEL, RUN_LABEL, TASK_LABEL, root_label
 
 CONFIG = SandboxConfig(cpus=0.5, memory="512m", pids_limit=64, output_tail_chars=10)
@@ -138,6 +139,17 @@ async def test_a_command_runs_locked_down_and_offline(tmp_path: Path) -> None:
     assert kw["environment"]["PYTHONPATH"] == "/workspace/.deps"
     assert (kw["labels"][RUN_LABEL], kw["labels"][TASK_LABEL]) == ("run_1", "task_1")
     assert container.started and container.removed and client.created == []
+
+
+async def test_containers_get_none_of_the_host_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The API key in the harness's environment never reaches a container."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-host-only")
+    client = FakeClient()
+    await runner(client, tmp_path).run(spec(tmp_path, network=True))
+    [container] = client.all
+    assert container.kwargs["environment"] == COMMAND_ENV
 
 
 async def test_only_install_steps_get_the_network(tmp_path: Path) -> None:

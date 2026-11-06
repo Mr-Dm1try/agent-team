@@ -5,6 +5,9 @@ search memory.
 While the run waits on you, each line typed is sent as a message; end the input
 (Ctrl-D) to leave the run waiting, and pick it up later with ``resume``. When it is
 done you accept it or describe a change.
+
+At startup ``entry`` reads ``.env`` from the current folder, so the API key can live
+there instead of in the shell. Variables already set in the shell win.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Column, Table
 
@@ -55,6 +59,18 @@ AppFactory = Callable[[Config], Awaitable[App]]
 _factory: AppFactory = build_app
 #: The embedder ``memory search`` uses; None is the configured Ollama one.
 _embedder: Embedder | None = None
+
+
+def load_env(folder: Path | None = None) -> bool:
+    """Load ``.env`` from ``folder`` (default: the current folder) into the
+    environment without replacing variables already set; False when there is none."""
+    return load_dotenv((folder or Path.cwd()) / ".env", override=False)
+
+
+def entry() -> None:
+    """The ``agent-team`` command: load ``.env``, then run the CLI."""
+    load_env()
+    app()
 
 
 @app.callback()
@@ -300,4 +316,4 @@ def _short(value: Any, limit: int = 200) -> Any:
 
 
 if __name__ == "__main__":
-    app()
+    entry()

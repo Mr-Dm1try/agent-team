@@ -108,3 +108,50 @@ async def test_walks_skip_symlinks_that_escape(ctx: ToolContext, tmp_path: Path)
     for recursive in (True, False):
         listing = await tools["list_dir"]({"recursive": recursive}, ctx)
         assert "secret.py" not in listing.content and "linked" not in listing.content
+
+
+@pytest.mark.parametrize("name", [".env", ".env.local", ".env.production", "sub/.env"])
+async def test_env_files_in_context_folders_are_refused(ctx: ToolContext, name: str) -> None:
+    """Secrets files in a --context folder can't be read, listed or searched."""
+    ref = Path(ctx.run.context_dirs[0])
+    secret = ref / name
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("ANTHROPIC_API_KEY=sk-secret\n")
+    tools = file_tools()
+    with pytest.raises(ToolError, match="secrets file"):
+        await tools["read_file"]({"path": str(secret)}, ctx)
+    with pytest.raises(ToolError, match="secrets file"):
+        await tools["grep"]({"pattern": "sk-", "path": str(secret)}, ctx)
+    listing = await tools["list_dir"]({"path": str(ref)}, ctx)
+    assert Path(name).name not in listing.content and "notes.md" in listing.content
+    found = await tools["grep"]({"pattern": "sk-secret", "path": str(ref)}, ctx)
+    assert found.content == "no matches"
+
+
+async def test_env_example_in_a_context_folder_is_readable(ctx: ToolContext) -> None:
+    """``.env.example`` holds no secrets, so it stays readable."""
+    example = Path(ctx.run.context_dirs[0]) / ".env.example"
+    example.write_text("ANTHROPIC_API_KEY=\n")
+    read = await file_tools()["read_file"]({"path": str(example)}, ctx)
+    assert "ANTHROPIC_API_KEY=" in read.content
+
+
+async def test_symlinks_to_or_named_env_are_refused(ctx: ToolContext) -> None:
+    """A link to a context .env, or a link called .env, is refused like the file."""
+    ref = Path(ctx.run.context_dirs[0])
+    (ref / ".env").write_text("ANTHROPIC_API_KEY=sk-secret\n")
+    (ref / "harmless.txt").symlink_to(ref / ".env")
+    (Path(ctx.run.workspace) / "link").symlink_to(ref / ".env")
+    (ref / "keys").mkdir()
+    (ref / "keys" / ".env").symlink_to(ref / "notes.md")
+    tools = file_tools()
+    for path in (str(ref / "harmless.txt"), "link", str(ref / "keys" / ".env")):
+        with pytest.raises(ToolError, match="secrets file"):
+            await tools["read_file"]({"path": path}, ctx)
+
+
+async def test_workspace_env_files_stay_usable(ctx: ToolContext) -> None:
+    """The rule covers --context folders only; the agents' own workspace keeps .env."""
+    tools = file_tools()
+    await tools["write_file"]({"path": ".env", "content": "DEBUG=1\n"}, ctx)
+    assert "DEBUG=1" in (await tools["read_file"]({"path": ".env"}, ctx)).content
