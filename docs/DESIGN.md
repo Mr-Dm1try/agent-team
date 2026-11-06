@@ -109,6 +109,7 @@ Context is gathered up front, but not only once. If the Architect or Engineer hi
 
 - A request that repeats a question the run already asked is answered by that task. Questions match on their content words (with filler such as "the official docs" dropped), at 85% overlap, so a question about GitLab doesn't take GitHub's answer; a question with no content words left matches nothing. A finished brief joins the asker's inputs, and open requested research (or a revision of it) is waited for, unless it already waits on the asker. A question a planned task is still researching, or one whose answer is already in the asker's inputs, is refused.
 - A task made from a request can't ask for more (`limits.max_research_depth`, 1), and a run makes at most `limits.max_research_tasks` (6) requested tasks.
+- A task asks for research once, and only while it has an attempt left to use the answer. The attempt that asks counts like any other, so asking never raises a task's limit, and the attempt after the research is told it can't ask again.
 - Past a limit, the request is refused, the decision log says why, and the task is told to answer with what it has. A refused task may not ask again. A task that may not ask is told so in its envelope, and any request it still files is turned into what is still open: an unanswered question with its gap in a brief, or a question with an assumption elsewhere.
 
 Every expert also reads the feedback on its own work: your answers to its questions, your comments on its last version and the auditor's findings. See Questions and feedback below.
@@ -270,7 +271,7 @@ Each rule has an id, a scope (task or run), the agents whose tasks it applies to
 
 A question about one task's failure ends with one sentence that lists exactly the replies it takes: guidance for another try, 'approve' only when the work may be kept, and 'stop'.
 
-Each run is capped at 3 attempts per task and 2 upstream re-runs, plus token, cost and time budgets, so it always ends.
+Each run is capped at 3 attempts per task, plus the one on the stronger model, and 2 upstream re-runs, plus token, cost and time budgets, so it always ends. An attempt that asked for research or asked you a question counts toward the 3. Only your answers can add an attempt: guidance on an escalated task, or answers to questions asked on the last attempt, buy one more when none is left.
 
 ## Questions and feedback
 

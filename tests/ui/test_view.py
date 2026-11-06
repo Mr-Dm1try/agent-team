@@ -482,11 +482,11 @@ async def test_the_stronger_model_attempt_is_marked_not_counted_against_the_limi
     text = console.export_text()
     assert "check 3/4: the research" in text
     assert "check 4/4 on the stronger model: the research" in text
-    assert "· attempt 4 on the stronger model" in text
+    assert "· attempt 4/4 on the stronger model" in text
     plain = RunView(_console(), plain=True)
     lines = [plain.apply(e) for e in events]
-    assert (
-        lines[4] == "  planning: researcher: the research running (attempt 4 on the stronger model)"
+    assert lines[4] == (
+        "  planning: researcher: the research running (attempt 4/4 on the stronger model)"
     )
 
 
@@ -515,7 +515,7 @@ async def test_a_resumed_run_still_marks_the_stronger_model_attempt() -> None:
     )
     view.load(RUN, [brief], [sent])
     console.print(view.render())
-    assert "attempt 4 on the stronger model" in console.export_text()
+    assert "attempt 4/4 on the stronger model" in console.export_text()
 
 
 def screen(raw: str) -> list[str]:

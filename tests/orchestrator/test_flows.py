@@ -99,7 +99,7 @@ async def test_questions_only_mode_waits_for_answers(tmp_path: Path) -> None:
     assert "[user_answer Q-1] Yes, 20 per page" in second
     prd_task = (await _tasks(team.tasks, reply.run_id, "prd"))[0]
     assert prd_task.attempt == 2
-    assert prd_task.max_attempts == 4  # asking didn't eat into the retry budget
+    assert prd_task.max_attempts == 3  # the attempt that asked counts like any other
 
 
 async def test_every_phase_review_approve_and_comment(tmp_path: Path) -> None:
@@ -189,15 +189,14 @@ async def test_research_requests_dedup_and_stop_at_the_depth_limit(tmp_path: Pat
         ]
     child_prompts = [p for p in prompts if "origin research_request" in p]
     assert child_prompts and all("can't ask for more research" in p for p in child_prompts)
-    # The planned task asked again after its answers came in: refused, told to answer
-    # with what it has, and its last attempt could not ask at all.
+    # The planned task had its one round of research: the attempt after it was told it
+    # can't ask again, so its repeated requests became gaps instead of new attempts.
     [planned] = [t for t in briefs if t.origin is TaskOrigin.PLAN]
     assert planned.status is TaskStatus.DONE and not planned.may_request_research
-    refusals = [d for d in team.decisions.items if d.choice.startswith("refuse")]
-    assert {d.choice for d in refusals} == {"refuse: already answered"}
-    last = prompts[-1]
-    assert "origin plan" in last and "attempt 3" in last
-    assert "can't ask for more research" in last and "No more research will be run" in last
+    assert planned.attempt == 2 and planned.max_attempts == 3
+    assert not [d for d in team.decisions.items if d.choice.startswith("refuse")]
+    last = [p for p in prompts if "origin plan" in p][-1]
+    assert "attempt 2" in last and "can't ask for more research" in last
 
 
 async def test_research_requests_stop_at_the_run_cap(tmp_path: Path) -> None:

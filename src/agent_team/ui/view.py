@@ -450,7 +450,7 @@ class RunView:
                 state.tasks[row.id] = row
             row.status = str(data.get("to", row.status))
             row.attempt = event.attempt or row.attempt
-            # An answer or research can give a task another attempt.
+            # The stronger model, or answers that came on the last attempt, add one.
             row.max_attempts = int(data.get("max_attempts") or row.max_attempts)
             if row.status != "running":
                 row.tool = None
@@ -493,9 +493,9 @@ class RunView:
 
     @staticmethod
     def _attempt(row: TaskRow) -> str:
-        """A row's latest attempt, such as "attempt 2" or "attempt 4 on the stronger
-        model"."""
-        return attempt_text(row.attempt, stronger=row.on_stronger())
+        """A row's latest attempt against its limit, such as "attempt 2/3" or "attempt
+        4/4 on the stronger model"."""
+        return attempt_text(row.attempt, row.max_attempts, stronger=row.on_stronger())
 
     def _room(self, head: str, tail: str) -> int:
         """The characters a line of the console's width leaves between ``head`` and

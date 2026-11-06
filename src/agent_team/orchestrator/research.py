@@ -1,7 +1,8 @@
 """Limits on research that agents ask for mid-run: a request that repeats one already
 asked in the run is answered by that task instead of a new one, a task created from a
-request can't ask for more past ``max_research_depth``, and a run makes at most
-``max_research_tasks`` of them (docs/DESIGN.md, "Research requests")."""
+request can't ask for more past ``max_research_depth``, a run makes at most
+``max_research_tasks`` of them, and a task asks once, with an attempt left to use the
+answer (docs/DESIGN.md, "Research requests")."""
 
 from __future__ import annotations
 
@@ -107,9 +108,13 @@ class ResearchLimits:
     max_depth: int = 1
 
     def refusal(self, task: Task, tasks: list[Task]) -> str | None:
-        """Why ``task`` may not ask for (more) research now, or None if it may."""
+        """Why ``task`` may not ask for (more) research now, or None if it may. A task
+        asks once, and only while an attempt is left to use what comes back, since the
+        attempt that asks counts like any other."""
         if not task.may_request_research:
-            return "a research request of this task was already refused"
+            return "this task has already asked for research once"
+        if task.attempt >= task.max_attempts:
+            return "this is the task's last attempt, so none is left to use research in"
         if research_depth(task, {t.id: t for t in tasks}) >= self.max_depth:
             return f"research requests may chain only {self.max_depth} deep"
         if requested_count(tasks) >= self.max_tasks:

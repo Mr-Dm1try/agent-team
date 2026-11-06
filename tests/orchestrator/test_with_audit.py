@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 from agents.fakes import tool_call
-from agents.scenario import CODE, Responder, team_script
+from agents.scenario import BRIEF, CODE, Responder, team_script
 
 from agent_team.audit.toollog import ToolCall, tool_call_from_event
 from agent_team.core.artifacts import ArtifactRef
@@ -237,3 +237,54 @@ async def test_an_escalation_left_by_a_crash_still_gets_the_stronger_model(
     kinds = [d.kind for d in team.decisions.items if d.task_id == task.id]
     assert kinds == [DecisionKind.NO_PROGRESS, DecisionKind.STRONGER_MODEL]
     assert task.id in team.llm.overrides
+
+
+async def test_research_requests_and_the_stronger_model_stay_within_the_limit(
+    tmp_path: Path,
+) -> None:
+    # As in a rehearsal: a planned research task fails its check, asks for research,
+    # keeps asking, and keeps failing. Its attempts stop at the limit plus the one on
+    # the stronger model, and the attempt that asked counts like any other.
+    script = team_script()
+    team = await make_team(tmp_path, code_policy=True, script=script)
+    prompts: dict[int, str] = {}
+    gap = {"question": "What does the WAL checkpoint cost?", "why": "trade-offs"}
+
+    def researcher(request: LLMRequest) -> str:
+        """A planned brief plain on attempt 1, then always asking for research."""
+        text = getattr(request.messages[0].content[0], "text", "")
+        if "origin research_request" in text:
+            return json.dumps(BRIEF)
+        attempt = int(text.split("(attempt ", 1)[1].split(",", 1)[0])
+        prompts[attempt] = text
+        return json.dumps(BRIEF if attempt == 1 else dict(BRIEF, research_requests=[gap]))
+
+    script[AgentName.RESEARCHER] = researcher
+    passing = team.auditor.audit_task
+
+    async def audit_task(task: Task, artifact: object, run: object) -> Verdict:
+        """Fail every attempt of planned research on a new item, so it isn't no progress."""
+        if task.origin is TaskOrigin.PLAN and task.output_kind == "research_brief":
+            return _blocker("P2", f"item {task.attempt}").model_copy(
+                update={"task_id": task.id, "run_id": task.run_id}
+            )
+        return await passing(task, artifact, run)  # type: ignore[arg-type]
+
+    team.auditor.audit_task = audit_task  # type: ignore[method-assign]
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "waiting", reply.text
+    assert reply.run_id
+    tasks = await team.tasks.list_tasks(reply.run_id)
+    planned = next(
+        t for t in tasks if t.origin is TaskOrigin.PLAN and t.output_kind == "research_brief"
+    )
+    # 1 failed, 2 asked for research, 3 (the last) couldn't ask and failed, 4 ran on the
+    # stronger model and failed: then the user is asked.
+    assert planned.attempt == 4 and planned.max_attempts == 4
+    assert planned.status is TaskStatus.ESCALATED
+    children = [t for t in tasks if t.origin is TaskOrigin.RESEARCH_REQUEST]
+    assert [c.parent_task_id for c in children] == [planned.id]
+    assert "can't ask for more research" not in prompts[2]
+    assert all("can't ask for more research" in prompts[n] for n in (3, 4))
+    kinds = [d.kind for d in team.decisions.items if d.task_id == planned.id]
+    assert kinds.count(DecisionKind.STRONGER_MODEL) == 1
