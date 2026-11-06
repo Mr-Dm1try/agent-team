@@ -63,7 +63,7 @@ async def test_the_switch_skips_a_down_embedder_until_it_may_be_back() -> None:
 
 async def test_ollama_down_is_embedder_unavailable() -> None:
     config = EmbedderConfig(timeout_s=2)
-    embedder = OllamaEmbedder(config, "http://127.0.0.1:9/v1")  # nothing listens on 9
+    embedder = OllamaEmbedder(config, "http://127.0.0.1:9")  # nothing listens on 9
     with pytest.raises(EmbedderUnavailable):
         await embedder.embed(["hello"], query=True)
 

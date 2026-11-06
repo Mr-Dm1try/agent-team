@@ -27,17 +27,24 @@ def _inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-#: Committed templates that list variable names without values.
-_ENV_TEMPLATES = frozenset({".env.example", ".env.sample", ".env.template"})
+#: Committed templates that list variable names without values, after ``.env`` and a
+#: separator (``.env.example``, ``.env-sample``, ``.env_template``).
+_ENV_TEMPLATES = frozenset({"example", "sample", "template"})
+#: What may follow ``.env`` in a secrets-file name: ``.env.local``, ``.env-local``,
+#: ``.env_production``.
+_ENV_SEPARATORS = (".", "-", "_")
 
 
 def is_env_file(name: str) -> bool:
-    """True for secrets-file names: ``.env``, ``.env.*``, ``*.env`` and ``.envrc``, in any
-    letter case (macOS folders ignore it), but not the templates such as ``.env.example``."""
+    """True for secrets-file names: ``.env``, ``.env`` followed by ``.``, ``-`` or ``_``
+    and more, ``*.env`` and ``.envrc``, in any letter case (macOS folders ignore it), but
+    not the templates such as ``.env.example``."""
     name = name.casefold()
-    if name in _ENV_TEMPLATES:
+    if name in (".env", ".envrc") or name.endswith(".env"):
+        return True
+    if not name.startswith(".env") or name[4:5] not in _ENV_SEPARATORS:
         return False
-    return name == ".envrc" or name.startswith(".env.") or name.endswith(".env")
+    return name[5:] not in _ENV_TEMPLATES
 
 
 def _asked_parts(asked: Path, roots: tuple[Path, ...]) -> tuple[str, ...]:

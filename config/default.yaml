@@ -1,6 +1,6 @@
 # Routing, budgets and review mode. Loaded by agent_team.core.config.
 # effort (low, medium, high, xhigh, max) sets how hard the model reasons: Claude's
-# effort, or Ollama's reasoning_effort (xhigh and max become high). Cheap Claude roles
+# effort, or Ollama's think level (xhigh and max become high). Cheap Claude roles
 # start at low, engineer and architect at medium. The researcher runs locally for
 # free, so it keeps gpt-oss's own default of medium.
 defaults: {provider: anthropic, model: claude-haiku-5-5, context_budget: 90000, effort: low}
@@ -32,8 +32,9 @@ providers:
     thinking: {type: adaptive}
     # A thinking block whose earlier history was edited is dropped, not a 400.
     on_history_edit: drop_block
-  # reasoning_models: models that take reasoning_effort; others get none.
-  ollama: {base_url: "http://localhost:11434/v1", num_ctx: 32768, reasoning_models: [gpt-oss]}
+  # Ollama's native API, which loads the model with num_ctx; a model whose own limit is
+  # smaller gets that. reasoning_models: models that take an effort; others get none.
+  ollama: {base_url: "http://localhost:11434", num_ctx: 32768, reasoning_models: [gpt-oss]}
 # Fault injection; the --chaos flag overrides this.
 chaos: {rate: 0.0, faults: []}
 # Custom hooks as "module:function"; each function receives the event bus.

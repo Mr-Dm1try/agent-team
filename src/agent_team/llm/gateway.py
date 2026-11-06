@@ -329,10 +329,12 @@ class Gateway:
         usage = self.budget.usage(request.run_id)
         transient = isinstance(exc, TransientLLMError)
         unreachable = isinstance(exc, TransientLLMError) and exc.unreachable
+        cap = exc.max_retries if isinstance(exc, TransientLLMError) else None
         will_retry = (
             transient
             and not (unreachable and not last_route)
             and try_no < len(self.config.retry.delays_s)
+            and (cap is None or try_no < cap)
         )
         await self.bus.emit(
             self._event(

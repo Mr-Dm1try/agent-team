@@ -26,7 +26,7 @@ class _Cfg(BaseModel):
 
 class Route(_Cfg):
     """A provider and model, with an optional prompt-token budget and effort. Effort
-    sets how hard the model reasons: Claude's effort, or Ollama's reasoning_effort for
+    sets how hard the model reasons: Claude's effort, or Ollama's think level for
     the models listed in ``providers.ollama.reasoning_models``."""
 
     provider: str
@@ -112,13 +112,16 @@ class AnthropicConfig(_Cfg):
 class OllamaConfig(_Cfg):
     """Ollama provider settings."""
 
-    base_url: str = "http://localhost:11434/v1"
+    #: The server; a trailing OpenAI-compatible ``/v1`` is ignored.
+    base_url: str = "http://localhost:11434"
+    #: The window asked for. Ollama's native API loads the model with it; a model whose
+    #: own limit, or loaded context, is smaller gets the smaller window.
     num_ctx: int = 32_768
     timeout_s: float = 300.0
     #: The slowest generation speed planned for. A call's timeout grows past
     #: ``timeout_s`` when its ``max_tokens`` would take longer than that at this speed.
     min_tokens_per_s: float = 20.0
-    #: Models (by name before the ":" tag) that take ``reasoning_effort``. Ollama
+    #: Models (by name before the ":" tag) that take a ``think`` level. Ollama
     #: rejects it for models that can't think, so others get no effort at all.
     reasoning_models: list[str] = Field(default_factory=lambda: ["gpt-oss"])
     #: Least room left for the reply. A route's prompt budget plus this must fit
@@ -181,12 +184,16 @@ class WebConfig(_Cfg):
 
 
 class EmbedderConfig(_Cfg):
-    """The embedding model for memory: nomic-embed-text through Ollama's
-    OpenAI-compatible endpoint, called once when a memory is saved and once per search."""
+    """The embedding model for memory: nomic-embed-text through Ollama's ``/api/embed``,
+    called once when a memory is saved and once per search."""
 
     model: str = "nomic-embed-text"
     #: None uses ``providers.ollama.base_url``.
     base_url: str | None = None
+    #: The most tokens one text may take; the model's own window from ``/api/show``
+    #: wins when smaller. Longer texts are cut at a safe character count first, so
+    #: Ollama never truncates them itself.
+    max_input_tokens: int = 2_048
     timeout_s: float = 10.0
     #: After a failed call, search uses BM25 alone for this long before trying again.
     retry_after_s: float = 60.0
