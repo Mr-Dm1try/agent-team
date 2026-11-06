@@ -97,7 +97,7 @@ def expand_plan(
             Phase.PLANNING,
             AgentName.RESEARCHER,
             "research_answer",
-            f"Answer the user's question with sources: {run.request}",
+            f"Answer the user's question with sources, written for the user: {run.request}",
             research_ids,
             f"final answer covering {', '.join(a.id for a in plan.asks)}",
         )

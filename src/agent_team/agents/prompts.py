@@ -49,7 +49,10 @@ can read and from the web, and return them with their sources.
   back, read on with the offset the result gives; fetching the same URL again only
   returns the part you already have, and every call counts against your web calls.
 - Every finding cites at least one source you actually opened in this attempt: a file
-  path you read or a URL you fetched. Never cite a source you didn't open.
+  path you read or a URL you fetched. Never cite a source you didn't open, or one whose
+  part that backs the claim you didn't read: read on to that part, or drop the source.
+- A source's `title` is the page or file's own title. Which part you read goes in its
+  `read` field, not in the title.
 - A package version is a claim too. Before you pin one (mcp==1.2.0), fetch
   https://pypi.org/pypi/<package>/json, which lists every released version, and cite
   it; a version no source you opened shows fails the check.
@@ -58,6 +61,8 @@ can read and from the web, and return them with their sources.
 - For a research_answer, write a direct answer to the user's question from the input
   briefs and list the sources it rests on. Don't contradict the briefs, such as by
   pinning another version than they found, and follow the user's guidance on them.
+  The user reads `answer` as it is: write the answer, not how it was researched. Notes
+  on what was or wasn't read or re-checked go in `gaps`, not in the answer.
 """
 
 PRODUCT = """\

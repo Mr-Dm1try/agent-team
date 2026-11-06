@@ -43,3 +43,18 @@ def test_sources_print_before_the_audit_report() -> None:
     ]
     assert summary.lines()[5] == "Audit report:"
     assert RunSummary(audit_passed=True).lines()[:2] == ["", "Audit report:"]
+
+
+def test_a_source_line_shows_the_page_title_without_notes_on_how_it_was_read() -> None:
+    rfc = Source(
+        ref="https://www.rfc-editor.org/rfc/rfc9110",
+        title="RFC 9110: HTTP Semantics (opened in this attempt at offset 361000)",
+    )
+    assert (
+        source_line(rfc) == "  - RFC 9110: HTTP Semantics: https://www.rfc-editor.org/rfc/rfc9110"
+    )
+    assert rfc.read == "opened in this attempt at offset 361000"
+    read = Source(
+        ref="https://sqlite.org/wal.html", title="WAL", read="characters 0-10000 of 27246"
+    )
+    assert "10000" not in source_line(read)
