@@ -37,7 +37,11 @@ class DecisionsMixin(OrchestratorBase):
         task = await self.tasks.get_task(task_id) if isinstance(task_id, str) else None
         route: object = None
         if d.kind is DecisionKind.STRONGER_MODEL and task is not None:
-            d, route = self._route_to_stronger(d, task)
+            try:
+                d, route = self._route_to_stronger(d, task)
+            except ValueError:
+                await self._record(d)  # so the policy asks the user next time instead
+                raise
         await self._record(d)
 
         if d.kind is DecisionKind.RETRY and task is not None:

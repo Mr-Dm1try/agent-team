@@ -515,6 +515,7 @@ async def test_typed_keys_show_at_the_prompt_and_under_the_live_tree(tmp_path: P
             return None
 
         session = Session(app, console, read_line=nothing, listen=True)
+        session.draws_typing = True  # as at a terminal, where it reads keys itself
         session._at_prompt = True
         session._typed("acc", False)
         session._typed("accept", True)
@@ -523,3 +524,13 @@ async def test_typed_keys_show_at_the_prompt_and_under_the_live_tree(tmp_path: P
         session._typed("what", False)
         assert out.getvalue().endswith("Type: what")
         session.view.stop()
+        # The team stopped mid-line: the prompt shows the line so far, and once it is
+        # entered there the next live view starts with an empty hint line.
+        session._at_prompt = False
+        reading = asyncio.ensure_future(session._read())
+        await asyncio.sleep(0)
+        assert out.getvalue().endswith("> what")
+        await reading
+        session._typed("what now", True)
+        assert out.getvalue().endswith("\r\x1b[2Kwhat now\n")
+        assert session.view._typed == ""  # what the next live view draws after its hint

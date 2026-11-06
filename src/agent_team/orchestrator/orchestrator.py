@@ -37,6 +37,7 @@ from agent_team.core.models import (
     TaskStatus,
     check_reason,
     new_id,
+    stronger_attempts,
 )
 from agent_team.core.tracing import Tracer
 from agent_team.orchestrator.base import (
@@ -130,11 +131,21 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
     async def drive(self, run_id: str) -> Reply:
         """Run until the run is done, waits on the user, or stops. Each pass through a
         phase is a ``phase`` span under the run's root span."""
+        await self._restore_stronger_routes(run_id)
         passes = _PhasePasses(Tracer(self.bus))
         try:
             return await self._drive(run_id, passes)
         finally:
             await passes.close()
+
+    async def _restore_stronger_routes(self, run_id: str) -> None:
+        """Route tasks the policy sent to the stronger model there again, since routes
+        live in memory and a resumed or answered run may be in a new process. A task
+        that passed has its route cleared and stays on its own model."""
+        sent = stronger_attempts(await self.decisions.list(run_id))
+        for task in await self.tasks.list_tasks(run_id):
+            if task.id in sent and task.status not in (TaskStatus.DONE, TaskStatus.SUPERSEDED):
+                self.llm.use_stronger_model(task.id)
 
     async def _drive(self, run_id: str, passes: _PhasePasses) -> Reply:
         """The drive loop; ``passes`` keeps the current phase's span open."""

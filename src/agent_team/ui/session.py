@@ -203,8 +203,13 @@ class StdinLines:
         """Read keys with the terminal's echo and line mode off, and hand the loop each
         change to the typed line and each finished line, then None at the end."""
         assert termios is not None and tty is not None and self.on_typing is not None
-        fd = sys.stdin.fileno()
-        saved = termios.tcgetattr(fd)
+        try:
+            fd = sys.stdin.fileno()
+            saved = termios.tcgetattr(fd)
+        except (termios.error, OSError, ValueError):
+            log.debug("can't read keys from stdin; reading lines", exc_info=True)
+            self._pump(loop, lines)
+            return
 
         def restore() -> None:
             """Give the terminal back its echo and line mode."""
@@ -212,27 +217,41 @@ class StdinLines:
                 termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
         atexit.register(restore)
-        tty.setcbreak(fd)  # keys arrive one by one, unechoed; Ctrl-C still interrupts
-        editor = LineEditor()
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
-            while True:
-                data = os.read(fd, 1024)
-                events = editor.feed(decoder.decode(data)) if data else [("end", "")]
-                for kind, text in events:
-                    try:
-                        if kind == "typed":
-                            loop.call_soon_threadsafe(self.on_typing, text, False)
-                        elif kind == "line":
-                            loop.call_soon_threadsafe(self.on_typing, text, True)
-                            loop.call_soon_threadsafe(lines.put_nowait, text.strip())
-                        else:
-                            loop.call_soon_threadsafe(lines.put_nowait, None)
-                            return
-                    except RuntimeError:
-                        return  # the loop has closed: the session is over
+            # Keys arrive one by one, unechoed; Ctrl-C still interrupts. TCSANOW keeps
+            # anything typed before this, which the default would throw away.
+            tty.setcbreak(fd, termios.TCSANOW)
+            self._read_keys(fd, loop, lines)
+        except Exception:
+            log.debug("reading keys failed; the input ends here", exc_info=True)
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(lines.put_nowait, None)
         finally:
             restore()
+
+    def _read_keys(
+        self, fd: int, loop: asyncio.AbstractEventLoop, lines: asyncio.Queue[str | None]
+    ) -> None:
+        """Hand the loop each change to the typed line and each finished line until the
+        input ends (end of file or Ctrl-D on an empty line), then None."""
+        assert self.on_typing is not None
+        editor = LineEditor()
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        while True:
+            data = os.read(fd, 1024)
+            events = editor.feed(decoder.decode(data)) if data else [("end", "")]
+            for kind, text in events:
+                try:
+                    if kind == "typed":
+                        loop.call_soon_threadsafe(self.on_typing, text, False)
+                    elif kind == "line":
+                        loop.call_soon_threadsafe(self.on_typing, text, True)
+                        loop.call_soon_threadsafe(lines.put_nowait, text.strip())
+                    else:
+                        loop.call_soon_threadsafe(lines.put_nowait, None)
+                        return
+                except RuntimeError:
+                    return  # the loop has closed: the session is over
 
 
 class Session:
@@ -257,6 +276,7 @@ class Session:
         self.read_line = read_line or StdinLines(self._typed if self.draws_typing else None)
         self.listen = sys.stdin.isatty() if listen is None else listen
         self._at_prompt = False  # the "> " prompt is showing and waits for a line
+        self._line_so_far = ""  # what is typed on the current line, when the session draws it
         self.view = RunView(console, plain=plain)
         self.view.attach(team.bus)
         self.lock = DriveLock(team.runs_dir)
@@ -281,8 +301,9 @@ class Session:
     def _typed(self, text: str, entered: bool) -> None:
         """Show what the user has typed so far: after the hint under the live view, or
         on the prompt's line. Enter ends the line there, as the terminal's echo did."""
+        self._line_so_far = "" if entered else text
+        self.view.typed(self._line_so_far)  # kept for the next frame when not live
         if self.view.live:
-            self.view.typed("" if entered else text)
             return
         prompt = "> " if self._at_prompt else ""
         try:
@@ -501,7 +522,9 @@ class Session:
         """One line at a prompt: the read already in flight, or a new one."""
         if self._ended:
             return None
-        self.console.print("> ", end="", markup=False, highlight=False)
+        # A line begun under the live tree carries on at the prompt, so show it there.
+        shown = self._line_so_far if self.draws_typing else ""
+        self.console.print(f"> {shown}", end="", markup=False, highlight=False)
         if self._reading is None:
             self._reading = asyncio.ensure_future(self.read_line())
         self._at_prompt = True

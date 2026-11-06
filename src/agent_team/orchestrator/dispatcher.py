@@ -29,6 +29,7 @@ from agent_team.core.interfaces import (
     ArtifactStore,
     Auditor,
     CheckpointStore,
+    DecisionLog,
     EventBus,
     FeedbackStore,
     TaskStore,
@@ -52,6 +53,7 @@ from agent_team.core.models import (
     TaskEnvelope,
     TaskStatus,
     Verdict,
+    stronger_attempts,
 )
 from agent_team.core.tracing import Tracer
 from agent_team.llm.types import LLMClient
@@ -106,8 +108,9 @@ class Dispatcher:
     research: ResearchLimits | None = None
     #: The tool calls of earlier attempts, summed up for a retry after an error.
     tool_log: ToolCallLog | None = None
-    #: The stronger model's name: a task on it gets a compact envelope.
-    stronger_model: str | None = None
+    #: The decision log, whose STRONGER_MODEL decisions mark the attempts that get a
+    #: compact envelope; None gives every attempt the full one.
+    decisions: DecisionLog | None = None
 
     async def dispatch(self, task: Task) -> AgentResult:
         """Run one attempt of ``task`` and move it on; never raises for agent errors."""
@@ -358,7 +361,7 @@ class Dispatcher:
         # The stronger model starts small, since it costs many times as much per token:
         # the objective, inputs, last output, findings and feedback on them, without
         # memories, the harness's notes, the last attempt's tool trail or upstream diffs.
-        compact = self.stronger_model is not None and task.model == self.stronger_model
+        compact = await self._on_stronger(task)
         memories: list[str] = []
         if self.memory is not None and not compact:
             memories = await self.memory(task, run, inputs)
@@ -386,6 +389,14 @@ class Dispatcher:
             trace_id=task.trace_id or run.trace_id,
             span_id=task.span_id or run.span_id,
         )
+
+    async def _on_stronger(self, task: Task) -> bool:
+        """Whether this attempt of ``task`` runs on the stronger model: a decision sent
+        the task there at or before it. The stronger route then stays with the task."""
+        if self.decisions is None:
+            return False
+        first = stronger_attempts(await self.decisions.list(task.run_id)).get(task.id)
+        return first is not None and task.attempt >= first
 
     async def _input_feedback(
         self, run_id: str, refs: list[ArtifactRef], all_tasks: list[Task]

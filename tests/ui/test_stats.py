@@ -174,9 +174,9 @@ def test_an_output_that_failed_validation_is_not_a_first_pass() -> None:
 
 
 def test_token_counts_are_short() -> None:
-    shown = [row("r", Stats(input_tokens=n)).__getitem__(2) for n in (950, 5_500, 812_400)]
-    assert shown == ["950", "5.5k", "812k"]
-    assert [row("r", Stats(input_tokens=n))[2] for n in (1_150_000, 20_396_212)] == ["1.1M", "20M"]
+    counts = (950, 5_500, 812_400, 999_999, 1_160_000, 20_396_212)
+    shown = [row("r", Stats(input_tokens=n))[2] for n in counts]
+    assert shown == ["950", "5.5k", "812k", "999k", "1.2M", "20.4M"]
 
 
 def test_the_all_runs_table_never_cuts_numbers_at_80_columns() -> None:

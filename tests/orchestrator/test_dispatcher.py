@@ -212,11 +212,10 @@ async def test_feedback_reaches_only_its_own_line_of_work(tmp_path: Path) -> Non
 
 
 async def test_the_stronger_model_gets_a_compact_envelope(tmp_path: Path) -> None:
-    from agent_team.core.models import Feedback, FeedbackSource
+    from agent_team.core.models import Decision, DecisionKind, Feedback, FeedbackSource
 
     team = await make_team(tmp_path)
     run = await team.orch.start_run("Build a books API")
-    team.dispatcher.stronger_model = "claude-sonnet-5-5"
     remembered: list[str] = []
 
     async def memory(task: Task, run: Any, inputs: Any) -> list[str]:
@@ -235,6 +234,7 @@ async def test_the_stronger_model_gets_a_compact_envelope(tmp_path: Path) -> Non
             output_kind="prd",
             attempt=3,
             previous_error=failed,
+            model="claude-sonnet-5-5",  # an agent may run on that model as its own
         )
     )
     for source, text in (
@@ -250,7 +250,17 @@ async def test_the_stronger_model_gets_a_compact_envelope(tmp_path: Path) -> Non
     assert usual.memories == ["an old lesson"] and usual.previous_attempt is not None
     assert len(usual.feedback) == 3
 
-    task = await team.tasks.update_task(task.model_copy(update={"model": "claude-sonnet-5-5"}))
+    await team.decisions.record(
+        Decision(
+            run_id=run.id,
+            task_id=task.id,
+            kind=DecisionKind.STRONGER_MODEL,
+            inputs={"attempt": 3, "model": "claude-sonnet-5-5"},
+            choice="one last attempt on claude-sonnet-5-5",
+            reason="no attempts left",
+            made_by="code",
+        )
+    )
     compact = await team.dispatcher.build_envelope(task, run)
     assert compact.memories == [] and compact.previous_attempt is None
     assert compact.upstream_diff is None

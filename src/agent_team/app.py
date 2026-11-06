@@ -252,7 +252,7 @@ async def build_app(
         auditor=auditor,
         research=research_limits,
         tool_log=tool_log,
-        stronger_model=config.stronger_model.model if config.stronger_model else None,
+        decisions=stores.decisions,
     )
     stronger = config.stronger_model
     stronger_price = config.prices.get(stronger.model) if stronger else None

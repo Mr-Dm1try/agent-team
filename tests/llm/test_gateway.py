@@ -247,6 +247,13 @@ async def test_the_stronger_model_runs_with_its_own_prompt_cap(sleeps: Sleeps) -
     gw.use_stronger_model("task_1")
     assert gw.context_budget(AgentName.PRODUCT, "task_1") == 300
     assert gw.context_budget(AgentName.PRODUCT, "task_2") == 1000
+    # A cap above the agent's own budget never raises it.
+    loose = make_config(
+        stronger_model={"provider": "fake", "model": "fake-strong", "context_budget": 5000}
+    )
+    wide = gateway(FakeProvider(), sleeps=sleeps, config=loose)
+    wide.use_stronger_model("task_1")
+    assert wide.context_budget(AgentName.PRODUCT, "task_1") == 1000
     # Without a cap of its own, it runs with the agent's budget.
     plain = gateway(FakeProvider(), sleeps=sleeps)
     plain.use_stronger_model("task_1")

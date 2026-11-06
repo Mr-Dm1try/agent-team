@@ -686,13 +686,30 @@ def own_questions(ctx: AuditContext) -> list[str]:
         return []
     question = task.objective
     plan = ctx.latest.get("plan")
-    if task.origin is TaskOrigin.RESEARCH_REQUEST and task.reason:
-        question += f" ({task.reason})"
+    request = _request_of(task, ctx.tasks)
+    if request is not None:
+        question += f" ({request.reason})" if request.reason else ""
     elif isinstance(plan, Plan):
         asks = [q.ask for q in own_plan_questions(plan, task)]
         if asks:
             question += f" (for {', '.join(asks)})"
     return [question]
+
+
+def _request_of(task: Task, tasks: list[Task]) -> Task | None:
+    """The task made from a research request that ``task`` is, or was reopened from
+    (a fix or revision of requested research); None for planned research."""
+    by_id = {t.id: t for t in tasks}
+    current: Task | None = task
+    seen: set[str] = set()
+    while current is not None and current.id not in seen:
+        if current.origin is TaskOrigin.RESEARCH_REQUEST:
+            return current
+        if current.origin is TaskOrigin.PLAN:
+            return None
+        seen.add(current.id)
+        current = by_id.get(current.parent_task_id) if current.parent_task_id else None
+    return None
 
 
 def own_plan_questions(plan: Plan, task: Task) -> list[ResearchQuestion]:

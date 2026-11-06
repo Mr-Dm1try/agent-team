@@ -4,6 +4,7 @@ terminal's echo off so the session can draw what is typed."""
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import sys
 
@@ -66,3 +67,12 @@ async def test_the_reader_echoes_nothing_itself_and_gives_the_terminal_back(
         stdin.close()
         os.close(slave)
         os.close(master)
+
+
+async def test_a_stdin_that_cant_switch_to_keys_is_read_by_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO("hello\n"))  # no file descriptor
+    reader = StdinLines(lambda text, entered: None)
+    assert await asyncio.wait_for(reader(), 5) == "hello"
+    assert await asyncio.wait_for(reader(), 5) is None

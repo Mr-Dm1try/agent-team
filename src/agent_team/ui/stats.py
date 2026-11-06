@@ -29,7 +29,7 @@ from agent_team.core.errors import OWN_OUTPUT_ERRORS
 from agent_team.core.interfaces import TaskStore
 from agent_team.core.models import AgentName, Event, EventName, Run, Task, TaskOrigin
 from agent_team.core.tracing import SpanRecord, read_events, spans_from_events
-from agent_team.ui.view import short
+from agent_team.ui.view import compact, short
 
 #: Agents whose tasks are audited work, not checks or questions.
 WORK_AGENTS = frozenset(a for a in AgentName if a not in (AgentName.AUDITOR, AgentName.USER))
@@ -165,16 +165,6 @@ def _time(seconds: float) -> str:
     return f"{minutes}m{secs:02d}s"
 
 
-def _count(n: int) -> str:
-    """A token count in at most five characters, such as 950, 5.5k, 812k, 1.2M or 20M,
-    so the number columns stay narrow enough to show whole at 80 columns."""
-    for unit, size in (("M", 1_000_000), ("k", 1_000)):
-        if n >= size:
-            value = n / size
-            return f"{value:.1f}{unit}" if value < 10 else f"{value:.0f}{unit}"
-    return str(n)
-
-
 #: Two-line headers keep the number columns as narrow as their numbers.
 HEADER = ("", "calls", "tokens\nin", "tokens\nout", "cost", "time", "tasks", "retries", "1st\npass")
 #: Printed under the table, so the time column can't be misread.
@@ -192,8 +182,8 @@ def row(name: str, stats: Stats) -> tuple[str, ...]:
     return (
         name,
         str(stats.calls),
-        _count(stats.input_tokens),
-        _count(stats.output_tokens),
+        compact(stats.input_tokens),
+        compact(stats.output_tokens),
         f"${stats.cost_usd:.4f}",
         _time(stats.seconds),
         str(stats.tasks),

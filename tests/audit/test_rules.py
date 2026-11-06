@@ -366,6 +366,27 @@ def test_p2_judges_a_brief_only_on_its_own_questions(run: Run) -> None:
         prompt = render_prompt(ctx, [RULES["P2"]], {"P2": res})
         assert "Read-only database handling?" not in prompt
         assert ("WAL trade-offs?" in prompt) is (task is planned)
+    # A fix of requested research is still judged on the request it came from.
+    fix = researching.model_copy(
+        update={
+            "id": "task_fix",
+            "objective": "Checkpoint cost?",
+            "origin": TaskOrigin.FIX,
+            "parent_task_id": requested.id,
+            "reason": "fix of R2",
+        }
+    )
+    reopened = AuditContext(
+        run=run,
+        scope=RuleScope.TASK,
+        task=fix,
+        artifact=brief,
+        tasks=[planned, requested, fix],
+        latest={"plan": two},
+    )
+    assert "(research request 1 from researcher: trade-offs)" in "\n".join(
+        run_helper("P2", reopened).notes
+    )
     # The final answer's check still sees the whole plan.
     answer = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_answer")
     whole = AuditContext(
