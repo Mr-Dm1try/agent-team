@@ -1011,6 +1011,14 @@ def interface_names(ctx: AuditContext, rule: Rule) -> HelperResult:
         return HelperResult()
     code = "\n".join(text for *_, text in ctx.code_files())
     res = HelperResult()
+    declared = [
+        line
+        for _, out in ctx.outputs
+        if isinstance(out, CodeChange)
+        for line in out.spec_deviations
+    ]
+    if declared:
+        res.notes.append(f"departures from the spec the Engineer declared: {declared}")
     for iface in spec.interfaces:
         needle = _interface_needle(iface.name)
         if not needle:

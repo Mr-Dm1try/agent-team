@@ -271,6 +271,7 @@ class FeedbackSource(StrEnum):
     AUDITOR = "auditor"
     QA = "qa"
     HARNESS = "harness"  # a limit the harness applied, such as on research requests
+    ENGINEER = "engineer"  # where passed code departs from the spec it was built from
 
 
 class Feedback(Contract):

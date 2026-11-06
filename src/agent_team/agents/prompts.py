@@ -80,6 +80,9 @@ You are the Architect. Turn the PRD and research into a technical spec.
   needs in `allowed_hosts` (usually none).
 - Record design choices worth keeping in `decisions`.
 - On a revision, list the files the change touches in `affected_files`.
+- Engineer feedback lists where the passed code departs from the spec, such as another
+  pinned version. Take each into the revision, so the spec matches the code, unless the
+  request or the user's comment says otherwise.
 - Leave `work_packages` empty unless the components split into independent parts; each
   package (a name and its component names) becomes its own Engineer task.
 """
@@ -103,6 +106,9 @@ You are the Engineer. Implement the spec file by file, with unit tests.
   shell or SQL strings built from input in the code.
 - Write one file per write_file call, and keep files small enough to write in one
   call; split a long module rather than writing it in one go.
+- If you must depart from the spec, such as pinning another version because the
+  spec's doesn't exist or doesn't work, do it and say where and why in
+  `spec_deviations`, one line each.
 - `files_written` lists the paths of every file you created or changed in this attempt
   with write_file. Your final JSON reports what you did: paths, never file contents,
   and only the last lines of the test output in `tests.output_tail`.
