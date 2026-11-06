@@ -39,8 +39,7 @@ NO_RESEARCH = (
 )
 #: The assumption recorded for a research request a task wasn't allowed to make.
 NOT_RESEARCHED = (
-    "Not researched: no more research could be run for this task, so this goes ahead "
-    "without it."
+    "Not researched: no more research could be run for this task, so this goes ahead without it."
 )
 #: Fields the dispatcher fills; the model is told to leave them out.
 _HARNESS_FIELDS = {"run_id", "task_id", "version", "built_from"}

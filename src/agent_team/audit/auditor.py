@@ -24,6 +24,7 @@ from agent_team.audit.evidence import (
     AuditContext,
     HelperResult,
     gather,
+    own_plan_questions,
     ref_of,
 )
 from agent_team.audit.llmjson import ask_json
@@ -33,6 +34,7 @@ from agent_team.core.artifacts import (
     ARTIFACT_TYPES,
     Artifact,
     ArtifactRef,
+    Plan,
     ResearchAnswer,
     ResearchBrief,
 )
@@ -510,7 +512,8 @@ def render_prompt(ctx: AuditContext, rules: list[Rule], helpers: dict[str, Helpe
         parts.append(f"## Built from {ref_of(brief)}\n{_dump(brief, _CONTEXT_CHARS)}")
     for kind, artifact in ctx.latest.items():
         if str(ref_of(artifact)) not in in_scope and kind in _UPSTREAM.get(ctx.phase, ()):
-            parts.append(f"## Upstream {ref_of(artifact)}\n{_dump(artifact, _CONTEXT_CHARS)}")
+            shown = _scoped(artifact, ctx.task)
+            parts.append(f"## Upstream {ref_of(artifact)}\n{_dump(shown, _CONTEXT_CHARS)}")
     for _, _, path, text in ctx.code_files()[:20]:
         parts.append(f"## File {path}\n```\n{_clip(text, _FILE_CHARS)}\n```")
     if ctx.tool_calls:
@@ -537,6 +540,15 @@ def render_prompt(ctx: AuditContext, rules: list[Rule], helpers: dict[str, Helpe
             + "\n".join(f"- {d.kind.value}: {d.choice} ({d.reason})" for d in ctx.decisions)
         )
     return "\n\n".join(parts)
+
+
+def _scoped(artifact: Artifact, task: Task | None) -> Artifact:
+    """An upstream artifact as a research brief's check shows it: the plan with only
+    the research question the brief's task was given, so the brief isn't judged on
+    questions other tasks answer. Other artifacts and checks see it whole."""
+    if not isinstance(artifact, Plan) or task is None or task.output_kind != "research_brief":
+        return artifact
+    return artifact.model_copy(update={"research_questions": own_plan_questions(artifact, task)})
 
 
 def _on_stronger(task: Task, stronger: dict[str, int]) -> bool:

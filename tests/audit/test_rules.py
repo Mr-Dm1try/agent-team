@@ -326,6 +326,54 @@ def test_p2_brief_complete(run: Run) -> None:
     assert blockers(run_helper("P2", bad)) == ["q?"]
 
 
+def test_p2_judges_a_brief_only_on_its_own_questions(run: Run) -> None:
+    # The plan asks two questions; each brief's check sees only the one its task was
+    # given, and a requested brief sees its own request, not the plan's questions.
+    two = plan(
+        research_questions=[
+            ResearchQuestion(question="WAL trade-offs?", ask="ASK-1"),
+            ResearchQuestion(question="Read-only database handling?", ask="ASK-2"),
+        ]
+    )
+    brief = ResearchBrief(summary="s", answers=[AnsweredQuestion(question="q", answer="a")])
+    researching = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    planned = researching.model_copy(update={"objective": "WAL trade-offs?"})
+    requested = researching.model_copy(
+        update={
+            "id": "task_requested",
+            "objective": "Checkpoint cost?",
+            "origin": TaskOrigin.RESEARCH_REQUEST,
+            "parent_task_id": planned.id,
+            "reason": "research request 1 from researcher: trade-offs",
+        }
+    )
+    for task, own in (
+        (planned, "WAL trade-offs? (for ASK-1)"),
+        (requested, "Checkpoint cost? (research request 1 from researcher: trade-offs)"),
+    ):
+        ctx = AuditContext(
+            run=run,
+            scope=RuleScope.TASK,
+            phase=Phase.PLANNING,
+            task=task,
+            artifact=brief,
+            outputs=[(task, brief)],
+            latest={"plan": two},
+        )
+        res = run_helper("P2", ctx)
+        notes = "\n".join(res.notes)
+        assert own in notes and "Read-only" not in notes
+        prompt = render_prompt(ctx, [RULES["P2"]], {"P2": res})
+        assert "Read-only database handling?" not in prompt
+        assert ("WAL trade-offs?" in prompt) is (task is planned)
+    # The final answer's check still sees the whole plan.
+    answer = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_answer")
+    whole = AuditContext(
+        run=run, scope=RuleScope.TASK, phase=Phase.PLANNING, task=answer, latest={"plan": two}
+    )
+    assert "Read-only database handling?" in render_prompt(whole, [RULES["P2"]], {})
+
+
 def test_r2_github_file_pages_and_tracking_links_are_one_source(run: Run) -> None:
     task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
     cited = [

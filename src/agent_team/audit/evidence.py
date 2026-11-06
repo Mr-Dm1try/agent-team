@@ -30,6 +30,7 @@ from agent_team.core.artifacts import (
     QAReport,
     ResearchAnswer,
     ResearchBrief,
+    ResearchQuestion,
     Spec,
     TestRun,
 )
@@ -43,6 +44,7 @@ from agent_team.core.models import (
     Run,
     Severity,
     Task,
+    TaskOrigin,
     TaskStatus,
     Verdict,
     attempt_text,
@@ -654,12 +656,12 @@ def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
     if not isinstance(brief, ResearchBrief):
         return HelperResult()
     res = HelperResult()
-    plan = ctx.latest.get("plan")
-    if isinstance(plan, Plan) and plan.research_questions:
-        questions = [f"{q.question} ({q.ask})" for q in plan.research_questions]
-        res.notes.append(f"research questions in the plan: {questions}")
     if ctx.task is not None:
-        res.notes.append(f"task objective: {ctx.task.objective}")
+        res.notes.append(f"the questions this brief was given: {own_questions(ctx)}")
+        res.notes.append(
+            "judge the brief only on these: the plan's other research questions are "
+            "other tasks' work"
+        )
     if not brief.answers:
         res.findings.append(hit(rule, "the brief answers no questions", artifact=brief))
     for i, ans in enumerate(brief.answers, start=1):
@@ -673,6 +675,30 @@ def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
                 )
             )
     return res
+
+
+def own_questions(ctx: AuditContext) -> list[str]:
+    """The questions a research brief's task was given: its objective, with the plan's
+    ask it serves for planned research, or why an agent asked for research it requested.
+    Never the plan's other research questions, which other tasks answer."""
+    task = ctx.task
+    if task is None:
+        return []
+    question = task.objective
+    plan = ctx.latest.get("plan")
+    if task.origin is TaskOrigin.RESEARCH_REQUEST and task.reason:
+        question += f" ({task.reason})"
+    elif isinstance(plan, Plan):
+        asks = [q.ask for q in own_plan_questions(plan, task)]
+        if asks:
+            question += f" (for {', '.join(asks)})"
+    return [question]
+
+
+def own_plan_questions(plan: Plan, task: Task) -> list[ResearchQuestion]:
+    """The plan's research questions a research task was made from: the one its
+    objective is; none for research an agent asked for."""
+    return [q for q in plan.research_questions if q.question == task.objective]
 
 
 def _pins(text: str) -> dict[str, set[str]]:
