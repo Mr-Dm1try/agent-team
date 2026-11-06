@@ -5,6 +5,7 @@
 - agent_team.agents: Agent implementations; agent_team.orchestrator: Dispatcher and
   Orchestrator; agent_team.tools: tools.
 - agent_team.audit: Auditor, VerdictPolicy, rule store and evidence helpers.
+- agent_team.memory: MemoryIndex and the Embedders.
 
 Each package codes against these Protocols and tests with its own fakes. The two
 context classes are plain dataclasses: they only bundle the services passed in.
@@ -25,6 +26,9 @@ from agent_team.core.models import (
     EventName,
     Feedback,
     HookOutcome,
+    Memory,
+    MemoryKind,
+    MemoryMatch,
     Phase,
     PrecheckResult,
     Rule,
@@ -203,6 +207,67 @@ class VerdictStore(Protocol):
 
     async def for_task(self, task_id: str) -> list[Verdict]:
         """Every verdict on this task, oldest first: one per audited attempt."""
+        ...
+
+
+# --- memory ------------------------------------------------------------------------
+
+
+class Embedder(Protocol):
+    """Turns text into vectors for memory search."""
+
+    async def embed(self, texts: Sequence[str], *, query: bool) -> list[list[float]]:
+        """One vector per text, in order; ``query`` marks search text rather than a
+        memory being saved. Raises EmbedderUnavailable when the model can't answer."""
+        ...
+
+
+class MemoryIndex(Protocol):
+    """Long-term memory: saved memories, their vectors, and the matches for a query.
+    Retrieval goes through ``search`` alone, so a vector database could replace the
+    SQLite one by implementing this."""
+
+    async def save(
+        self, memory: Memory, vector: Sequence[float] | None, *, merge_at: float
+    ) -> tuple[Memory, bool]:
+        """Save ``memory``, or merge it into a near-duplicate of the same kind (the
+        same text, or a cosine of at least ``merge_at``), which keeps its id and gains
+        the new sources. Returns the stored memory and whether it was merged."""
+        ...
+
+    async def search(
+        self,
+        text: str,
+        vector: Sequence[float] | None,
+        kinds: Sequence[MemoryKind],
+        *,
+        limit: int,
+    ) -> list[MemoryMatch]:
+        """Memories of ``kinds`` that match ``text`` by keywords or ``vector`` by
+        meaning, up to ``limit`` from each, with their raw scores."""
+        ...
+
+    async def memories(self, kinds: Sequence[MemoryKind] | None = None) -> list[Memory]:
+        """Every memory, or those of ``kinds``, oldest first."""
+        ...
+
+    async def without_vectors(self, limit: int) -> list[Memory]:
+        """Memories saved while the embedder was down, oldest first."""
+        ...
+
+    async def set_vector(self, memory_id: str, vector: Sequence[float]) -> None:
+        """Store the vector of a memory saved without one."""
+        ...
+
+    async def record_fetch(
+        self, run_id: str, task_id: str, attempt: int, query: str, ids: Sequence[str]
+    ) -> None:
+        """Remember which memories one attempt of a task was given."""
+        ...
+
+    async def credit(self, task_id: str) -> list[str]:
+        """Raise the usefulness of each memory the task's first attempt was given, once
+        per task; returns their ids."""
         ...
 
 

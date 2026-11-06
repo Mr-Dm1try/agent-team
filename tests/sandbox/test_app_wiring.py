@@ -31,7 +31,9 @@ async def test_the_runner_backs_the_command_tools(tmp_path: Path) -> None:
 
 
 async def test_disabled_sandbox_and_web_leave_only_file_tools(tmp_path: Path) -> None:
-    config = e2e_config(tmp_path, sandbox={"enabled": False}, web={"enabled": False})
+    config = e2e_config(
+        tmp_path, sandbox={"enabled": False}, web={"enabled": False}, memory={"enabled": False}
+    )
     with await build_app(config, providers=_provider()) as app:
         assert set(app.dispatcher.tools) == {"read_file", "list_dir", "grep", "write_file"}
 

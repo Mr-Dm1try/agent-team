@@ -1,4 +1,5 @@
-"""Command-line entry point: start, resume and stop runs, and read their logs and stats.
+"""Command-line entry point: start, resume and stop runs, read their logs and stats, and
+search memory.
 
 ``run`` and ``resume`` show the run live and talk to the team (see ui/session.py).
 While the run waits on you, each line typed is sent as a message; end the input
@@ -27,15 +28,20 @@ from agent_team.core.control import DriveLock, KillSwitch
 from agent_team.core.db import Database
 from agent_team.core.errors import SandboxError
 from agent_team.core.events import InMemoryEventBus
-from agent_team.core.models import Event, RunStatus
+from agent_team.core.interfaces import Embedder
+from agent_team.core.models import Event, MemoryKind, RunStatus
 from agent_team.core.stores import SqliteDecisionLog, SqliteTaskStore
 from agent_team.core.tracing import JsonlTracer, load_spans, read_events, render_tree, span_tree
 from agent_team.llm.chaos import parse_chaos
+from agent_team.memory import open_search
+from agent_team.memory.rank import line
 from agent_team.orchestrator.base import mark_stopped
 from agent_team.ui.session import Session
 from agent_team.ui.stats import HEADER, overview_table, run_stats, run_table
 
 app = typer.Typer(help="Multi-agent harness: Planning, PRD, Spec and Implementation.")
+memory_app = typer.Typer(help="Long-term memory from earlier runs.")
+app.add_typer(memory_app, name="memory")
 
 ConfigOption = Annotated[
     Path | None, typer.Option("--config", "-c", help="Config file (default: config/default.yaml).")
@@ -47,6 +53,8 @@ ChaosOption = Annotated[
 #: Builds the app from a config; tests swap it for one over a scripted model.
 AppFactory = Callable[[Config], Awaitable[App]]
 _factory: AppFactory = build_app
+#: The embedder ``memory search`` uses; None is the configured Ollama one.
+_embedder: Embedder | None = None
 
 
 @app.callback()
@@ -138,6 +146,38 @@ def logs(
         raise typer.Exit(1)
     for event in events:
         typer.echo(format_event(event))
+
+
+@memory_app.command("search")
+def memory_search(
+    query: str,
+    kind: Annotated[
+        list[MemoryKind] | None, typer.Option(help="Only this kind; repeat for several.")
+    ] = None,
+    limit: Annotated[int, typer.Option(min=1, help="Most results to print.")] = 10,
+    config: ConfigOption = None,
+) -> None:
+    """Print the memories that best match QUERY, best first, with their scores."""
+    raise typer.Exit(
+        asyncio.run(_search(load_config(config), query, kind or list(MemoryKind), limit))
+    )
+
+
+async def _search(config: Config, query: str, kinds: list[MemoryKind], limit: int) -> int:
+    """Run one search and print it; returns 1 when nothing matched."""
+    parts = await open_search(config, embedder=_embedder)
+    try:
+        found = await parts.search.search(query, kinds, run_id=None)
+    finally:
+        parts.close()
+    if found.mode == "bm25":
+        typer.echo(f"Keyword search only ({found.embedder_error}).", err=True)
+    if not found.ranked:
+        typer.echo("No memory matched.", err=True)
+        return 1
+    for r in found.ranked[:limit]:
+        typer.echo(f"{r.score:.3f}  {r.memory.id}  {line(r.memory, None)}")
+    return 0
 
 
 def _config(path: Path | None, chaos: str | None) -> Config:

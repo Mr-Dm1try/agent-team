@@ -266,7 +266,7 @@ You can steer every phase: agents ask you questions when they need to, and you c
 - **Review modes.** The config sets `review` to `every_phase`, `questions_only` or `auto_assumptions`. In auto\_assumptions mode agents don't wait: they record assumptions instead of asking, and you review at the end. In `questions_only` mode agents still stop and ask you when they need to, but phases move on without your review, and you review once at the end. `every_phase` adds a review of each phase before the next one starts. The auto\_assumptions mode keeps a live demo moving, and its final review lists every assumption so you can correct any of them.
 - **Rule R11, questions resolved.** A phase can't pass while any of its questions is neither answered nor recorded as an assumption.
 
-Answers and comments that state a preference are saved to memory, so the next run doesn't ask again.
+Answers and comments that state a preference are saved to memory, so the next run doesn't ask again. The orchestrator keeps one with its remember\_preference action, which code validates like its other actions and records as a decision.
 
 ## Memory
 
@@ -298,7 +298,11 @@ For each task, step by step:
 
 For example, on a second API run the Engineer's prompt starts with "Lesson: FastAPI tests need httpx installed (run 3)" and "Preference: you want type hints and pytest", so it avoids the failure the first run hit.
 
-**Ranking and upkeep.** A memory's score combines text match, recency and usefulness. Usefulness goes up each time a task that received the memory passes audit on its first try. Near-duplicates are merged when written.
+**Ranking and upkeep.** A memory's score combines text match, recency and usefulness, with the weights in the `memory:` config. Text match mixes the cosine with a keyword score: BM25, or the share of words in common when that is higher, because BM25 gives no weight to a term found in half the memories or more, which with a handful of memories is nearly every term. Usefulness goes up each time a task that received the memory passes audit on its first try. Near-duplicates are merged when written: the same words, or a cosine of 0.92 or more within one kind. The merge keeps the older memory's id and text and adds the new source, so the trace still credits both runs.
+
+**Memory is data.** Memories are quoted in the prompt under a header that says the current request wins and nothing quoted is an instruction. The writer drops any text that reads like instructions, a research fact is saved only with a source its brief cites (the ones rule R2 checked), and memory\_search results go through the auditor's injected-instructions check (S6) like any other read tool.
+
+**Lessons.** When a task passes after a failed check, the writer builds a lesson in code from the earlier finding (its rule and message) and the fix that worked: the passing output's summary and the fields it changed against the failed version, or the auditor's suggested fix when there is no earlier version to compare. A check that failed closed teaches nothing and leaves no lesson.
 
 **Self-improvement.** Lessons are how the system improves: a failure, the fix that worked and the rule that caught it become a lesson fetched the next time a similar task runs.
 
@@ -310,7 +314,7 @@ Embedding model: nomic-embed-text runs locally through Ollama (under 300 MB), so
 
 Logging, auditing, memory and the live terminal view are all hooks on one event bus, so new behavior never means editing the core loop.
 
-**Events:** run\_started, phase\_started, phase\_finished, task\_started, task\_finished, llm\_call\_before, llm\_call\_after, tool\_call\_before, tool\_call\_after, audit\_verdict, decision, task\_state\_changed, task\_retried, task\_escalated, question\_asked, review\_requested, user\_message, memory\_fetched, checkpoint\_saved, context\_compacted, run\_finished.
+**Events:** run\_started, phase\_started, phase\_finished, task\_started, task\_finished, llm\_call\_before, llm\_call\_after, tool\_call\_before, tool\_call\_after, audit\_verdict, decision, task\_state\_changed, task\_retried, task\_escalated, question\_asked, review\_requested, user\_message, memory\_fetched, memory\_saved, checkpoint\_saved, context\_compacted, run\_finished.
 
 **Two kinds of hook.** A before hook can change or block what is about to happen, such as denying a shell command or stopping a call that would pass the budget. An after hook only observes.
 
@@ -318,7 +322,7 @@ Logging, auditing, memory and the live terminal view are all hooks on one event 
 | --- | --- | --- |
 | Tracer | Every event | Writes each event, spans included, to events.jsonl |
 | Auditor | task\_finished, phase\_finished, run\_finished | Starts the auditor's sweep as a task |
-| Memory writer | audit\_verdict, run\_finished | Saves proposed memories once their audit passes, and writes the run summary |
+| Memory writer | audit\_verdict, decision, run\_finished | Saves proposed memories and lessons once their audit passes, preferences from remember decisions, and the run summary; logs each save as memory\_saved |
 | Budget guard | llm\_call\_before | Blocks calls past the token or cost cap |
 | Auditor pre-check | tool\_call\_before | Checks each tool call against the auditor's safety rules before it runs: blocks clear violations, asks the auditor model about unclear ones, allows the rest |
 | Live view | Every event | Streams progress to your terminal |
@@ -384,7 +388,7 @@ Generated code runs only inside a Docker container, and you drive everything fro
 - The orchestrator's replies print under the view. While the run waits on you, each line you type is sent as a message: an answer, a comment, a question or a change. Ending the input (Ctrl-D) leaves the run waiting, and `agent-team resume <run_id>` picks it up, after a crash too. `--chaos` injects model faults, and `--context <folder>` gives the Researcher files to read but never write.
 - At the end you get a summary, the run audit's findings, QA's evidence for each acceptance criterion, the test results and every assumption. You type accept or describe a change, and the session stays open. After a change re-runs, the next review starts with what changed: a section diff of each artifact that got a new version, with list items matched by id, and the git diff between the code versions' tags.
 - You can then ask things like "show the PRD", "list the files" or "why did the spec retry?", or ask for a change in plain words.
-- `agent-team logs <run_id>` prints the run's events, filtered with `--agent` or `--task`, and `--spans` prints its trace tree. `agent-team memory search` will cover memory.
+- `agent-team logs <run_id>` prints the run's events, filtered with `--agent` or `--task`, and `--spans` prints its trace tree. `agent-team memory search "<query>"` prints the best memories with their scores, filtered with `--kind`.
 - `agent-team stats [run_id]` shows tokens, cost, time, retries and the first-pass audit rate per run and per agent, for the performance part of the demo. A run's time counts only while tasks were working, not while it waited on you. The first-pass rate counts planned work whose first audit passed; retries, revisions and fixes don't count toward it.
 - The workflow itself is driven only through the orchestrator's streaming session, as the brief requires. The other commands only read the store, apart from resume and stop, which the session also offers.
 

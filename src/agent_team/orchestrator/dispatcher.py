@@ -71,7 +71,8 @@ INPUT_KINDS: dict[AgentName, tuple[str, ...]] = {
 #: Errors that pause the run rather than fail the attempt.
 PAUSING_ERRORS = frozenset({"BudgetExceeded", "RunStopped"})
 
-MemoryFetcher = Callable[[Task, Run], Awaitable[list[str]]]
+#: The "Relevant memory" lines for a task, given its run and its input artifacts.
+MemoryFetcher = Callable[[Task, Run, list[Artifact]], Awaitable[list[str]]]
 ConstraintSource = Callable[[Task, Run], list[str]]
 
 
@@ -335,7 +336,7 @@ class Dispatcher:
 
         memories: list[str] = []
         if self.memory is not None:
-            memories = await self.memory(task, run)
+            memories = await self.memory(task, run, inputs)
         constraints = self.constraints(task, run) if self.constraints else []
 
         return TaskEnvelope(

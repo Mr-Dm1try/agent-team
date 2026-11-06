@@ -7,6 +7,7 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from agent_team.agents.prompts import RUN_SUMMARY
 from agent_team.core.models import AgentName
 from agent_team.llm.types import ContentBlock, LLMRequest, ToolResultBlock
 from agents.fakes import reply, tool_call
@@ -123,6 +124,8 @@ def orchestrator_responder(
             if not _last_is_tool_result(request):
                 return tool_call("list_tasks", {})
             return json.dumps({"answer": "The PRD retried once.", "cited": ["prd@v2"]})
+        if request.system == RUN_SUMMARY:
+            return json.dumps({"summary": "Built the books API with one test."})
         if request.system.startswith("You compress"):
             return json.dumps({"done": ["things"], "decisions": [], "remaining": []})
         raise AssertionError("unexpected orchestrator call")
