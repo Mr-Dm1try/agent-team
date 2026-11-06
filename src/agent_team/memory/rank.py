@@ -104,13 +104,15 @@ def score(match: MemoryMatch, rel: float, config: MemoryConfig, now: datetime) -
     )
 
 
-def lesson_agent(memory: Memory) -> AgentName | None:
-    """The agent a lesson came from: its source's agent, or for a lesson saved before
-    sources named one, the agent its text starts with ("Engineer, implementation: ...")."""
-    if memory.origin.agent is not None:
-        return memory.origin.agent
+def lesson_agents(memory: Memory) -> set[AgentName]:
+    """The agents a lesson came from: every source's agent (a merged lesson can have
+    several), or for a lesson saved before sources named one, the agent its text
+    starts with ("Engineer, implementation: ..."). Empty when nothing says."""
+    named = {s.agent for s in memory.sources if s.agent is not None}
+    if named:
+        return named
     head = memory.text.split(",", 1)[0].strip().lower()
-    return AgentName(head) if head in {a.value for a in AgentName} else None
+    return {AgentName(head)} if head in {a.value for a in AgentName} else set()
 
 
 def rank(
@@ -129,8 +131,8 @@ def rank(
     out: list[Ranked] = []
     for match in matches:
         if agent is not None and match.memory.kind is MemoryKind.LESSON:
-            taught = lesson_agent(match.memory)
-            if taught is not None and taught is not agent:
+            taught = lesson_agents(match.memory)
+            if taught and agent not in taught:
                 continue
         rel = relevance(match, config)
         if rel < config.min_relevance:

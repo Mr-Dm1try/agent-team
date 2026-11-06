@@ -15,8 +15,8 @@ import httpx
 from agent_team.core.config import EmbedderConfig
 from agent_team.core.errors import EmbedderUnavailable
 from agent_team.core.interfaces import Embedder
+from agent_team.core.words import STOPWORDS, WORD
 from agent_team.llm.ollama_api import api_root, error_text, model_context
-from agent_team.memory.store import STOPWORDS, WORD
 
 #: Characters per token planned for when cutting a text to the embedder's window. Lower
 #: than for chat prompts, since memories hold paths, URLs and code that pack tokens.
@@ -55,7 +55,7 @@ class OllamaEmbedder:
         limit = await model_context(self._client, self.config.model)
         chars = int(min(cap, limit or cap) * EMBED_CHARS_PER_TOKEN)
         if limit is not None:
-            self._max_chars = chars  # Ollama has said; until then, ask again next time
+            self._max_chars = chars  # Ollama answered; until it does, ask again next time
         return chars
 
     async def embed(self, texts: Sequence[str], *, query: bool) -> list[list[float]]:

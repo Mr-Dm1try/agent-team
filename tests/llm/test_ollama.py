@@ -395,6 +395,25 @@ async def test_the_configured_window_is_used_until_ollama_answers() -> None:
     assert fake.paths.count("/api/show") == 2  # asked again, since it didn't say
 
 
+async def test_an_answer_without_a_limit_or_a_loaded_model_is_asked_once() -> None:
+    """Ollama answered /api/show with no context length, and /api/ps doesn't list the
+    model (unloaded at once): neither is asked again on every call."""
+
+    def bare_show(req: httpx.Request) -> httpx.Response:
+        """A fake whose /api/show carries no context length."""
+        if req.url.path == "/api/show":
+            return httpx.Response(200, json={"model_info": {}})
+        return fake(req)
+
+    fake = FakeOllama(counted(10))
+    provider = op.OllamaProvider(transport=httpx.MockTransport(bare_show))
+    for _ in range(3):
+        await provider.complete(request(), model="gpt-oss:20b")
+    assert fake.paths.count("/api/ps") == 1
+    assert fake.chats[-1]["options"]["num_ctx"] == 32_768
+    assert await provider.window("gpt-oss:20b") == 32_768
+
+
 async def test_ollama_timeout_grows_with_the_reply_it_may_write() -> None:
     provider, _ = ollama(counted(0))
     body, short = await provider._body(request(max_tokens=1_000), "gpt-oss:20b", None, stream=False)

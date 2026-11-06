@@ -16,7 +16,7 @@ from agent_team.core.models import (
     Phase,
     Task,
 )
-from agent_team.memory.rank import build_query, fit, lesson_agent, line, rank
+from agent_team.memory.rank import build_query, fit, lesson_agents, line, rank
 
 NOW = datetime(2026, 11, 4, tzinfo=UTC)
 RUN = "run_now"
@@ -174,8 +174,8 @@ def test_a_lesson_goes_only_to_the_agent_that_learned_it() -> None:
         lesson("mem_old", "Engineer, implementation: rule R6 caught ...", None),
         lesson("mem_any", "no agent named here", None),
     ]
-    assert lesson_agent(matches[2].memory) is AgentName.ENGINEER
-    assert lesson_agent(matches[3].memory) is None
+    assert lesson_agents(matches[2].memory) == {AgentName.ENGINEER}
+    assert lesson_agents(matches[3].memory) == set()
 
     def ids(agent: AgentName | None) -> list[str]:
         """What ``agent`` is given."""
@@ -186,3 +186,11 @@ def test_a_lesson_goes_only_to_the_agent_that_learned_it() -> None:
     assert ids(AgentName.RESEARCHER) == ["mem_any", "mem_res"]
     assert ids(AgentName.ENGINEER) == ["mem_any", "mem_eng", "mem_old"]
     assert len(ids(None)) == 4
+
+    # A lesson two agents learned (merged) goes to both.
+    shared = lesson("mem_two", "Engineer, implementation: rule R6 caught ...", AgentName.ENGINEER)
+    shared.memory.sources.append(MemorySource(run_id="run_2", agent=AgentName.QA))
+    assert lesson_agents(shared.memory) == {AgentName.ENGINEER, AgentName.QA}
+    for agent in (AgentName.ENGINEER, AgentName.QA):
+        assert rank([shared], MemoryConfig(), now=NOW, run_id=RUN, agent=agent)
+    assert not rank([shared], MemoryConfig(), now=NOW, run_id=RUN, agent=AgentName.RESEARCHER)

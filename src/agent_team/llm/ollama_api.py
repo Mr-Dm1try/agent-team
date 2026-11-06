@@ -48,12 +48,13 @@ def trained_context(show: dict[str, Any]) -> int | None:
 
 
 async def model_context(client: httpx.AsyncClient, model: str) -> int | None:
-    """The model's own context window from ``/api/show``, or None when Ollama can't
-    say (it is down, or the model isn't pulled). Never raises."""
+    """The model's own context window from ``/api/show``; 0 when Ollama answered but
+    gave none, and None when it couldn't answer (it is down, or the model isn't
+    pulled), so the caller may ask again. Never raises."""
     try:
         reply = await client.post("/api/show", json={"model": model})
         reply.raise_for_status()
-        return trained_context(reply.json())
+        return trained_context(reply.json()) or 0
     except (httpx.HTTPError, ValueError) as exc:
         log.debug("ollama /api/show %s failed: %s", model, exc)
         return None

@@ -27,7 +27,7 @@ from agent_team.orchestrator.control import create_user_task
 from agent_team.orchestrator.lineage import ancestry
 from agent_team.orchestrator.phases import is_work
 from agent_team.orchestrator.replies import plain_agent, upper_first
-from agent_team.orchestrator.research import find_same
+from agent_team.orchestrator.research import find_same, is_requested, waits_on
 
 
 class SettleMixin(OrchestratorBase):
@@ -56,10 +56,9 @@ class SettleMixin(OrchestratorBase):
                     by_id[d]
                     for d in task.depends_on
                     if d in by_id
-                    and by_id[d].origin in CHILD_ORIGINS
                     and (
-                        by_id[d].parent_task_id == task.id
-                        or by_id[d].origin is TaskOrigin.RESEARCH_REQUEST
+                        (by_id[d].origin in CHILD_ORIGINS and by_id[d].parent_task_id == task.id)
+                        or is_requested(by_id[d], by_id)
                     )
                 ]
                 live_children = [c for c in children if c.status is not TaskStatus.SUPERSEDED]
@@ -160,11 +159,13 @@ class SettleMixin(OrchestratorBase):
     ) -> list[str]:
         """Turn ``task``'s research requests into the tasks it waits for, and return
         their ids. A request the run already asked is answered by that task: a finished
-        brief joins the inputs, an open one is waited for. Past a limit, or for a
-        question the task already has the answer to, the request is refused and the
-        task told to answer with what it has; it may not ask again."""
+        brief joins the inputs, and open requested research is waited for unless it
+        waits on this task. Past a limit, for a question the task already has the answer
+        to, or one planned research is still on, the request is refused and the task
+        told to answer with what it has; it may not ask again."""
         limits = self.config.research
         tasks = await self.tasks.list_tasks(run.id)
+        by_id = {t.id: t for t in tasks}
         own = {t.id for t in ancestry(task, tasks)}
         waits: list[str] = []
         refused: list[str] = []
@@ -180,7 +181,11 @@ class SettleMixin(OrchestratorBase):
                 else:
                     task.inputs.append(match.task.output)
                     choice, target = "reuse the finished research", match.task.id
-            elif match is not None and match.task.origin is TaskOrigin.RESEARCH_REQUEST:
+            elif (
+                match is not None
+                and is_requested(match.task, by_id)
+                and not waits_on(task, match.task, by_id)
+            ):
                 waits.append(match.task.id)
                 choice, target = "wait for the same open research", match.task.id
             elif match is not None:
@@ -205,6 +210,7 @@ class SettleMixin(OrchestratorBase):
                     )
                 )
                 tasks.append(child)
+                by_id[child.id] = child
                 waits.append(child.id)
                 choice, target = "researcher", child.id
             await self._record(

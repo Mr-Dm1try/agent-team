@@ -237,7 +237,8 @@ class OllamaProvider:
             return known
         limit = await model_context(self.client, model)
         if limit is None:
-            return self.config.num_ctx
+            return self.config.num_ctx  # Ollama didn't answer: ask again next call
+        limit = limit or self.config.num_ctx  # it answered without a limit
         if limit < self.config.num_ctx:
             log.warning(
                 "ollama %s: its window is %d tokens, less than num_ctx %d",
@@ -252,9 +253,11 @@ class OllamaProvider:
         """Cut the window to the context ``model`` is loaded with, if smaller, and
         warn: Ollama would cut prompts that fit the planned window."""
         loaded = await loaded_context(self.client, model)
+        # Checked once either way: a model unloaded at once (keep_alive 0) reloads with
+        # the num_ctx each call sends.
+        self._checked.add(model)
         if loaded is None:
             return
-        self._checked.add(model)
         planned = self._windows.get(model, self.config.num_ctx)
         if loaded < planned:
             log.warning(

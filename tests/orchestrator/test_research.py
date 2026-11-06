@@ -16,9 +16,11 @@ from agent_team.core.models import AgentName, Phase, Task, TaskOrigin, TaskStatu
 from agent_team.orchestrator.research import (
     ResearchLimits,
     find_same,
+    is_requested,
     question_words,
     research_depth,
     same_question,
+    waits_on,
 )
 
 
@@ -46,6 +48,31 @@ def test_rephrasings_of_one_question_match_and_different_ones_do_not() -> None:
     )
     assert not same_question(a, question_words("Where are the python-frontmatter docs?"))
     assert not same_question(a, frozenset())
+    # Questions that differ in their key word are different questions.
+    github = "What is the rate limit of the GitHub REST API for authenticated users?"
+    assert not same_question(
+        question_words(github), question_words(github.replace("GitHub", "GitLab"))
+    )
+    # Nothing left to compare (all filler, or a script the words pattern can't read)
+    # matches nothing, so the question is researched.
+    assert not same_question(question_words("Как работает кэш?"), question_words("Какая лицензия?"))
+    assert not same_question(
+        question_words("What should we use?"), question_words("Which is latest?")
+    )
+
+
+def test_requested_research_and_its_revisions_can_be_waited_on_but_not_in_a_cycle() -> None:
+    planned = researcher()
+    asked = researcher(TaskOrigin.RESEARCH_REQUEST, planned)
+    revised = researcher(TaskOrigin.REVISION, asked)
+    by_id = {t.id: t for t in (planned, asked, revised)}
+    assert not is_requested(planned, by_id)
+    assert is_requested(asked, by_id) and is_requested(revised, by_id)
+    other = researcher(TaskOrigin.RESEARCH_REQUEST, planned)
+    by_id[other.id] = other
+    assert not waits_on(other, revised, by_id)
+    revised.depends_on.append(other.id)  # the revision now waits on ``other``
+    assert waits_on(other, revised, by_id)
 
 
 def test_depth_counts_research_requests_along_the_parents() -> None:
@@ -112,3 +139,39 @@ def test_other_work_that_may_not_ask_records_an_assumption() -> None:
     assert closed.questions[-1] == Question(
         id="Q-3", text="Which ORM?", why="deps", assumption=NOT_RESEARCHED
     )
+
+
+def test_a_new_plan_does_not_take_requested_research_as_its_own_line() -> None:
+    """A re-planned question that an agent once asked as a request starts its own
+    planned line (depth 0, free to ask), while a planned question is still revised."""
+    from agent_team.core.artifacts import Plan
+    from agent_team.core.models import Run
+    from agent_team.orchestrator.planning import expand_plan
+
+    run = Run(title="t", request="r", workspace="/ws")
+    planner = Task(
+        run_id=run.id,
+        phase=Phase.PLANNING,
+        agent=AgentName.ORCHESTRATOR,
+        objective="plan",
+        output_kind="plan",
+    )
+    old_planned = researcher(objective="Which DB?", status=TaskStatus.SUPERSEDED)
+    asked = researcher(
+        TaskOrigin.RESEARCH_REQUEST, old_planned, objective="mcp SDK?", status=TaskStatus.SUPERSEDED
+    )
+    plan = Plan(
+        summary="s",
+        request_kind="build",
+        asks=[{"id": "ASK-1", "text": "x"}],  # type: ignore[list-item]
+        research_questions=[
+            {"question": "Which DB?", "ask": "ASK-1"},  # type: ignore[list-item]
+            {"question": "mcp SDK?", "ask": "ASK-1"},  # type: ignore[list-item]
+        ],
+    )
+    ref = ArtifactRef(kind="plan", version=1)
+    tasks = expand_plan(plan, ref, run, planner, previous=[old_planned, asked])
+    by_question = {t.objective: t for t in tasks if t.agent is AgentName.RESEARCHER}
+    assert by_question["Which DB?"].origin is TaskOrigin.REVISION
+    assert by_question["Which DB?"].parent_task_id == old_planned.id
+    assert by_question["mcp SDK?"].origin is TaskOrigin.PLAN

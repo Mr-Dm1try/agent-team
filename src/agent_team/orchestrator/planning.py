@@ -20,6 +20,7 @@ from agent_team.core.models import (
     TaskOrigin,
     new_id,
 )
+from agent_team.orchestrator.research import is_requested
 
 RULE = "pipeline"
 
@@ -44,7 +45,13 @@ def expand_plan(
     for the same work (the same research question, or the PRD, spec or answer) points
     back at the old one, so it runs as a revision with that work's output and
     feedback instead of from scratch."""
-    old_work = {_work_key(t): t for t in sorted(previous or [], key=lambda t: t.created_at)}
+    earlier = {t.id: t for t in previous or []}
+    old_work = {
+        _work_key(t): t
+        for t in sorted(earlier.values(), key=lambda t: t.created_at)
+        # Research an agent asked for is not the plan's work, even with the same question.
+        if not is_requested(t, earlier)
+    }
 
     def task(
         phase: Phase,

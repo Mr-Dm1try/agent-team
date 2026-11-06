@@ -5,42 +5,20 @@ request can't ask for more past ``max_research_depth``, and a run makes at most
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from agent_team.core.models import AgentName, Task, TaskOrigin, TaskStatus
+from agent_team.core.words import terms
 
-_WORD = re.compile(r"[a-z0-9]+")
-#: Words that don't tell two research questions apart.
+#: Words beyond the usual stopwords that don't tell two research questions apart.
 _FILLER = frozenset(
     {
-        "a",
-        "an",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "by",
         "can",
         "do",
         "does",
-        "for",
-        "from",
         "how",
-        "i",
-        "in",
-        "is",
-        "it",
-        "its",
-        "of",
-        "on",
-        "or",
         "should",
-        "the",
-        "this",
-        "to",
         "use",
         "used",
         "using",
@@ -51,10 +29,9 @@ _FILLER = frozenset(
         "which",
         "who",
         "why",
-        "will",
-        "with",
         "you",
         "your",
+        "doc",
         "docs",
         "documentation",
         "official",
@@ -62,25 +39,24 @@ _FILLER = frozenset(
         "current",
     }
 )
-#: Share of content words two questions must have in common to count as the same.
-SAME_QUESTION = 0.7
+#: Share of content words (Jaccard) two questions must have in common to count as the
+#: same. High, since a false match hands an agent the wrong facts while a missed one
+#: only costs a task: "GitHub's rate limit" and "GitLab's rate limit" share 75%.
+SAME_QUESTION = 0.85
 
 
 def question_words(text: str) -> frozenset[str]:
-    """The content words of a research question, lower-cased, without filler and with
-    a plural ``s`` dropped, so rephrasings of one question compare equal."""
-    words = set()
-    for word in _WORD.findall(text.casefold()):
-        if word in _FILLER:
-            continue
-        words.add(word[:-1] if len(word) > 3 and word.endswith("s") else word)
-    return frozenset(words)
+    """The content words of a research question, as memory search reads them, without
+    filler, so rephrasings of one question compare equal."""
+    return frozenset(terms(text) - _FILLER)
 
 
 def same_question(a: frozenset[str], b: frozenset[str]) -> bool:
-    """Whether two questions' content words overlap enough (Jaccard) to be one."""
+    """Whether two questions' content words overlap enough (Jaccard) to be one. A
+    question with no content words left (all filler, or a script the word pattern
+    doesn't read) matches nothing, so it is researched rather than wrongly reused."""
     if not a or not b:
-        return a == b
+        return False
     return len(a & b) / len(a | b) >= SAME_QUESTION
 
 
@@ -95,6 +71,27 @@ def research_depth(task: Task, by_id: dict[str, Task]) -> int:
             depth += 1
         current = by_id.get(current.parent_task_id) if current.parent_task_id else None
     return depth
+
+
+def is_requested(task: Task, by_id: dict[str, Task]) -> bool:
+    """Whether ``task`` is research an agent asked for, or a retry or revision of it."""
+    return task.agent is AgentName.RESEARCHER and research_depth(task, by_id) > 0
+
+
+def waits_on(task: Task, target: Task, by_id: dict[str, Task]) -> bool:
+    """Whether ``target`` already waits, directly or not, on ``task``; then ``task``
+    waiting on ``target`` would never end."""
+    seen: set[str] = set()
+    frontier = [target]
+    while frontier:
+        current = frontier.pop()
+        if current.id == task.id:
+            return True
+        if current.id in seen:
+            continue
+        seen.add(current.id)
+        frontier += [by_id[d] for d in current.depends_on if d in by_id]
+    return False
 
 
 def requested_count(tasks: Iterable[Task]) -> int:
