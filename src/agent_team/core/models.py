@@ -6,6 +6,7 @@ fields) are safe; renames and removals touch every package that uses them.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -222,6 +223,22 @@ class Run(Contract):
     span_id: str = Field(default_factory=lambda: uuid4().hex[:16])
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+
+
+#: The reason on a check of one task names the attempt it checks.
+_CHECK_REASON = "check of attempt {attempt}"
+_CHECKED = re.compile(r"^check of attempt (\d+)$")
+
+
+def check_reason(attempt: int) -> str:
+    """The reason on the check of a task's ``attempt``."""
+    return _CHECK_REASON.format(attempt=attempt)
+
+
+def checked_attempt(reason: str | None) -> int | None:
+    """The attempt a check's reason names, or None for the run's check or another task."""
+    found = _CHECKED.match(reason or "")
+    return int(found.group(1)) if found else None
 
 
 class Task(Contract):

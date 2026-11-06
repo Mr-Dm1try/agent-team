@@ -235,7 +235,12 @@ async def test_a_provider_going_down_and_back_gets_a_line() -> None:
 
 
 QUESTION = "How do you run a FastMCP server over stdio?"
-BRIEF_TASK = {"phase": "planning", "kind": "research_brief", "objective": QUESTION}
+BRIEF_TASK = {
+    "phase": "planning",
+    "kind": "research_brief",
+    "objective": QUESTION,
+    "max_attempts": 3,
+}
 OTHER_BRIEF = {"phase": "planning", "kind": "research_brief", "objective": "Which mcp version?"}
 STUCK = (
     "The researcher is stuck on: How do you run a FastMCP server over stdio? (no valid "
@@ -258,6 +263,7 @@ def _labelled_run() -> list[Event]:
             kind="verdict",
             objective="Check research brief from the researcher",
             parent="b1",
+            task_reason="check of attempt 1",
         ),
         _state(
             "c2",
@@ -288,7 +294,7 @@ async def test_checks_say_what_they_check_and_questions_are_short() -> None:
     await _feed(view, _labelled_run())
     console.print(view.render())
     text = console.export_text()
-    assert "✓ check: the research [How do you run a FastMCP server over st…]" in text
+    assert "✓ check 1/3: the research [How do you run a FastMCP server over stdio?]" in text
     assert "▶ check: the whole run" in text
     assert "auditor: check" not in text
     assert "? you: decide how a stuck step goes on" in text
@@ -302,10 +308,62 @@ async def test_plain_lines_label_checks_and_questions_too() -> None:
     await _feed(view, _labelled_run())
     lines = console.export_text().splitlines()
     assert (
-        "  planning: check: the research [How do you run a FastMCP server over st…] done" in lines
+        "  planning: check 1/3: the research [How do you run a FastMCP server over stdio?] done"
+        in lines
     )
     assert "  planning: check: the whole run running" in lines
     assert "  planning: you: decide how a stuck step goes on waiting" in lines
+
+
+def _retried_checks() -> list[Event]:
+    """Two briefs, one checked on three attempts."""
+    checks = [
+        _state(
+            f"c{n}",
+            AgentName.AUDITOR,
+            "done",
+            phase="planning",
+            kind="verdict",
+            objective="Check research brief from the researcher",
+            parent="b1",
+            task_reason=f"check of attempt {n}",
+        )
+        for n in (1, 2, 3)
+    ]
+    return [
+        _event(EventName.RUN_STARTED),
+        _state("b1", AgentName.RESEARCHER, "done", **BRIEF_TASK),
+        _state("b2", AgentName.RESEARCHER, "running", **OTHER_BRIEF),
+        *checks,
+    ]
+
+
+async def test_retried_checks_show_which_attempt_they_check() -> None:
+    console = _console()
+    view = RunView(console)
+    await _feed(view, _retried_checks())
+    console.print(view.render())
+    text = console.export_text()
+    for n in (1, 2, 3):
+        assert f"✓ check {n}/3: the research [How do you run a FastMCP server" in text
+
+
+@pytest.mark.parametrize("width", [60, 80, 100])
+async def test_labels_are_cut_at_the_width_the_line_has(width: int) -> None:
+    console = Console(file=io.StringIO(), record=True, width=width, color_system=None)
+    view = RunView(console)
+    await _feed(view, _retried_checks())
+    console.print(view.render())
+    rows = [line for line in console.export_text().splitlines() if "check 2/3" in line]
+    assert len(rows) == 1 and len(rows[0]) <= width
+    # The tag takes what the line has left, never a fixed 40 characters.
+    cut = rows[0].split("[", 1)[1].rstrip(" ]")
+    assert len(cut) >= min(len(QUESTION), width - 40)
+    plain = Console(file=io.StringIO(), record=True, width=width, color_system=None)
+    lines = RunView(plain, plain=True)
+    await _feed(lines, _retried_checks())
+    out = [line for line in plain.export_text().splitlines() if "check 2/3" in line]
+    assert len(out) == 1 and len(out[0]) <= width
 
 
 async def test_the_ticker_keeps_paid_and_local_tokens_apart() -> None:

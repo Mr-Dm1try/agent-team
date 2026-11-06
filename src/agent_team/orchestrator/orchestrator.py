@@ -35,6 +35,7 @@ from agent_team.core.models import (
     Task,
     TaskOrigin,
     TaskStatus,
+    check_reason,
     new_id,
 )
 from agent_team.core.tracing import Tracer
@@ -451,7 +452,7 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
     async def _check_task(self, run: Run, subject: Task | None) -> Task:
         """The auditor task that checks ``subject``'s current attempt (or the run): the
         one left unfinished by a crash or pause, else a new one."""
-        reason = f"check of attempt {subject.attempt}" if subject else "check of the run"
+        reason = check_reason(subject.attempt) if subject else "check of the run"
         parent = subject.id if subject else None
         for t in await self.tasks.list_tasks(run.id):
             if (

@@ -25,7 +25,14 @@ from rich.tree import Tree
 
 from agent_team.core.artifacts import plain_kind
 from agent_team.core.interfaces import EventBus
-from agent_team.core.models import PHASE_ORDER, Event, EventName, HookOutcome, Task
+from agent_team.core.models import (
+    PHASE_ORDER,
+    Event,
+    EventName,
+    HookOutcome,
+    Task,
+    checked_attempt,
+)
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +68,10 @@ USER_LABELS = {
     "policy": "decide how a failed check goes on",
     "run_audit": "decide on the run's final check",
 }
+#: The fewest characters an objective tag is cut to, however narrow the screen.
+MIN_TAG = 16
+#: How far the tree indents a task row: two levels of guides.
+TREE_INDENT = 8
 
 
 @dataclass
@@ -78,6 +89,7 @@ class TaskRow:
     origin: str = "plan"
     parent: str | None = None  # the task this one checks, asks about or revises
     reason: str | None = None  # why the task exists, such as "confirm_change"
+    max_attempts: int = 0  # 0 when the events didn't say
 
     @property
     def label(self) -> str:
@@ -149,11 +161,12 @@ def short(value: Any, limit: int = 60) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _tag(state: RunState, row: TaskRow) -> str:
-    """A short objective after a task's plain lines when a sibling (another task of the
-    same phase, agent and output that isn't superseded) prints the same label, such as
-    two research questions running at once or work packages one after another; empty
-    otherwise."""
+def _tag(state: RunState, row: TaskRow, room: int) -> str:
+    """A short objective after a task's label when a sibling (another task of the same
+    phase, agent and output that isn't superseded) shows the same label, such as two
+    research questions running at once or work packages one after another; empty
+    otherwise. The tag, brackets included, is cut to ``room`` characters, but never
+    below ``MIN_TAG``."""
     siblings = [
         t
         for t in state.tasks.values()
@@ -163,20 +176,31 @@ def _tag(state: RunState, row: TaskRow) -> str:
     ]
     if not siblings or row.agent in ("user", "auditor") or not row.objective:
         return ""
-    return f" [{short(row.objective, 40)}]"
+    return f" [{short(row.objective, max(MIN_TAG, room - 3))}]"
 
 
-def label(state: RunState, row: TaskRow) -> str:
-    """A row's label. A check names what it checks, such as "check: the research
-    [How do you run…]", or "check: the whole run"."""
+def label(state: RunState, row: TaskRow, room: int) -> str:
+    """A row's label. A check names the attempt and what it checks, cut to fit
+    ``room`` characters, such as "check 2/3: the research [How do you run…]", or
+    "check: the whole run"."""
     if row.agent != "auditor":
         return row.label
     subject = state.tasks.get(row.parent or "")
     if subject is not None:
-        return f"check: {plain_kind(subject.kind)}{_tag(state, subject)}"
+        attempt = checked_attempt(row.reason)
+        of = f"/{subject.max_attempts}" if attempt and subject.max_attempts else ""
+        head = f"check {attempt}{of}: " if attempt else "check: "
+        head += plain_kind(subject.kind)
+        return head + _tag(state, subject, room - len(head))
     if row.parent is None:
         return "check: the whole run"
-    return f"check: {short(row.objective.removeprefix('Check '), 50)}"
+    return f"check: {short(row.objective.removeprefix('Check '), max(MIN_TAG, room - 7))}"
+
+
+def tagged(state: RunState, row: TaskRow, room: int) -> str:
+    """A row's label and its sibling tag, together cut to fit ``room`` characters."""
+    text = label(state, row, room)
+    return text + _tag(state, row, room - len(text))
 
 
 def waiting(state: RunState) -> list[TaskRow]:
@@ -297,6 +321,7 @@ class RunView:
                 origin=task.origin.value,
                 parent=task.parent_task_id,
                 reason=task.reason,
+                max_attempts=task.max_attempts,
             )
         for phase in {t.phase for t in state.tasks.values()}:
             rows = [t for t in state.tasks.values() if t.phase == phase]
@@ -379,6 +404,7 @@ class RunView:
                     origin=str(data.get("origin", "plan")),
                     parent=data.get("parent"),
                     reason=data.get("task_reason"),
+                    max_attempts=int(data.get("max_attempts") or 0),
                 )
                 state.tasks[row.id] = row
             row.status = str(data.get("to", row.status))
@@ -388,7 +414,8 @@ class RunView:
             if row.status not in PLAIN_STATES:
                 return None
             attempt = f" (attempt {row.attempt})" if row.attempt > 1 else ""
-            return f"  {row.phase}: {label(state, row)}{_tag(state, row)} {row.status}{attempt}"
+            head, tail = f"  {row.phase}: ", f" {row.status}{attempt}"
+            return head + tagged(state, row, self._room(head, tail)) + tail
         if row is None:
             return None
         if name is EventName.TASK_STARTED:
@@ -396,23 +423,30 @@ class RunView:
             return None
         if name is EventName.TOOL_CALL_BEFORE:
             row.tool = tool_summary(str(data.get("tool", "")), data.get("args"))
-            return f"    {row.agent}{_tag(state, row)} → {row.tool}"
+            tail = f" → {row.tool}"
+            room = self._room(f"    {row.agent}", tail)
+            return f"    {row.agent}{_tag(state, row, room)}{tail}"
         if name is EventName.TOOL_CALL_AFTER:
             row.tool = None
             if data.get("blocked"):
-                return (
-                    f"    {row.agent}{_tag(state, row)} ✗ {data.get('tool')} blocked by "
-                    f"{data.get('rule_id')}"
-                )
+                tail = f" ✗ {data.get('tool')} blocked by {data.get('rule_id')}"
+                room = self._room(f"    {row.agent}", tail)
+                return f"    {row.agent}{_tag(state, row, room)}{tail}"
             return None
         if name is EventName.AUDIT_VERDICT:
             findings = data.get("findings") or []
             blockers = [f for f in findings if f.get("severity") == "blocker"]
-            what = f"{label(state, row)}{_tag(state, row)}"
             if data.get("passed"):
-                return f"    audit passed: {what}"
-            return f"    audit failed: {what} ({len(blockers)} blockers)"
+                head, tail = "    audit passed: ", ""
+            else:
+                head, tail = "    audit failed: ", f" ({len(blockers)} blockers)"
+            return head + tagged(state, row, self._room(head, tail)) + tail
         return None
+
+    def _room(self, head: str, tail: str) -> int:
+        """The characters a line of the console's width leaves between ``head`` and
+        ``tail``."""
+        return self.console.width - len(head) - len(tail)
 
     # --- drawing ---------------------------------------------------------------------
 
@@ -440,7 +474,7 @@ class RunView:
             mark = "✓" if status == "done" else "▶" if status == "running" else "·"
             branch = tree.add(Text(f"{mark} {phase}", style="bold" if status else "dim"))
             for row in rows:
-                branch.add(self._row(state, row))
+                branch.add(self.row(state, row))
         asks = waiting(state)
         if asks:
             what = "1 question" if len(asks) == 1 else f"{len(asks)} questions"
@@ -448,17 +482,24 @@ class RunView:
         tree.add(Text(state.ticker.text(), style="dim"))
         return tree
 
-    @staticmethod
-    def _row(state: RunState, row: TaskRow) -> Text:
-        """One task line: mark, who and what, attempt and current tool."""
-        text = Text(f"{STATUS_MARK.get(row.status, '·')} ", style=STATUS_STYLE.get(row.status, ""))
-        text.append(label(state, row), style="dim" if row.status == "superseded" else "")
-        if row.attempt > 1:
-            text.append(f" · attempt {row.attempt}", style="yellow")
+    def row(self, state: RunState, row: TaskRow) -> Text:
+        """One task line: mark, who and what, attempt and current tool. A check's label
+        gets the room the line has left at the console's width."""
+        attempt = f" · attempt {row.attempt}" if row.attempt > 1 else ""
+        objective = ""
         if row.agent not in ("user", "auditor") and row.objective:
-            text.append(f" · {short(row.objective, 50)}", style="dim")
-        if row.tool:
-            text.append(f" · {row.tool}", style="cyan")
+            objective = f" · {short(row.objective, 50)}"
+        tool = f" · {row.tool}" if row.tool else ""
+        mark = f"{STATUS_MARK.get(row.status, '·')} "
+        room = self._room(" " * TREE_INDENT + mark, attempt + objective + tool)
+        text = Text(mark, style=STATUS_STYLE.get(row.status, ""))
+        text.append(label(state, row, room), style="dim" if row.status == "superseded" else "")
+        if attempt:
+            text.append(attempt, style="yellow")
+        if objective:
+            text.append(objective, style="dim")
+        if tool:
+            text.append(tool, style="cyan")
         return text
 
 
