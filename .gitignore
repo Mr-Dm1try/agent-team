@@ -10,6 +10,8 @@ dist/
 build/
 *.egg-info/
 .env
+.env.*
+!.env.example
 runs/
 *.db
 *.db-wal

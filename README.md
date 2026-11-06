@@ -43,7 +43,7 @@ The full design is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ```bash
 uv sync
-export ANTHROPIC_API_KEY=...
+cp .env.example .env                       # then put your key in .env
 uv run agent-team run "Build a REST API for a small library inventory"
 uv run agent-team run "..." --plain --context ./docs  # line output; a read-only folder
 uv run agent-team resume <run_id>              # continue a waiting, stopped or crashed run
@@ -53,6 +53,9 @@ uv run agent-team logs <run_id> --agent qa      # one agent's events
 uv run agent-team logs <run_id> --spans         # the run's trace tree
 uv run agent-team memory search "FastAPI tests"  # what earlier runs learned
 ```
+
+`agent-team` reads `.env` from the folder you run it in. A variable already set in
+your shell wins over the file.
 
 While a run waits on you, type your answer and press Enter. Ctrl-D leaves the run
 waiting for `resume`. When it is done, type `accept` or describe a change; after the
