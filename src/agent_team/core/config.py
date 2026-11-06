@@ -181,8 +181,9 @@ class WebConfig(_Cfg):
     timeout_s: float = 20.0
     #: Bytes read from one response before the rest is dropped.
     max_bytes: int = 2_000_000
-    #: Characters of readable text returned from one page.
-    max_chars: int = 20_000
+    #: Characters of readable text one web_fetch call returns; offset reads on. Never
+    #: more than fits inline in the tool loop (tools/web.py, PAGE_CHARS).
+    max_chars: int = 10_000
     max_results: int = 8
     max_redirects: int = 5
     #: web_search and web_fetch calls one attempt may make, together, before the tools

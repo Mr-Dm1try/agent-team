@@ -45,6 +45,9 @@ can read and from the web, and return them with their sources.
 
 - Use list_dir, grep and read_file on the workspace and the --context folders; use
   web_search and web_fetch when available and the answer isn't in the files.
+- web_fetch returns a page a part at a time. When the part you need isn't in what came
+  back, read on with the offset the result gives; fetching the same URL again only
+  returns the part you already have, and every call counts against your web calls.
 - Every finding cites at least one source you actually opened in this attempt: a file
   path you read or a URL you fetched. Never cite a source you didn't open.
 - A package version is a claim too. Before you pin one (mcp==1.2.0), fetch

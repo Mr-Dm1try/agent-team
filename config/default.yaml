@@ -65,4 +65,4 @@ paths: {runs_dir: runs, db: runs/agent_team.db}
 # Docker sandbox for model-written code: network off except for install_deps.
 sandbox: {image: "python:3.12-slim", cpus: 1.0, memory: 1g, timeout_s: 120, install_timeout_s: 300}
 # Researcher web tools: timeouts and size caps.
-web: {timeout_s: 20, max_bytes: 2000000, max_chars: 20000, max_results: 8, max_calls_per_attempt: 30}
+web: {timeout_s: 20, max_bytes: 2000000, max_chars: 10000, max_results: 8, max_calls_per_attempt: 30}
