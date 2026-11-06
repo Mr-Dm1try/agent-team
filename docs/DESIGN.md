@@ -103,7 +103,7 @@ Context is gathered up front, but not only once. If the Architect or Engineer hi
 
 **Research requests are bounded.** Without limits, research fans out: in one demo run four planned questions became 22 requested tasks, many of them the same question, and planning never ended. So:
 
-- A request that repeats a question the run already asked is answered by that task. Questions match on their content words (with filler such as "the official docs" dropped), at 70% overlap. A finished brief joins the asker's inputs, and an open requested task is waited for. A question another planned task is still researching, or one whose answer is already in the asker's inputs, is refused.
+- A request that repeats a question the run already asked is answered by that task. Questions match on their content words (with filler such as "the official docs" dropped), at 85% overlap, so a question about GitLab doesn't take GitHub's answer; a question with no content words left matches nothing. A finished brief joins the asker's inputs, and open requested research (or a revision of it) is waited for, unless it already waits on the asker. A question a planned task is still researching, or one whose answer is already in the asker's inputs, is refused.
 - A task made from a request can't ask for more (`limits.max_research_depth`, 1), and a run makes at most `limits.max_research_tasks` (6) requested tasks.
 - Past a limit, the request is refused, the decision log says why, and the task is told to answer with what it has. A refused task may not ask again. A task that may not ask is told so in its envelope, and any request it still files is turned into what is still open: an unanswered question with its gap in a brief, or a question with an assumption elsewhere.
 
