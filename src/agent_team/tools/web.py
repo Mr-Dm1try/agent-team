@@ -14,8 +14,8 @@ the URL after redirects is in ``data.final_url``.
 A page's readable text comes back a part at a time, sized to stay inline in the tool
 loop; ``offset`` reads on from where the last part ended, and every part says where
 the next one starts. Each page is kept per task, so reading on, or fetching the same
-URL again, uses the saved copy instead of a new request. Every call still counts
-against the web budget.
+URL again, uses the saved copy instead of a new request (an error page isn't kept, so
+a retry fetches it again). Every call still counts against the web budget.
 
 JSON over the size cap is shortened first, so its structure survives: long strings
 are cut. A PyPI project document (``https://pypi.org/pypi/<package>/json``) becomes
@@ -63,6 +63,9 @@ PYPI_REQUIRES = 30
 PAGE_CHARS = MAX_INLINE_CHARS - 2_000
 #: Pages kept for reading on and repeat fetches, across tasks; the oldest go first.
 SAVED_PAGES = 64
+#: JSON up to this size comes back as it is, a part at a time; longer JSON is
+#: shortened first so its structure survives.
+JSON_CHARS = 40_000
 _CLOSE_TAG = re.compile(r"<\s*/\s*untrusted_content", re.IGNORECASE)
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 _TAG = re.compile(r"<(script|style)\b.*?</\1>|<[^>]+>", re.DOTALL | re.IGNORECASE)
@@ -341,7 +344,8 @@ class WebFetchTool:
         saved = page is not None
         if page is None:
             page = await self._fetch(url)
-            self._pages[key] = page
+            if page.status < 400:  # an error page may be gone on the next try
+                self._pages[key] = page
             while len(self._pages) > SAVED_PAGES:
                 self._pages.popitem(last=False)
         else:
@@ -438,7 +442,7 @@ class WebFetchTool:
             extracted = await asyncio.to_thread(_extract_html, raw, url)
             return extracted
         if kind == "application/json" or kind.endswith("+json"):
-            return readable_json(raw, self.part_chars)
+            return readable_json(raw, JSON_CHARS)
         if not kind or kind.startswith(TEXT_TYPES):
             return raw
         return None

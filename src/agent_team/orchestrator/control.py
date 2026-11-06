@@ -30,7 +30,7 @@ from agent_team.core.models import (
     TaskStatus,
     ToolResult,
 )
-from agent_team.core.tracing import cut_strings, format_event
+from agent_team.core.tracing import cut_strings, events_path, format_event, read_events
 from agent_team.llm.types import ToolSpec
 
 USER_OUTPUT = "user_answer"
@@ -294,8 +294,8 @@ class ReadTrace:
         """The run's last matching events, as short lines (or JSON), within
         ``TRACE_CHARS``."""
         name = self.spec.name
-        path = Path(ctx.run.workspace).parent / "logs" / "events.jsonl"
-        if not path.is_file():
+        runs_dir = Path(ctx.run.workspace).parent.parent  # runs/<run_id>/workspace
+        if not events_path(runs_dir, ctx.run.id).is_file():
             return ToolResult(content="no trace file yet", is_error=True)
         limit = args.get("limit", 30)
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
@@ -310,24 +310,19 @@ class ReadTrace:
         except ValueError as exc:
             raise ToolError(str(exc), tool=name) from exc
         errors_only, full = bool(args.get("errors_only")), bool(args.get("full"))
-        found: list[str] = []
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            try:
-                event = Event.model_validate_json(raw)
-            except ValueError:
-                continue
-            if task_id and event.task_id != task_id:
-                continue
-            if agent and (event.agent is None or event.agent.value != agent):
-                continue
-            if names and event.name not in names:
-                continue
-            if not names and event.name in TRACE_NOISE:
-                continue
-            if errors_only and event.level not in ("warning", "error"):
-                continue
-            found.append(_trace_line(event, full=full))
+        found = [
+            _trace_line(e, full=full)
+            for e in read_events(runs_dir, ctx.run.id, agent=agent, task_id=task_id)
+            if (e.name in names if names else e.name not in TRACE_NOISE or _failed(e))
+            and (_failed(e) or not errors_only)
+        ]
         return ToolResult(content=_fit(found[-limit:]), data={"matched": len(found)})
+
+
+def _failed(event: Event) -> bool:
+    """Whether an event reports a problem: a warning or an error, such as a span that
+    failed."""
+    return event.level in ("warning", "error")
 
 
 def _trace_line(event: Event, *, full: bool) -> str:

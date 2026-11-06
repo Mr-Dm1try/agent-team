@@ -409,6 +409,8 @@ class RunView:
                 state.tasks[row.id] = row
             row.status = str(data.get("to", row.status))
             row.attempt = event.attempt or row.attempt
+            # An answer or research can give a task another attempt.
+            row.max_attempts = int(data.get("max_attempts") or row.max_attempts)
             if row.status != "running":
                 row.tool = None
             if row.status not in PLAIN_STATES:

@@ -204,3 +204,19 @@ async def test_read_trace_keeps_the_newest_lines_within_its_cap(tmp_path: Path) 
     assert len(out) <= TRACE_CHARS + 100
     assert out.startswith("[") and "older events left out" in out.splitlines()[0]
     assert "e199 " in out and "e0 " not in out
+
+
+async def test_read_trace_shows_a_failed_span(tmp_path: Path) -> None:
+    _team, tools, ctx = await _ctx(tmp_path)
+    _trace(
+        ctx,
+        [
+            _event(ctx, EventName.SPAN_FINISHED, level="debug", data={"status": "ok"}),
+            _event(
+                ctx, EventName.SPAN_FINISHED, level="error", data={"status": "error", "x": "boom"}
+            ),
+        ],
+    )
+    for args in ({}, {"errors_only": True}):
+        out = (await tools["read_trace"](args, ctx)).content.splitlines()
+        assert len(out) == 1 and "boom" in out[0]

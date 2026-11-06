@@ -375,3 +375,33 @@ async def test_an_attempt_has_a_web_call_budget_shared_by_both_tools(ctx: ToolCo
     # The next attempt starts with the whole budget again.
     ctx.task.attempt += 1
     await tools["web_search"]({"query": "fastapi"}, ctx)
+
+
+async def test_an_error_page_is_fetched_again(ctx: ToolContext) -> None:
+    busy = httpx.Response(503, text="busy", headers={"content-type": "text/plain"})
+    web = Web({"a.example": [PUBLIC]}, {"a.example/doc": busy})
+    fetch = web.fetch()
+    first = await fetch({"url": "https://a.example/doc"}, ctx)
+    web.pages["a.example/doc"] = _numbered(10)
+    second = await fetch({"url": "https://a.example/doc"}, ctx)
+    assert first.is_error and not second.is_error
+    assert len(web.requests) == 2
+    assert second.data is not None and not second.data["cached"]
+
+
+async def test_json_under_its_cap_comes_back_whole_a_part_at_a_time(ctx: ToolContext) -> None:
+    doc = {"items": [{"id": i, "description": "d" * 400} for i in range(10)]}
+    raw = json.dumps(doc)
+    config = CONFIG.model_copy(update={"max_bytes": 100_000})
+    page = httpx.Response(200, text=raw, headers={"content-type": "application/json"})
+    web = Web({"a.example": [PUBLIC]}, {"a.example/api": page})
+    fetch = web_tools(config, transport=httpx.MockTransport(web.handle), resolver=web.resolve)[
+        "web_fetch"
+    ]
+    parts, offset = [], 0
+    while offset is not None:
+        out = await fetch({"url": "https://a.example/api", "offset": offset}, ctx)
+        assert out.data is not None
+        parts.append(out.data["chars"])
+        offset = out.data["next_offset"]
+    assert sum(parts) == len(raw)  # nothing shortened: offset reads all of it

@@ -231,34 +231,46 @@ async def test_a_stop_while_the_team_works_is_logged_with_its_reason(tmp_path: P
 
 
 class MidRunTypist:
-    """Types ``mid`` while the team works, once the Engineer starts, and then each of
-    ``lines`` only once the session is at a prompt (its output ends with "> ")."""
+    """Types ``mid`` (one line or several) while the team works, once the Engineer
+    starts in the ``in_run``-th run the session starts, and then each of ``lines``
+    only once the session is at a prompt (its output ends with "> ")."""
 
-    def __init__(self, app: App, out: io.StringIO, mid: str, *lines: str | None) -> None:
+    def __init__(
+        self,
+        app: App,
+        out: io.StringIO,
+        mid: str | list[str],
+        *lines: str | None,
+        in_run: int = 1,
+    ) -> None:
         """Watch ``app``'s bus for the Engineer and ``out`` for the prompt."""
         self.out = out
-        self.mid: str | None = mid
+        self.mid = [mid] if isinstance(mid, str) else list(mid)
         self.lines = _lines(*lines)
         self.seen = 0  # how much output there was when the last line was typed
+        self.in_run = in_run
+        self.runs: list[str] = []
         self.engineer = asyncio.Event()
         app.bus.on_after(EventName.TASK_STATE_CHANGED, self._on_state)
 
     async def _on_state(self, event: Event) -> None:
-        """Let the typed line through when the Engineer first starts, and give the
-        session time to read it before the Engineer's next model call, as a real
-        model call would."""
+        """Let the typed lines through when the Engineer first starts in the chosen
+        run, and give the session time to read them before the Engineer's next model
+        call, as a real model call would."""
+        if event.run_id not in self.runs:
+            self.runs.append(event.run_id)
         engineer = event.agent is AgentName.ENGINEER and event.data.get("to") == "running"
-        if engineer and not self.engineer.is_set():
+        chosen = len(self.runs) >= self.in_run and event.run_id == self.runs[self.in_run - 1]
+        if engineer and chosen and not self.engineer.is_set():
             self.engineer.set()
             await asyncio.sleep(0.05)
 
     async def read_line(self) -> str | None:
-        """The mid-run line first, then the prompt lines."""
+        """The mid-run lines first, then the prompt lines."""
         async with asyncio.timeout(10):
-            if self.mid is not None:
+            if self.mid:
                 await self.engineer.wait()
-                line, self.mid = self.mid, None
-                return line
+                return self.mid.pop(0)
             while not self._at_prompt():  # noqa: ASYNC110 (the console has no event)
                 await asyncio.sleep(0.005)
             self.seen = len(self.out.getvalue())
@@ -282,9 +294,9 @@ async def test_typing_stop_while_the_team_works_stops_the_run(tmp_path: Path) ->
     app.bus.on_after(EventName.LLM_CALL_AFTER, count)
     typist = MidRunTypist(app, out, "stop the run")
     with app:
-        code = await Session(app, console, plain=True, read_line=typist.read_line).start(
-            "Build a books API"
-        )
+        code = await Session(
+            app, console, plain=True, read_line=typist.read_line, listen=True
+        ).start("Build a books API")
         (run,) = await app.stores.tasks.list_runs()
         stops = [d for d in await app.stores.decisions.list(run.id) if d.kind is DecisionKind.STOP]
         qa = [t for t in await app.stores.tasks.list_tasks(run.id) if t.agent is AgentName.QA]
@@ -316,9 +328,9 @@ async def test_a_question_typed_while_the_team_works_is_answered_under_the_view(
     console, out = _console()
     typist = MidRunTypist(app, out, "how is it going?", "accept")
     with app:
-        code = await Session(app, console, plain=True, read_line=typist.read_line).start(
-            "Build a books API"
-        )
+        code = await Session(
+            app, console, plain=True, read_line=typist.read_line, listen=True
+        ).start("Build a books API")
         (run,) = await app.stores.tasks.list_runs()
     text = out.getvalue()
     assert code == 0, text
@@ -338,9 +350,9 @@ async def test_a_change_typed_while_the_team_works_waits_until_it_stops(
     console, out = _console()
     typist = MidRunTypist(app, out, "paginate the list", "yes", "accept")
     with app:
-        code = await Session(app, console, plain=True, read_line=typist.read_line).start(
-            "Build a books API"
-        )
+        code = await Session(
+            app, console, plain=True, read_line=typist.read_line, listen=True
+        ).start("Build a books API")
     text = out.getvalue()
     assert code == 0, text
     held = text.index(HELD_REPLY)
@@ -368,7 +380,9 @@ async def test_a_reply_while_the_team_works_prints_under_the_live_tree(tmp_path:
     console = Console(file=out, width=120, color_system=None, force_terminal=True)
     typist = MidRunTypist(app, out, "how is it going?", "accept")
     with app:
-        code = await Session(app, console, read_line=typist.read_line).start("Build a books API")
+        code = await Session(app, console, read_line=typist.read_line, listen=True).start(
+            "Build a books API"
+        )
     text = out.getvalue()
     assert code == 0, text
     # The tree printed once when the view stopped for the reply, then the reply.
@@ -381,3 +395,108 @@ async def test_stdin_lines_are_read_on_a_thread(monkeypatch: Any) -> None:
     monkeypatch.setattr("sys.stdin", io.StringIO("first\n  second  \n"))
     read = StdinLines()
     assert [await read(), await read(), await read()] == ["first", "second", None]
+
+
+async def test_held_lines_are_named_when_a_stop_ends_the_session(tmp_path: Path) -> None:
+    app = await e2e_app(tmp_path, script=_paging_script())
+    console, out = _console()
+    typist = MidRunTypist(app, out, ["paginate the list", "stop the run"])
+    with app:
+        session = Session(app, console, plain=True, read_line=typist.read_line, listen=True)
+        code = await session.start("Build a books API")
+    text = out.getvalue()
+    assert code == 1, text
+    assert HELD_REPLY in text and STOPPING in text
+    assert "Not sent, since the run ended: paginate the list" in text
+
+
+async def test_a_stop_typed_during_a_new_run_stops_that_run(tmp_path: Path) -> None:
+    script = e2e_script()
+    default = orchestrator_responder()
+
+    def message(request: LLMRequest) -> list[ContentBlock] | str:
+        """Start a second run for the todo API; otherwise answer like the default."""
+        said, _ = read_message(request)
+        if said == "Build a todo API" and not _last_is_tool_result(request):
+            return tool_call("start_run", {"request": said, "kind": "build"})
+        if said == "Build a todo API":
+            return message_reply("Starting the todo API.", "build")
+        return default(request)
+
+    script[AgentName.ORCHESTRATOR] = orchestrator_responder(message=message)
+    app = await e2e_app(tmp_path, script=script)
+    console, out = _console()
+    # The first run is reviewed with new work; the stop is typed while the second works.
+    typist = MidRunTypist(app, out, "stop the run", in_run=2)
+    first_prompt = ["Build a todo API"]
+
+    async def read_line() -> str | None:
+        """New work at the first review prompt, then the typist's lines."""
+        if first_prompt:
+            async with asyncio.timeout(10):
+                while not out.getvalue().endswith("> "):  # noqa: ASYNC110
+                    await asyncio.sleep(0.005)
+            typist.seen = len(out.getvalue())
+            return first_prompt.pop()
+        return await typist.read_line()
+
+    with app:
+        session = Session(app, console, plain=True, read_line=read_line, listen=True)
+        code = await session.start("Build a books API")
+        runs = {r.title: r for r in await app.stores.tasks.list_runs()}
+    text = out.getvalue()
+    assert code == 1, text
+    assert runs["Build a books API"].status is RunStatus.DONE
+    assert runs["Build a todo API"].status is RunStatus.STOPPED
+    assert not app.kill_switch.is_stopped(runs["Build a books API"].id)
+
+
+async def test_a_failure_with_a_typed_line_leaves_the_work_running(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    app = await e2e_app(tmp_path)
+    console, out = _console()
+
+    async def broken(message: str, run_id: str) -> Any:
+        """Fail as a store error would."""
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(app.orchestrator, "handle_while_working", broken)
+    typist = MidRunTypist(app, out, "how is it going?", "accept")
+    with app:
+        session = Session(app, console, plain=True, read_line=typist.read_line, listen=True)
+        code = await session.start("Build a books API")
+        (run,) = await app.stores.tasks.list_runs()
+    text = out.getvalue()
+    assert code == 0, text
+    assert "I couldn't read that just now." in text
+    assert run.status is RunStatus.DONE
+
+
+async def test_a_stop_that_comes_too_late_leaves_no_flag(tmp_path: Path) -> None:
+    app = await e2e_app(tmp_path)
+    console, out = _console()
+    with app:
+        session = Session(app, console, plain=True, read_line=Typist(app).read_line)
+        reply = await app.orchestrator.handle("Build a books API")
+        assert reply.kind == "done" and reply.run_id
+        # The stop was typed after the team's last model call.
+        app.kill_switch.stop(reply.run_id, "late")
+        session._stopping = reply.run_id
+        after = await session._settle_stop(reply)
+    assert after is reply
+    assert not app.kill_switch.is_stopped(reply.run_id)
+    assert "The run finished before it could stop." in out.getvalue()
+
+
+async def test_a_stop_typed_as_the_run_starts_waiting_stops_it(tmp_path: Path) -> None:
+    app = await e2e_app(tmp_path, script=asking_script(), review="questions_only")
+    console, _ = _console()
+    with app:
+        session = Session(app, console, plain=True, read_line=Typist(app).read_line)
+        reply = await app.orchestrator.handle("Build a books API")
+        assert reply.kind == "waiting" and reply.run_id
+        session._stopping = reply.run_id
+        after = await session._settle_stop(reply)
+        run = await app.stores.tasks.get_run(reply.run_id)
+    assert after.kind == "stopped" and run.status is RunStatus.STOPPED

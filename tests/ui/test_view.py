@@ -348,6 +348,28 @@ async def test_retried_checks_show_which_attempt_they_check() -> None:
         assert f"✓ check {n}/3: the research [How do you run a FastMCP server" in text
 
 
+async def test_a_check_row_follows_the_tasks_attempt_limit() -> None:
+    console = _console()
+    view = RunView(console)
+    more = dict(BRIEF_TASK, max_attempts=4)
+    check = {
+        "phase": "planning",
+        "kind": "verdict",
+        "objective": "Check research brief from the researcher",
+        "parent": "b1",
+        "task_reason": "check of attempt 4",
+    }
+    events = [
+        _event(EventName.RUN_STARTED),
+        _state("b1", AgentName.RESEARCHER, "running", **BRIEF_TASK),
+        _state("b1", AgentName.RESEARCHER, "ready", **more),  # an answer gave it one more
+        _state("c4", AgentName.AUDITOR, "running", **check),
+    ]
+    await _feed(view, events)
+    console.print(view.render())
+    assert "check 4/4: the research" in console.export_text()
+
+
 @pytest.mark.parametrize("width", [60, 80, 100])
 async def test_labels_are_cut_at_the_width_the_line_has(width: int) -> None:
     console = Console(file=io.StringIO(), record=True, width=width, color_system=None)
