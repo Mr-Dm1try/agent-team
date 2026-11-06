@@ -47,8 +47,9 @@ REVIEW_PROMPT = "Type 'accept' to finish, or describe a change."
 #: The status line's word for each run status, as the user would say it.
 STATE_WORDS = {RunStatus.WAITING: "waiting for you"}
 
-#: The hint under the live view while the team works.
-TYPE_HINT = "Type a question or a change, or stop to stop the run."
+#: The hint under the live view while the team works. It ends in ": " because what the
+#: user types appears right after it.
+TYPE_HINT = "Type a question or a change, or stop to stop the run: "
 #: What the session says when the user types stop while the team works.
 STOPPING = "Stopping the run at its next model call."
 #: The reason logged for that stop.
@@ -225,10 +226,10 @@ class Session:
         self._under_view(line, reply.text)
 
     def _under_view(self, line: str, text: str) -> None:
-        """Print the typed line and the reply to it under the live view: the view stops
-        (printing the tree once if it changed), they print, and the view starts again.
+        """Print the typed line and the reply to it under the live view: the view pauses,
+        they print, and the view starts again below them, so the screen keeps one tree.
         The line is echoed because a redraw of the live view clears what was typed."""
-        self.view.stop()
+        self.view.pause()
         self.say(f"> {line}")
         self.say(text)
         self.view.start(hint=TYPE_HINT)

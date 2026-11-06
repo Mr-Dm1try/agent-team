@@ -4,6 +4,7 @@ fallback to plain lines when drawing fails."""
 from __future__ import annotations
 
 import io
+import re
 from typing import Any
 
 import pytest
@@ -446,3 +447,79 @@ def test_the_view_before_any_run_says_what_it_is_doing() -> None:
     console = _console()
     console.print(RunView(console).render())
     assert console.export_text().strip() == "reading your message…"
+
+
+async def test_the_stronger_model_attempt_is_marked_not_counted_against_the_limit() -> None:
+    console = _console()
+    view = RunView(console)
+    check = {
+        "phase": "planning",
+        "kind": "verdict",
+        "objective": "Check research brief from the researcher",
+        "parent": "b1",
+    }
+    events = [
+        _event(EventName.RUN_STARTED),
+        _state("b1", AgentName.RESEARCHER, "running", attempt=3, **BRIEF_TASK),
+        _state("c3", AgentName.AUDITOR, "done", task_reason="check of attempt 3", **check),
+        _event(EventName.DECISION, "b1", kind="stronger_model"),
+        _state(
+            "b1", AgentName.RESEARCHER, "running", attempt=4, **dict(BRIEF_TASK, max_attempts=4)
+        ),
+        _state("c4", AgentName.AUDITOR, "running", task_reason="check of attempt 4", **check),
+    ]
+    await _feed(view, events)
+    console.print(view.render())
+    text = console.export_text()
+    assert "check 3/4: the research" in text
+    assert "check 4 (stronger model): the research" in text
+    assert "attempt 4 (stronger model)" in text and "4/4" not in text
+    plain = RunView(_console(), plain=True)
+    lines = [plain.apply(e) for e in events]
+    assert lines[4] == "  planning: researcher: the research running (attempt 4 (stronger model))"
+
+
+def screen(raw: str) -> list[str]:
+    """What a terminal shows after ``raw``: lines, with the cursor moves and line
+    clears Rich's live display writes applied."""
+    lines, row, col = [""], 0, 0
+    for part in re.split(r"(\x1b\[[0-9;?]*[A-Za-z]|\r|\n)", raw):
+        if part == "\n":
+            row, col = row + 1, 0
+            if row == len(lines):
+                lines.append("")
+        elif part == "\r":
+            col = 0
+        elif part == "\x1b[1A":
+            row = max(0, row - 1)
+        elif part == "\x1b[2K":
+            lines[row] = ""
+        elif part.startswith("\x1b"):
+            continue  # cursor show and hide
+        elif part:
+            line = lines[row].ljust(col)
+            lines[row] = line[:col] + part + line[col + len(part) :]
+            col += len(part)
+    return [line.rstrip() for line in lines]
+
+
+async def test_a_reply_under_the_live_tree_leaves_one_tree_below_it() -> None:
+    out = io.StringIO()
+    console = Console(file=out, width=100, color_system=None, force_terminal=True)
+    view = RunView(console)
+    hint = "Type a question or a change, or stop to stop the run: "
+    view.start(hint=hint)
+    await _feed(view, STREAM[:6])
+    shown = screen(out.getvalue())
+    assert shown[-1] == hint.rstrip() and out.getvalue().endswith(hint)  # typing follows ": "
+    view.pause()
+    console.print("> what are you doing right now?")
+    console.print("The architect is writing the design.")
+    view.start(hint=hint)
+    await _feed(view, STREAM[6:])
+    view.stop()
+    shown = screen(out.getvalue())
+    trees = [i for i, line in enumerate(shown) if line == "run run_1"]
+    assert len(trees) == 1, "\n".join(shown)
+    assert shown.index("The architect is writing the design.") < trees[0]
+    assert hint.rstrip() not in shown

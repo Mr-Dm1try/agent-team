@@ -5,8 +5,9 @@ task with its agent, status, attempt and current tool call, and a token and cost
 ticker that keeps paid (Claude) and local tokens apart. It draws a Rich tree that
 redraws in place while the team works and is cleared when it stops; the tree is then
 printed once, only if it changed, so the scrollback holds one copy per change, not
-one per reply. With ``plain`` it prints one stable line per event that matters, for
-CI and logs.
+one per reply. A reply printed while the team works pauses the tree instead, so the
+screen keeps one tree, below the reply. With ``plain`` it prints one stable line per
+event that matters, for CI and logs.
 
 The view must never break a run. Every event is handled inside a guard: if drawing
 fails, the error is logged once and the view falls back to plain lines.
@@ -27,10 +28,13 @@ from agent_team.core.artifacts import plain_kind
 from agent_team.core.interfaces import EventBus
 from agent_team.core.models import (
     PHASE_ORDER,
+    STRONGER_MARK,
+    DecisionKind,
     Event,
     EventName,
     HookOutcome,
     Task,
+    attempt_text,
     checked_attempt,
 )
 
@@ -90,6 +94,13 @@ class TaskRow:
     parent: str | None = None  # the task this one checks, asks about or revises
     reason: str | None = None  # why the task exists, such as "confirm_change"
     max_attempts: int = 0  # 0 when the events didn't say
+    #: The first attempt on the stronger model, once the policy sent the task there.
+    stronger_from: int | None = None
+
+    def on_stronger(self, attempt: int | None = None) -> bool:
+        """Whether ``attempt`` (the latest by default) ran on the stronger model."""
+        attempt = self.attempt if attempt is None else attempt
+        return self.stronger_from is not None and attempt >= self.stronger_from
 
     @property
     def label(self) -> str:
@@ -181,14 +192,16 @@ def _tag(state: RunState, row: TaskRow, room: int) -> str:
 
 def label(state: RunState, row: TaskRow, room: int) -> str:
     """A row's label. A check names the attempt and what it checks, cut to fit
-    ``room`` characters, such as "check 2/3: the research [How do you run…]", or
-    "check: the whole run"."""
+    ``room`` characters, such as "check 2/3: the research [How do you run…]",
+    "check 4 (stronger model): the research", or "check: the whole run"."""
     if row.agent != "auditor":
         return row.label
     subject = state.tasks.get(row.parent or "")
     if subject is not None:
         attempt = checked_attempt(row.reason)
         of = f"/{subject.max_attempts}" if attempt and subject.max_attempts else ""
+        if attempt and subject.on_stronger(attempt):
+            of = f" ({STRONGER_MARK})"
         head = f"check {attempt}{of}: " if attempt else "check: "
         head += plain_kind(subject.kind)
         return head + _tag(state, subject, room - len(head))
@@ -275,6 +288,18 @@ class RunView:
             self.console.file.flush()
         except Exception:
             self._fall_back("follow a typed line")
+
+    def pause(self) -> None:
+        """Stop redrawing, which clears the live frame, without printing the tree:
+        ``start`` draws it again below whatever prints meanwhile, so a reply under the
+        live view leaves no frozen copy of the tree above it."""
+        live, self._live = self._live, None
+        if live is None:
+            return
+        try:
+            live.stop()
+        except Exception:
+            self._fall_back("pause the live view")
 
     def stop(self) -> None:
         """Stop redrawing, which clears the live frame, then print the tree once if it
@@ -427,13 +452,17 @@ class RunView:
                 row.tool = None
             if row.status not in PLAIN_STATES:
                 return None
-            attempt = f" (attempt {row.attempt})" if row.attempt > 1 else ""
+            attempt = f" ({self._attempt(row)})" if row.attempt > 1 else ""
             head, tail = f"  {row.phase}: ", f" {row.status}{attempt}"
             return head + tagged(state, row, self._room(head, tail)) + tail
         if row is None:
             return None
         if name is EventName.TASK_STARTED:
             row.attempt = event.attempt or row.attempt
+            return None
+        if name is EventName.DECISION and data.get("kind") == DecisionKind.STRONGER_MODEL:
+            # Decided after an attempt failed: the next one runs on the stronger model.
+            row.stronger_from = row.attempt + 1
             return None
         if name is EventName.TOOL_CALL_BEFORE:
             row.tool = tool_summary(str(data.get("tool", "")), data.get("args"))
@@ -456,6 +485,11 @@ class RunView:
                 head, tail = "    audit failed: ", f" ({len(blockers)} blockers)"
             return head + tagged(state, row, self._room(head, tail)) + tail
         return None
+
+    @staticmethod
+    def _attempt(row: TaskRow) -> str:
+        """A row's latest attempt, such as "attempt 2" or "attempt 4 (stronger model)"."""
+        return attempt_text(row.attempt, stronger=row.on_stronger())
 
     def _room(self, head: str, tail: str) -> int:
         """The characters a line of the console's width leaves between ``head`` and
@@ -499,7 +533,7 @@ class RunView:
     def row(self, state: RunState, row: TaskRow) -> Text:
         """One task line: mark, who and what, attempt and current tool. A check's label
         gets the room the line has left at the console's width."""
-        attempt = f" · attempt {row.attempt}" if row.attempt > 1 else ""
+        attempt = f" · {self._attempt(row)}" if row.attempt > 1 else ""
         objective = ""
         if row.agent not in ("user", "auditor") and row.objective:
             objective = f" · {short(row.objective, 50)}"

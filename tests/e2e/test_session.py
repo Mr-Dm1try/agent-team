@@ -386,9 +386,10 @@ async def test_a_reply_while_the_team_works_prints_under_the_live_tree(tmp_path:
         )
     text = out.getvalue()
     assert code == 0, text
-    # The tree printed once when the view stopped for the reply, then the reply.
+    # The live tree drew before the reply, and drew again after it.
     reply = text.index("The engineer is writing the code now.")
     assert text.rfind("run run_", 0, reply) >= 0 and "engineer" in text[:reply]
+    assert "run run_" in text[reply:]
     assert "Accepted. Run" in text[reply:]
 
 
