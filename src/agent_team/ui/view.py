@@ -28,7 +28,7 @@ from agent_team.core.artifacts import plain_kind
 from agent_team.core.interfaces import EventBus
 from agent_team.core.models import (
     PHASE_ORDER,
-    STRONGER_MARK,
+    Decision,
     DecisionKind,
     Event,
     EventName,
@@ -36,6 +36,7 @@ from agent_team.core.models import (
     Task,
     attempt_text,
     checked_attempt,
+    stronger_attempts,
 )
 
 log = logging.getLogger(__name__)
@@ -193,16 +194,17 @@ def _tag(state: RunState, row: TaskRow, room: int) -> str:
 def label(state: RunState, row: TaskRow, room: int) -> str:
     """A row's label. A check names the attempt and what it checks, cut to fit
     ``room`` characters, such as "check 2/3: the research [How do you run…]",
-    "check 4 (stronger model): the research", or "check: the whole run"."""
+    "check 4/4 on the stronger model: the research", or "check: the whole run"."""
     if row.agent != "auditor":
         return row.label
     subject = state.tasks.get(row.parent or "")
     if subject is not None:
         attempt = checked_attempt(row.reason)
-        of = f"/{subject.max_attempts}" if attempt and subject.max_attempts else ""
-        if attempt and subject.on_stronger(attempt):
-            of = f" ({STRONGER_MARK})"
-        head = f"check {attempt}{of}: " if attempt else "check: "
+        head = "check: "
+        if attempt:
+            stronger = subject.on_stronger(attempt)
+            head = attempt_text(attempt, subject.max_attempts, stronger=stronger, word="check")
+            head += ": "
         head += plain_kind(subject.kind)
         return head + _tag(state, subject, room - len(head))
     if row.parent is None:
@@ -341,11 +343,12 @@ class RunView:
             except Exception:
                 log.debug("the live view didn't stop cleanly", exc_info=True)
 
-    def load(self, run_id: str, tasks: list[Task]) -> None:
+    def load(self, run_id: str, tasks: list[Task], decisions: list[Decision] | None = None) -> None:
         """Start from the tasks a run already has, so a resumed run shows its earlier
-        work. A phase whose tasks are all finished shows as done, and one with work
-        under way as running."""
+        work, with ``decisions`` marking attempts on the stronger model. A phase whose
+        tasks are all finished shows as done, and one with work under way as running."""
         state = self._run(run_id)
+        stronger = stronger_attempts(decisions or [])
         for task in tasks:
             state.tasks[task.id] = TaskRow(
                 id=task.id,
@@ -359,6 +362,7 @@ class RunView:
                 parent=task.parent_task_id,
                 reason=task.reason,
                 max_attempts=task.max_attempts,
+                stronger_from=stronger.get(task.id),
             )
         for phase in {t.phase for t in state.tasks.values()}:
             rows = [t for t in state.tasks.values() if t.phase == phase]
@@ -462,7 +466,8 @@ class RunView:
             return None
         if name is EventName.DECISION and data.get("kind") == DecisionKind.STRONGER_MODEL:
             # Decided after an attempt failed: the next one runs on the stronger model.
-            row.stronger_from = row.attempt + 1
+            first = (data.get("inputs") or {}).get("attempt")
+            row.stronger_from = first if isinstance(first, int) else row.attempt + 1
             return None
         if name is EventName.TOOL_CALL_BEFORE:
             row.tool = tool_summary(str(data.get("tool", "")), data.get("args"))
@@ -488,7 +493,8 @@ class RunView:
 
     @staticmethod
     def _attempt(row: TaskRow) -> str:
-        """A row's latest attempt, such as "attempt 2" or "attempt 4 (stronger model)"."""
+        """A row's latest attempt, such as "attempt 2" or "attempt 4 on the stronger
+        model"."""
         return attempt_text(row.attempt, stronger=row.on_stronger())
 
     def _room(self, head: str, tail: str) -> int:

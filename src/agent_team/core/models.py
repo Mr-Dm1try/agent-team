@@ -241,17 +241,25 @@ def checked_attempt(reason: str | None) -> int | None:
     return int(found.group(1)) if found else None
 
 
-#: How an attempt on the stronger model is marked: the policy grants it past the
-#: attempt limit by design, so it isn't shown against that limit.
-STRONGER_MARK = "stronger model"
-
-
-def attempt_text(attempt: int, max_attempts: int = 0, *, stronger: bool = False) -> str:
+def attempt_text(
+    attempt: int, max_attempts: int = 0, *, stronger: bool = False, word: str = "attempt"
+) -> str:
     """An attempt as people and the auditor read it: "attempt 2/3", "attempt 2" when
-    the limit isn't known, or "attempt 4 (stronger model)"."""
-    if stronger:
-        return f"attempt {attempt} ({STRONGER_MARK})"
-    return f"attempt {attempt}/{max_attempts}" if max_attempts else f"attempt {attempt}"
+    the limit isn't known, and "attempt 4/4 on the stronger model" for one the policy
+    granted past the limit on the stronger model. ``word`` replaces "attempt"."""
+    text = f"{word} {attempt}/{max_attempts}" if max_attempts else f"{word} {attempt}"
+    return f"{text} on the stronger model" if stronger else text
+
+
+def stronger_attempts(decisions: list[Decision]) -> dict[str, int]:
+    """The first attempt each task ran on the stronger model, by task id, from the
+    decisions that sent it there; the stronger route then stays with the task."""
+    out: dict[str, int] = {}
+    for d in decisions:
+        attempt = d.inputs.get("attempt")
+        if d.kind is DecisionKind.STRONGER_MODEL and d.task_id and isinstance(attempt, int):
+            out.setdefault(d.task_id, attempt)
+    return out
 
 
 class Task(Contract):

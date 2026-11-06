@@ -36,7 +36,6 @@ from agent_team.core.artifacts import (
 from agent_team.core.models import (
     AgentName,
     Decision,
-    DecisionKind,
     Finding,
     Phase,
     Rule,
@@ -47,6 +46,7 @@ from agent_team.core.models import (
     TaskStatus,
     Verdict,
     attempt_text,
+    stronger_attempts,
 )
 
 #: Upstream order of artifact kinds; used to find the earliest artifact at fault.
@@ -1182,18 +1182,13 @@ def process_trail(ctx: AuditContext, rule: Rule) -> HelperResult:
     """R8: every live task finished with times and a verdict within its attempts,
     and every decision has a reason."""
     res = HelperResult()
-    stronger = stronger_model_tasks(ctx.decisions)
+    stronger = stronger_attempts(ctx.decisions)
     for task in ctx.tasks:
         if task.status is TaskStatus.SUPERSEDED or task.agent in (
             AgentName.USER,
             AgentName.AUDITOR,
         ):
             continue
-        if task.id in stronger:
-            res.notes.append(
-                f"{task.id}: {attempt_text(task.attempt, stronger=True)}, which the "
-                "policy grants past the attempt limit by design, so it is within the limit"
-            )
         if task.status is not TaskStatus.DONE:
             res.findings.append(
                 hit(rule, f"task ended as {task.status.value}, not done", item=task.id)
@@ -1203,6 +1198,13 @@ def process_trail(ctx: AuditContext, rule: Rule) -> HelperResult:
             res.findings.append(hit(rule, "task has no start or end time", item=task.id))
         if not ctx.verdicts.get(task.id):
             res.findings.append(hit(rule, "task has no audit verdict", item=task.id))
+        first = stronger.get(task.id)
+        if first is not None and task.attempt >= first:
+            res.notes.append(
+                f"{task.id}: attempt {first} ran on the stronger model, which the policy "
+                f"grants past the configured limit by raising it; the task ended at "
+                f"{attempt_text(task.attempt, task.max_attempts)}"
+            )
         # max_attempts plus the one attempt the policy may grant on the stronger model
         if task.attempt > task.max_attempts + 1:
             res.findings.append(
@@ -1219,9 +1221,3 @@ def process_trail(ctx: AuditContext, rule: Rule) -> HelperResult:
             )
     res.notes.append(f"{len(ctx.tasks)} tasks, {len(ctx.decisions)} decisions")
     return res
-
-
-def stronger_model_tasks(decisions: list[Decision]) -> set[str]:
-    """Ids of the tasks sent to the stronger model. Its route stays with the task, so
-    each such task's latest attempt ran on it."""
-    return {d.task_id for d in decisions if d.kind is DecisionKind.STRONGER_MODEL and d.task_id}

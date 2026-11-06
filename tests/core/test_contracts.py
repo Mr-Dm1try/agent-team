@@ -129,7 +129,15 @@ def test_contract_guards() -> None:
         # Titles that only look like notes keep every word.
         ("Write-Ahead Logging (WAL)", "Write-Ahead Logging (WAL)", None),
         ("Python - Unicode characters", "Python - Unicode characters", None),
-        ("Opened files, fetched by offset 3", "Opened files", "fetched by offset 3"),
+        ("SQLite WAL, characters 0-10000", "SQLite WAL", "characters 0-10000"),
+        ("file.seek(offset 0) - Python docs", "file.seek(offset 0) - Python docs", None),
+        (
+            "Python 3.12: What's New - Files opened in text mode",
+            "Python 3.12: What's New - Files opened in text mode",
+            None,
+        ),
+        ("Unicode, 1,114,112 characters", "Unicode, 1,114,112 characters", None),
+        ("io - Tools for streams (opened files)", "io - Tools for streams (opened files)", None),
     ],
 )
 def test_source_titles_carry_no_notes_on_how_they_were_read(
@@ -147,6 +155,9 @@ def test_a_read_note_moved_from_the_title_joins_the_read_field() -> None:
     assert source.read == "lines 1-80; opened at offset 4000"
     # A title that is nothing but a note isn't emptied: its first part stays.
     assert Source(ref="a.md", title="opened at offset 0").title == "opened at offset 0"
+    # A read that isn't text still fails, whatever the title holds.
+    with pytest.raises(ValidationError):
+        Source.model_validate({"ref": "a.md", "title": "Notes (offset 4000)", "read": [1]})
 
 
 def test_a_research_answer_keeps_coverage_notes_in_gaps() -> None:

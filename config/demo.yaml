@@ -15,8 +15,8 @@ stronger_model: {provider: anthropic, model: claude-sonnet-5-5}
 fallbacks: [anthropic, ollama]
 # Model each provider uses when it stands in for another one.
 fallback_models: {anthropic: claude-haiku-5-5, ollama: "gpt-oss:20b"}
-# 60 minutes, because the Researcher runs locally one call at a time; docs/DESIGN.md,
-# "Routing", has the estimate. With every agent on Claude, 30 is enough.
+# Kept at default.yaml's 60 minutes, which allow for a local Researcher; with every
+# agent on Claude, as here, 30 is enough.
 budget: {max_usd_per_run: 1.00, max_minutes_per_run: 60}
 # Research agents ask for mid-run: at most max_research_tasks per run, and at depth 1 a
 # task made from a request can't ask for more. Past a limit a task answers with what it

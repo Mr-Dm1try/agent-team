@@ -937,16 +937,29 @@ def test_r8_accepts_the_stronger_model_attempt_and_says_so(run: Run) -> None:
         choice="one last attempt on claude-sonnet-5-5",
         reason="the fault is in the task's own output",
         made_by="code",
+        inputs={"task_id": t.id, "attempt": 4},
     )
     ctx = AuditContext(run=run, scope=RuleScope.RUN, tasks=[t], decisions=[d], verdicts={t.id: [v]})
     res = run_helper("R8", ctx)
     assert res.findings == []
-    assert any(f"{t.id}: attempt 4 (stronger model)" in n for n in res.notes)
+    assert f"{t.id}: attempt 4 ran on the stronger model" in " | ".join(res.notes)
     prompt = render_prompt(ctx, [RULES["R8"]], {"R8": res})
-    assert "attempt 4 (stronger model)" in prompt and "4/4" not in prompt
-    assert "(stronger model)" in RULES["R8"].statement
+    assert "attempt 4/4 on the stronger model" in prompt
+    assert "on the stronger model" in RULES["R8"].statement
     # Without the decision, the same task reads against its limit as before.
     plain = AuditContext(
         run=run, scope=RuleScope.RUN, tasks=[t], decisions=[], verdicts={t.id: [v]}
     )
-    assert "attempt 4/4" in render_prompt(plain, [RULES["R8"]], {})
+    assert "attempt 4/4 on the stronger model" not in render_prompt(plain, [RULES["R8"]], {})
+    # A decision whose attempt hasn't run yet marks nothing.
+    early = t.model_copy(update={"attempt": 3, "max_attempts": 4})
+    waiting = AuditContext(
+        run=run, scope=RuleScope.RUN, tasks=[early], decisions=[d], verdicts={t.id: [v]}
+    )
+    assert "attempt 3/4 on the stronger model" not in render_prompt(waiting, [RULES["R8"]], {})
+    # Attempts past the raised limit are still over it.
+    over = t.model_copy(update={"attempt": 6})
+    late = AuditContext(
+        run=run, scope=RuleScope.RUN, tasks=[over], decisions=[d], verdicts={t.id: [v]}
+    )
+    assert "over its limit" in " | ".join(f.message for f in run_helper("R8", late).findings)

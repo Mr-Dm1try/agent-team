@@ -70,13 +70,14 @@ class ResearchRequest(Contract):
 #: Words that mark a note about how a source was read, not its title: "opened in this
 #: attempt at offset 361000", "first 10,000 of 27,246 characters", "header only".
 _READ_NOTE = re.compile(
-    r"\boffset\s*=?\s*\d|\bcharacters?\s+\d|\d[\d,]*\s+characters\b|\bthis attempt\b"
-    r"|\b(?:opened|fetched|truncated)\b|\bnot (?:reached|read|re-?verified|verified)\b"
-    r"|\bheader only\b|\bfirst [\d,]+ of\b",
+    r"\boffset\s*=?\s*\d|\bcharacters\s+\d[\d,]*\s*(?:-|to)\s*\d"
+    r"|\b\d[\d,]*\s+of\s+\d[\d,]*\s+characters\b|\bthis attempt\b|\bheader only\b"
+    r"|\bnot (?:reached|read|re-?verified)\b",
     re.IGNORECASE,
 )
-#: A bracketed aside in a title, such as "(opened for its header only)".
-_ASIDE = re.compile(r"\s*[(\[]([^()\[\]]*)[)\]]")
+#: A bracketed aside in a title after a space, such as "(opened for its header only)";
+#: "seek(offset)" is part of the name.
+_ASIDE = re.compile(r"\s+[(\[]([^()\[\]]*)[)\]]")
 #: Where a title splits into parts: a semicolon, a comma, or a spaced dash.
 _TITLE_PARTS = re.compile(r"(\s*;\s*|,\s+|\s+[-\u2013\u2014]\s+)")
 
@@ -123,11 +124,13 @@ class Source(Contract):
         title the user sees is the page's own."""
         if not isinstance(data, dict) or not isinstance(data.get("title"), str):
             return data
+        read = data.get("read")
+        if read is not None and not isinstance(read, str):
+            return data  # left for the field's own check to reject
         title, notes = split_read_notes(data["title"])
         if not notes:
             return data
-        read = [data["read"]] if isinstance(data.get("read"), str) and data["read"] else []
-        return {**data, "title": title or None, "read": "; ".join(read + notes)}
+        return {**data, "title": title or None, "read": "; ".join([r for r in [read] if r] + notes)}
 
 
 class ArtifactBase(Contract):
@@ -350,15 +353,16 @@ class ResearchAnswer(ArtifactBase):
     kind: Literal["research_answer"] = "research_answer"
     question: str
     answer: str = Field(
-        description="The answer as the user reads it. Leave out how you researched it, "
-        "such as which parts of a page you read or what you didn't re-check; that goes in "
-        "`gaps`.",
+        description="The answer as the user reads it. Say plainly if part of the question "
+        "stays unanswered, but leave out how you researched it, such as which parts of a "
+        "page you read or what you didn't re-check; that goes in `gaps`.",
     )
     sources: list[Source] = Field(min_length=1)
     gaps: list[str] = Field(
         default_factory=list,
-        description="What the answer doesn't cover and why, one line each, such as a part "
-        "of a source you didn't read. Kept for the audit trail; the user isn't shown it.",
+        description="Notes on how the answer was researched, one line each, such as a part "
+        "of a source you didn't read or a claim you didn't re-check. Kept for the audit "
+        "trail; the user isn't shown it.",
     )
 
 

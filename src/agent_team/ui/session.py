@@ -257,7 +257,9 @@ class Session:
             return 1
         try:
             self.team.kill_switch.clear(run_id)  # a stop is lifted by resuming
-            self.view.load(run_id, await self.team.stores.tasks.list_tasks(run_id))
+            stores = self.team.stores
+            tasks = await stores.tasks.list_tasks(run_id)
+            self.view.load(run_id, tasks, await stores.decisions.list(run_id))
             reply = await self._drive(self.team.orchestrator.resume(run_id), run_id)
             return await self._talk(reply, run_id)
         finally:

@@ -10,7 +10,16 @@ from typing import Any
 import pytest
 from rich.console import Console
 
-from agent_team.core.models import AgentName, Event, EventName, Phase, Task, TaskStatus
+from agent_team.core.models import (
+    AgentName,
+    Decision,
+    DecisionKind,
+    Event,
+    EventName,
+    Phase,
+    Task,
+    TaskStatus,
+)
 from agent_team.ui.view import RunView, tool_summary
 
 RUN = "run_1"
@@ -462,7 +471,7 @@ async def test_the_stronger_model_attempt_is_marked_not_counted_against_the_limi
         _event(EventName.RUN_STARTED),
         _state("b1", AgentName.RESEARCHER, "running", attempt=3, **BRIEF_TASK),
         _state("c3", AgentName.AUDITOR, "done", task_reason="check of attempt 3", **check),
-        _event(EventName.DECISION, "b1", kind="stronger_model"),
+        _event(EventName.DECISION, "b1", kind="stronger_model", inputs={"attempt": 4}),
         _state(
             "b1", AgentName.RESEARCHER, "running", attempt=4, **dict(BRIEF_TASK, max_attempts=4)
         ),
@@ -472,11 +481,41 @@ async def test_the_stronger_model_attempt_is_marked_not_counted_against_the_limi
     console.print(view.render())
     text = console.export_text()
     assert "check 3/4: the research" in text
-    assert "check 4 (stronger model): the research" in text
-    assert "attempt 4 (stronger model)" in text and "4/4" not in text
+    assert "check 4/4 on the stronger model: the research" in text
+    assert "· attempt 4 on the stronger model" in text
     plain = RunView(_console(), plain=True)
     lines = [plain.apply(e) for e in events]
-    assert lines[4] == "  planning: researcher: the research running (attempt 4 (stronger model))"
+    assert (
+        lines[4] == "  planning: researcher: the research running (attempt 4 on the stronger model)"
+    )
+
+
+async def test_a_resumed_run_still_marks_the_stronger_model_attempt() -> None:
+    console = _console()
+    view = RunView(console)
+    brief = Task(
+        id="b1",
+        run_id=RUN,
+        phase=Phase.PLANNING,
+        agent=AgentName.RESEARCHER,
+        objective=QUESTION,
+        output_kind="research_brief",
+        status=TaskStatus.RUNNING,
+        attempt=4,
+        max_attempts=4,
+    )
+    sent = Decision(
+        run_id=RUN,
+        task_id="b1",
+        kind=DecisionKind.STRONGER_MODEL,
+        inputs={"task_id": "b1", "attempt": 4},
+        choice="one last attempt on claude-sonnet-5-5",
+        reason="the fault is in the task's own output",
+        made_by="code",
+    )
+    view.load(RUN, [brief], [sent])
+    console.print(view.render())
+    assert "attempt 4 on the stronger model" in console.export_text()
 
 
 def screen(raw: str) -> list[str]:

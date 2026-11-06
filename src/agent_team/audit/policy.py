@@ -33,8 +33,9 @@ call that already ran) escalates and asks at once too, since no retry can clear 
 the user may keep the work.
 
 Extra ``inputs`` keys beyond the contract's: ``finding_ids`` on most kinds,
-``previous_output`` on RETRY, ``phase``/``producer_task_id`` on UPSTREAM_RERUN and
-``rerun_after`` (task ids) on FIX.
+``previous_output`` on RETRY, ``phase``/``producer_task_id`` on UPSTREAM_RERUN,
+``rerun_after`` (task ids) on FIX and ``attempt`` (the first attempt on the stronger
+model) on STRONGER_MODEL.
 """
 
 from __future__ import annotations
@@ -432,6 +433,7 @@ def decide_task(
                 reason="the fault is in the task's own output: " + _summary(blockers),
                 rule="policy.stronger_model",
                 model=limits.stronger_model,
+                attempt=task.attempt + 1,
                 finding_ids=fids,
             )
         )
@@ -491,6 +493,7 @@ def decide_error(
                 reason=f"the task's own output failed: {error}",
                 rule="policy.stronger_model",
                 model=limits.stronger_model,
+                attempt=task.attempt + 1,
             )
         )
     return out

@@ -103,6 +103,7 @@ def test_no_attempts_left_own_fault_gets_the_stronger_model(run: Run) -> None:
         "task_id": task.id,
         "model": "strong-1",
         "finding_ids": [v.findings[0].id],
+        "attempt": task.attempt + 1,  # the attempt that runs on the stronger model
     }
 
 

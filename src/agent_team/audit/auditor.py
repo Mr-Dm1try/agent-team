@@ -25,7 +25,6 @@ from agent_team.audit.evidence import (
     HelperResult,
     gather,
     ref_of,
-    stronger_model_tasks,
 )
 from agent_team.audit.llmjson import ask_json
 from agent_team.audit.precheck import ToolPrecheck
@@ -59,6 +58,7 @@ from agent_team.core.models import (
     TaskStatus,
     Verdict,
     attempt_text,
+    stronger_attempts,
 )
 from agent_team.llm.types import LLMClient
 from agent_team.orchestrator.lineage import ancestry, previous_version
@@ -522,12 +522,12 @@ def render_prompt(ctx: AuditContext, rules: list[Rule], helpers: dict[str, Helpe
         ]
         parts.append("## Tool calls\n" + "\n".join(lines))
     if ctx.scope is RuleScope.RUN:
-        stronger = stronger_model_tasks(ctx.decisions)
+        stronger = stronger_attempts(ctx.decisions)
         parts.append(
             "## Tasks\n"
             + "\n".join(
                 f"- {t.id} {t.agent.value} {t.phase.value} {t.status.value} "
-                f"{attempt_text(t.attempt, t.max_attempts, stronger=t.id in stronger)} "
+                f"{attempt_text(t.attempt, t.max_attempts, stronger=_on_stronger(t, stronger))} "
                 f"verdicts {len(ctx.verdicts.get(t.id, []))}"
                 for t in ctx.tasks
             )
@@ -537,6 +537,12 @@ def render_prompt(ctx: AuditContext, rules: list[Rule], helpers: dict[str, Helpe
             + "\n".join(f"- {d.kind.value}: {d.choice} ({d.reason})" for d in ctx.decisions)
         )
     return "\n\n".join(parts)
+
+
+def _on_stronger(task: Task, stronger: dict[str, int]) -> bool:
+    """Whether the task's latest attempt ran on the stronger model."""
+    first = stronger.get(task.id)
+    return first is not None and task.attempt >= first
 
 
 _UPSTREAM: dict[Phase | None, tuple[str, ...]] = {

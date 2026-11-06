@@ -61,8 +61,9 @@ can read and from the web, and return them with their sources.
 - For a research_answer, write a direct answer to the user's question from the input
   briefs and list the sources it rests on. Don't contradict the briefs, such as by
   pinning another version than they found, and follow the user's guidance on them.
-  The user reads `answer` as it is: write the answer, not how it was researched. Notes
-  on what was or wasn't read or re-checked go in `gaps`, not in the answer.
+  The user reads `answer` as it is: write the answer, not how it was researched. If
+  part of the question stays unanswered, say so plainly in the answer. Notes on which
+  parts of a source were or weren't read or re-checked go in `gaps`, not the answer.
 """
 
 PRODUCT = """\
