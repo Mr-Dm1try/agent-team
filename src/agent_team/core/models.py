@@ -249,6 +249,9 @@ class Task(Contract):
     output: ArtifactRef | None = None
     finding_ids: list[str] = Field(default_factory=list)  # findings from the last verdict
     last_error: str | None = None
+    #: The error the attempt before the current one ended with, if it ended with one:
+    #: for spotting a repeat (no progress) and telling the next attempt what happened.
+    previous_error: str | None = None
     last_traceback: str | None = None
     trace_id: str | None = None
     span_id: str | None = None
@@ -298,6 +301,9 @@ class TaskEnvelope(Contract):
     findings: list[Finding] = Field(default_factory=list)  # from the last failed verdict
     previous_output: Artifact | None = None  # set on retries and revisions
     upstream_diff: str | None = None  # set on revisions
+    #: How the attempt before this one failed and what it did, so a retry after an
+    #: error builds on it instead of starting over.
+    previous_attempt: str | None = None
     #: False when the task can't ask for research (a depth or run limit); its
     #: requests are then turned into open gaps or assumptions.
     research_allowed: bool = True

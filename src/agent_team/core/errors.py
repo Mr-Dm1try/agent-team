@@ -72,6 +72,31 @@ class OutputValidationError(AgentTeamError):
         self.errors = errors
 
 
+#: Error types that mean the attempt's own output was at fault, like a failed check:
+#: they count toward no progress and the stronger model, and against the first pass.
+OWN_OUTPUT_ERRORS = frozenset({OutputValidationError.__name__})
+
+
+def error_type(error: str | None) -> str | None:
+    """The type name at the start of a task's recorded error ("Type: message")."""
+    if not error or ":" not in error:
+        return None
+    return error.split(":", 1)[0].strip() or None
+
+
+def is_own_output_error(error: str | None) -> bool:
+    """Whether a recorded error means the attempt's own output was at fault."""
+    return error_type(error) in OWN_OUTPUT_ERRORS
+
+
+def repeats_error(error: str | None, previous: str | None) -> bool:
+    """Whether an attempt failed its output the same way as the attempt before it:
+    no progress, as when a retry fails the same rules on the same items."""
+    if error is None or not previous or not is_own_output_error(error):
+        return False
+    return " ".join(error.split()).lower() == " ".join(previous.split()).lower()
+
+
 class ToolError(AgentTeamError):
     """A tool failed, e.g. file not found or a command exited non-zero.
 

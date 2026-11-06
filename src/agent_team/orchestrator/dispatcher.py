@@ -20,8 +20,9 @@ import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
+from agent_team.audit.toollog import ToolCallLog, summarize_attempt
 from agent_team.core.artifacts import Artifact, ArtifactRef
-from agent_team.core.errors import BudgetExceeded, RunStopped
+from agent_team.core.errors import BudgetExceeded, RunStopped, repeats_error
 from agent_team.core.interfaces import (
     Agent,
     AgentContext,
@@ -97,6 +98,8 @@ class Dispatcher:
     auditor: Auditor | None = None
     #: Limits on research agents ask for; None leaves it unlimited.
     research: ResearchLimits | None = None
+    #: The tool calls of earlier attempts, summed up for a retry after an error.
+    tool_log: ToolCallLog | None = None
 
     async def dispatch(self, task: Task) -> AgentResult:
         """Run one attempt of ``task`` and move it on; never raises for agent errors."""
@@ -114,6 +117,8 @@ class Dispatcher:
         agent = self.agents.get(task.agent)
         if not resume:
             task.attempt += 1
+            failed = task.last_error not in (None, INTERRUPTED)
+            task.previous_error = task.last_error if failed else None
         task.last_error = None
         task.last_traceback = None
         task.trace_id = run.trace_id
@@ -346,6 +351,7 @@ class Dispatcher:
         return TaskEnvelope(
             task=task,
             run=run,
+            previous_attempt=await self._previous_attempt(task),
             inputs=inputs,
             constraints=constraints,
             memories=memories,
@@ -358,6 +364,20 @@ class Dispatcher:
             trace_id=task.trace_id or run.trace_id,
             span_id=task.span_id or run.span_id,
         )
+
+    async def _previous_attempt(self, task: Task) -> str | None:
+        """How the attempt before this one failed and what it did, when it ended with
+        an error: its commands with their exit codes and the files it wrote."""
+        if task.previous_error is None:
+            return None
+        calls = []
+        if self.tool_log is not None:
+            calls = [
+                c
+                for c in await self.tool_log.for_task(task.run_id, task.id)
+                if c.attempt == task.attempt - 1
+            ]
+        return summarize_attempt(task.previous_error, calls)
 
     async def _upstream_diff(
         self, run_id: str, previous: Artifact, inputs: list[Artifact]
@@ -423,9 +443,23 @@ class Dispatcher:
                 },
                 level="error",
             )
+            stuck = repeats_error(task.last_error, task.previous_error)
             if paused:
                 await self.tasks.transition(
                     task.id, TaskStatus.READY, reason=f"paused: {result.error_type}"
+                )
+            elif stuck:
+                # The same failure as the attempt before: another try won't help, so
+                # the orchestrator escalates (the stronger model, then the user).
+                await self.tasks.transition(
+                    task.id,
+                    TaskStatus.ESCALATED,
+                    reason=f"no progress: {result.error_type} again, as on the attempt before",
+                )
+                await self._emit(
+                    EventName.TASK_ESCALATED,
+                    task,
+                    {"error_type": result.error_type, "no_progress": True},
                 )
             elif task.attempt < task.max_attempts:
                 await self.tasks.transition(

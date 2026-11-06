@@ -238,14 +238,17 @@ class TestRun(Contract):
     passed: int
     failed: int
     exit_code: int
-    output_tail: str
+    output_tail: str = Field(description="The last few lines of the test output, not all of it.")
 
 
 class CodeChange(ArtifactBase):
     """What one Engineer attempt wrote: files, the commit, and its test run."""
 
     kind: Literal["code_change"] = "code_change"
-    files_written: list[str]
+    files_written: list[str] = Field(
+        description="Workspace-relative paths of the files you wrote with write_file in this "
+        "attempt. Paths only, never file contents."
+    )
     commit: str | None = None  # git sha in the run workspace
     tests: TestRun | None = None
 

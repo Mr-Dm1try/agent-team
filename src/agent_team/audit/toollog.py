@@ -27,6 +27,7 @@ class ToolCall(Contract):
 
     run_id: str
     task_id: str | None = None
+    attempt: int | None = None
     agent: str | None = None
     tool: str
     args: dict[str, Any] = Field(default_factory=dict)
@@ -111,6 +112,7 @@ def tool_call_from_event(event: Event) -> ToolCall | None:
     return ToolCall(
         run_id=event.run_id,
         task_id=event.task_id,
+        attempt=event.attempt,
         agent=event.agent.value if event.agent else None,
         tool=tool,
         args=args if isinstance(args, dict) else {"value": args},
@@ -120,3 +122,72 @@ def tool_call_from_event(event: Event) -> ToolCall | None:
         data=extra if isinstance(extra, dict) else {},
         ts=event.ts,
     )
+
+
+#: Commands listed in an attempt summary; earlier ones are counted, not listed.
+SUMMARY_COMMANDS = 20
+#: Longest command shown in an attempt summary.
+SUMMARY_COMMAND_CHARS = 160
+#: Tools whose calls an attempt summary lists one by one.
+COMMAND_TOOLS = frozenset({"run_command", "install_deps"})
+
+
+def _command_line(call: ToolCall) -> str:
+    """One command and how it ended, such as ``run_command pytest -q: exit 1``."""
+    if call.tool == "install_deps":
+        packages = call.data.get("packages") or call.args.get("packages") or []
+        shown = " ".join(str(p) for p in packages) or str(call.args.get("requirements", ""))
+    else:
+        argv = call.data.get("argv") or call.args.get("argv") or []
+        shown = " ".join(str(a) for a in argv) if isinstance(argv, list) else str(argv)
+    if len(shown) > SUMMARY_COMMAND_CHARS:
+        shown = shown[: SUMMARY_COMMAND_CHARS - 3] + "..."
+    if call.blocked:
+        ended = "blocked by the pre-check, not run"
+    elif isinstance(call.data.get("exit_code"), int):
+        ended = f"exit {call.data['exit_code']}"
+    else:
+        first = call.result.strip().splitlines()[0] if call.result.strip() else "no result"
+        ended = f"failed: {first[:SUMMARY_COMMAND_CHARS]}"
+    return f"{call.tool} {shown}: {ended}"
+
+
+def summarize_attempt(error: str, calls: list[ToolCall]) -> str:
+    """What one failed attempt did, for the next attempt: the error it ended with, the
+    commands it ran with their exit codes (repeats folded, the last
+    ``SUMMARY_COMMANDS`` listed) and the files it wrote."""
+    lines = [f"It ended with: {error}"]
+    commands: list[tuple[str, int]] = []  # each line and how many times in a row
+    for call in calls:
+        if call.tool not in COMMAND_TOOLS:
+            continue
+        text = _command_line(call)
+        if commands and commands[-1][0] == text:
+            commands[-1] = (text, commands[-1][1] + 1)
+        else:
+            commands.append((text, 1))
+    if commands:
+        lines.append("Commands it ran:")
+        left_out = len(commands) - SUMMARY_COMMANDS
+        if left_out > 0:
+            lines.append(f"- ({left_out} earlier commands left out)")
+        for text, times in commands[-SUMMARY_COMMANDS:]:
+            lines.append(f"- {text}" + (f" ({times} times)" if times > 1 else ""))
+    else:
+        lines.append("Commands it ran: none.")
+    written = [
+        str(c.args.get("path"))
+        for c in calls
+        if c.tool == "write_file" and not c.is_error and not c.blocked and c.args.get("path")
+    ]
+    written = list(dict.fromkeys(written))
+    lines.append("Files it wrote: " + (", ".join(written) if written else "none") + ".")
+    others: dict[str, int] = {}
+    for call in calls:
+        if call.tool not in COMMAND_TOOLS and call.tool != "write_file":
+            others[call.tool] = others.get(call.tool, 0) + 1
+    if others:
+        lines.append(
+            "Other calls: " + ", ".join(f"{n} {tool}" for tool, n in sorted(others.items())) + "."
+        )
+    return "\n".join(lines)

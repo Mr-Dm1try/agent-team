@@ -98,7 +98,11 @@ You are the Engineer. Implement the spec file by file, with unit tests.
   no notes, and report its counts and exit code.
 - Don't write outside the workspace, and don't put secrets, eval or exec on input, or
   shell or SQL strings built from input in the code.
-- `files_written` lists every file you created or changed in this attempt.
+- Write one file per write_file call, and keep files small enough to write in one
+  call; split a long module rather than writing it in one go.
+- `files_written` lists the paths of every file you created or changed in this attempt
+  with write_file. Your final JSON reports what you did: paths, never file contents,
+  and only the last lines of the test output in `tests.output_tail`.
 """
 
 QA = """\

@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from agent_team.audit.toollog import EventFileToolCallLog, InMemoryToolCallLog, tool_call_from_event
+from agent_team.audit.toollog import (
+    SUMMARY_COMMANDS,
+    EventFileToolCallLog,
+    InMemoryToolCallLog,
+    ToolCall,
+    summarize_attempt,
+    tool_call_from_event,
+)
 from agent_team.core.models import AgentName, Event, EventName
 from agent_team.core.tracing import events_path
 
@@ -48,3 +56,52 @@ async def test_memory_log_filters_by_run_and_task() -> None:
         assert call is not None
         log.record(call)
     assert [c.tool for c in await log.for_task("r1", "t")] == ["a"]
+
+
+def test_attempt_summary_lists_commands_exit_codes_and_files() -> None:
+    def call(tool: str, args: dict[str, Any], **kw: Any) -> ToolCall:
+        """One logged call."""
+        return ToolCall(run_id="r", task_id="t", attempt=1, tool=tool, args=args, **kw)
+
+    pytest_argv = ["python", "-m", "pytest", "-q"]
+    calls = [
+        call(
+            "install_deps",
+            {"packages": ["mcp==2.3.0"]},
+            data={"packages": ["mcp==2.3.0"], "exit_code": 0},
+        ),
+        call("run_command", {"argv": pytest_argv}, data={"argv": pytest_argv, "exit_code": 1}),
+        call("run_command", {"argv": pytest_argv}, data={"argv": pytest_argv, "exit_code": 1}),
+        call("run_command", {"argv": ["curl", "x"]}, blocked=True),
+        call(
+            "run_command",
+            {"argv": "pytest"},
+            is_error=True,
+            result="run_command failed: argv must be a list",
+        ),
+        call("write_file", {"path": "app.py"}),
+        call("write_file", {"path": "bad.py"}, is_error=True),
+        call("read_file", {"path": "spec.md"}),
+    ]
+    text = summarize_attempt("OutputValidationError: no files", calls)
+    assert text.splitlines() == [
+        "It ended with: OutputValidationError: no files",
+        "Commands it ran:",
+        "- install_deps mcp==2.3.0: exit 0",
+        "- run_command python -m pytest -q: exit 1 (2 times)",
+        "- run_command curl x: blocked by the pre-check, not run",
+        "- run_command pytest: failed: run_command failed: argv must be a list",
+        "Files it wrote: app.py.",
+        "Other calls: 1 read_file.",
+    ]
+
+
+def test_attempt_summary_keeps_the_last_commands() -> None:
+    calls = [
+        ToolCall(run_id="r", tool="run_command", data={"argv": [f"cmd{i}"], "exit_code": 0})
+        for i in range(SUMMARY_COMMANDS + 5)
+    ]
+    text = summarize_attempt("E: x", calls)
+    assert "(5 earlier commands left out)" in text
+    assert "cmd4:" not in text and f"cmd{SUMMARY_COMMANDS + 4}: exit 0" in text
+    assert "Files it wrote: none." in text

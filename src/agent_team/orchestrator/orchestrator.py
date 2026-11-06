@@ -232,6 +232,10 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             task = await self.tasks.get_task(task.id)
             if task.status is TaskStatus.AUDITING:  # not superseded while it ran
                 await self._audit(run, task, result.artifact)
+            elif task.status is TaskStatus.ESCALATED and result.status is ResultStatus.ERROR:
+                # Its own output failed: the stronger model, then the user.
+                for decision in await self.policy.on_task_error(run, task):
+                    await self._apply(run, decision)
 
     async def _audit(self, run: Run, task: Task, artifact: Artifact | None) -> None:
         """Check one output with an auditor task and apply the policy's decisions. The

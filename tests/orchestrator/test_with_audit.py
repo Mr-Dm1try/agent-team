@@ -4,9 +4,13 @@ decision and event shapes."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from agent_team.audit.toollog import tool_call_from_event
+from agents.fakes import tool_call
+from agents.scenario import CODE, Responder, team_script
+
+from agent_team.audit.toollog import ToolCall, tool_call_from_event
 from agent_team.core.artifacts import ArtifactRef
 from agent_team.core.models import (
     AgentName,
@@ -19,7 +23,8 @@ from agent_team.core.models import (
     TaskStatus,
     Verdict,
 )
-from orchestrator.harness import make_team
+from agent_team.llm.types import ContentBlock, LLMRequest, ToolResultBlock
+from orchestrator.harness import Team, make_team
 
 
 def _blocker(rule: str, item: str) -> Verdict:
@@ -111,3 +116,92 @@ async def test_a_dangerous_action_cannot_be_kept_as_it_is(tmp_path: Path) -> Non
     prd = next(t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd")
     assert prd.attempt == 2
     assert all(v.model != "user" for v in team.verdicts.items)
+
+
+class _BusToolLog:
+    """The tool-call log read straight from the fake bus, which writes no events file."""
+
+    def __init__(self, team: Team) -> None:
+        """Read ``team``'s bus."""
+        self.team = team
+
+    async def for_run(self, run_id: str) -> list[ToolCall]:
+        """The run's calls, oldest first."""
+        calls = (
+            tool_call_from_event(e)
+            for e in self.team.bus.events
+            if e.name is EventName.TOOL_CALL_AFTER and e.run_id == run_id
+        )
+        return [c for c in calls if c is not None]
+
+    async def for_task(self, run_id: str, task_id: str) -> list[ToolCall]:
+        """The task's calls, oldest first."""
+        return [c for c in await self.for_run(run_id) if c.task_id == task_id]
+
+
+def _engineer_without_files(team: Team, *, stronger_writes: bool) -> Responder:
+    """An Engineer that runs one command and then replies with no files, so its output
+    never validates; on the stronger model it writes app.py when ``stronger_writes``."""
+
+    def respond(request: LLMRequest) -> list[ContentBlock] | str:
+        """One scripted Engineer turn."""
+        stronger = request.task_id in team.llm.overrides
+        last = request.messages[-1]
+        ran = any(isinstance(b, ToolResultBlock) for b in last.content)
+        if stronger and stronger_writes:
+            if not ran:
+                return tool_call("write_file", {"path": "app.py", "content": "print('ok')\n"})
+            return json.dumps(CODE)
+        if len(request.messages) == 1:
+            return tool_call("run_command", {"argv": ["python", "-c", "import mcp"]})
+        return json.dumps({"summary": "Looked at the SDK.", "files_written": []})
+
+    return respond
+
+
+async def test_invalid_output_repeated_goes_to_the_stronger_model(tmp_path: Path) -> None:
+    script = team_script()
+    team = await make_team(tmp_path, code_policy=True, script=script)
+    script[AgentName.ENGINEER] = _engineer_without_files(team, stronger_writes=True)
+    team.dispatcher.tool_log = _BusToolLog(team)
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "done", reply.text
+    assert reply.run_id
+    code = next(
+        t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "code_change"
+    )
+    # Attempt 2 failed the same way as attempt 1, so attempt 3 ran on the stronger model.
+    assert code.status is TaskStatus.DONE and code.attempt == 3
+    kinds = [d.kind for d in team.decisions.items if d.task_id == code.id]
+    assert DecisionKind.NO_PROGRESS in kinds and DecisionKind.STRONGER_MODEL in kinds
+    assert kinds.index(DecisionKind.NO_PROGRESS) < kinds.index(DecisionKind.STRONGER_MODEL)
+    # The second attempt was told what the first one did.
+    prompts = [
+        r.messages[0].content[0]
+        for r in team.llm.requests
+        if r.agent is AgentName.ENGINEER and len(r.messages) == 1
+    ]
+    second = getattr(prompts[1], "text", "")
+    assert "Your previous attempt failed" in second
+    assert "OutputValidationError" in second
+    assert "run_command python -c import mcp: exit 0" in second
+    assert "Files it wrote: none." in second
+    assert "Your previous attempt failed" not in getattr(prompts[0], "text", "")
+
+
+async def test_invalid_output_after_the_stronger_model_asks_the_user(tmp_path: Path) -> None:
+    script = team_script()
+    team = await make_team(tmp_path, code_policy=True, script=script)
+    script[AgentName.ENGINEER] = _engineer_without_files(team, stronger_writes=False)
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "waiting", reply.text
+    assert reply.run_id
+    tasks = await team.tasks.list_tasks(reply.run_id)
+    code = next(t for t in tasks if t.output_kind == "code_change")
+    assert code.status is TaskStatus.ESCALATED and code.attempt == 3
+    kinds = [d.kind for d in team.decisions.items if d.task_id == code.id]
+    assert kinds.count(DecisionKind.STRONGER_MODEL) == 1
+    asks = [d for d in team.decisions.items if d.kind is DecisionKind.ASK_USER]
+    assert asks[-1].rule == "policy.ask_after_stronger_model"
+    question = next(t for t in tasks if t.agent is AgentName.USER and t.parent_task_id == code.id)
+    assert question.id in code.depends_on
