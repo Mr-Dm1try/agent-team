@@ -58,8 +58,20 @@ RUN_QUESTION = "run_audit"
 TASK_QUESTION = "policy"
 #: The user-task reason for a question about a task that is stuck.
 ESCALATION = "escalation"
-#: Added to questions about work the user may keep as it is.
-KEEP_HINT = " Reply 'approve' to keep the work as it is."
+
+
+def reply_options(*, keep: bool, stopped: bool = False) -> str:
+    """The replies a question about one stuck or failing task takes, in one sentence:
+    guidance for another try, 'approve' when the work may be kept as it is, and 'stop'
+    unless the run is already stopped."""
+    approve = "'approve' to keep the work as it is" if keep else ""
+    if stopped:
+        tail = f", or {approve}" if approve else ""
+        return f"Reply with guidance for another try{tail}; until then the run stays stopped."
+    middle = f" {approve}," if approve else ""
+    return f"Reply with guidance for another try,{middle} or 'stop' to stop the run."
+
+
 PAUSING = (BudgetExceeded, RunStopped)
 
 

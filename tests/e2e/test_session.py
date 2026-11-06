@@ -13,6 +13,7 @@ from typing import Any
 from agents.scenario import (
     PRD,
     _last_is_tool_result,
+    message_reply,
     orchestrator_responder,
     read_message,
     tool_call,
@@ -80,7 +81,7 @@ def _paging_script() -> dict[AgentName, Any]:
         said, _ = read_message(request)
         if said == "paginate the list":
             if _last_is_tool_result(request):
-                return json.dumps({"reply": "I can add pagination."})
+                return message_reply("I can add pagination.", "change")
             return tool_call("request_change", {"text": "paginate the list", "target": "prd"})
         return default(request)
 
@@ -137,7 +138,9 @@ async def test_a_change_request_shows_the_section_and_code_diffs(tmp_path: Path)
     assert '+  "text": "List books, 20 per page"' in changed
     assert "code: code_change v1 → v2:" in changed
     assert "-print('books')" in changed and "+print('books, 20 per page')" in changed
-    assert text.rstrip().endswith("is done.")
+    assert text.rstrip().endswith(
+        "is done.\nOutside any run: 2 model calls · fake 1.7k in / 19 out · $0.0000"
+    )
     assert "Accepted. Run" in text
     # The session held the run's lock while the team worked, and let go at prompts.
     assert typist.at_call and all(typist.at_call)

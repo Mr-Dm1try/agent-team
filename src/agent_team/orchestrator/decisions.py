@@ -19,11 +19,11 @@ from agent_team.core.models import (
     Verdict,
 )
 from agent_team.orchestrator.base import (
-    KEEP_HINT,
     RUN_QUESTION,
     TASK_QUESTION,
     OrchestratorBase,
     can_keep,
+    reply_options,
 )
 from agent_team.orchestrator.control import create_user_task
 
@@ -72,8 +72,9 @@ class DecisionsMixin(OrchestratorBase):
                 await self._findings_to_feedback(run, checker, found)
         elif d.kind is DecisionKind.ASK_USER:
             question = str(d.inputs.get("question") or d.reason)
-            if task is not None and can_keep(task, verdict):
-                question += KEEP_HINT
+            if task is not None:
+                halted = (await self.tasks.get_run(run.id)).status is RunStatus.STOPPED
+                question += " " + reply_options(keep=can_keep(task, verdict), stopped=halted)
             if task is not None and task.status is TaskStatus.AUDITING:
                 await self.tasks.transition(task.id, TaskStatus.ESCALATED, reason=d.reason)
             phase = (

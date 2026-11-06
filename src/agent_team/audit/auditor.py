@@ -29,7 +29,13 @@ from agent_team.audit.evidence import (
 from agent_team.audit.llmjson import ask_json
 from agent_team.audit.precheck import ToolPrecheck
 from agent_team.audit.toollog import ToolCallLog
-from agent_team.core.artifacts import ARTIFACT_TYPES, Artifact, ArtifactRef
+from agent_team.core.artifacts import (
+    ARTIFACT_TYPES,
+    Artifact,
+    ArtifactRef,
+    ResearchAnswer,
+    ResearchBrief,
+)
 from agent_team.core.errors import BudgetExceeded, RunStopped
 from agent_team.core.interfaces import (
     ArtifactStore,
@@ -164,6 +170,13 @@ class LLMAuditor:
             if artifact is not None:
                 ctx.outputs = [(task, artifact)]
                 ctx.previous = await self._previous(run.id, artifact, task, ctx.tasks)
+            if isinstance(artifact, ResearchAnswer):
+                ctx.briefs = [
+                    b
+                    for r in artifact.built_from
+                    if r.kind == "research_brief"
+                    and isinstance(b := await self.artifacts.load(run.id, r), ResearchBrief)
+                ]
             ctx.latest = await self._latest(run.id)
             ctx.tool_calls = await self.tool_log.for_task(run.id, task.id)
             if task.agent is AgentName.QA:
@@ -490,6 +503,9 @@ def render_prompt(ctx: AuditContext, rules: list[Rule], helpers: dict[str, Helpe
         parts.append(
             f"## Previous version {ref_of(ctx.previous)}\n{_dump(ctx.previous, _CONTEXT_CHARS)}"
         )
+    for brief in ctx.briefs:
+        in_scope.add(str(ref_of(brief)))
+        parts.append(f"## Built from {ref_of(brief)}\n{_dump(brief, _CONTEXT_CHARS)}")
     for kind, artifact in ctx.latest.items():
         if str(ref_of(artifact)) not in in_scope and kind in _UPSTREAM.get(ctx.phase, ()):
             parts.append(f"## Upstream {ref_of(artifact)}\n{_dump(artifact, _CONTEXT_CHARS)}")

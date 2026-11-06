@@ -185,6 +185,9 @@ class WebConfig(_Cfg):
     max_chars: int = 20_000
     max_results: int = 8
     max_redirects: int = 5
+    #: web_search and web_fetch calls one attempt may make, together, before the tools
+    #: refuse and tell the agent to write its output with what it has.
+    max_calls_per_attempt: int = Field(default=30, ge=1)
     user_agent: str = "agent-team/0.1 (research tool)"
 
 

@@ -299,6 +299,9 @@ class TaskEnvelope(Contract):
     constraints: list[str] = Field(default_factory=list)
     memories: list[str] = Field(default_factory=list)  # pre-rendered "Relevant memory" lines
     feedback: list[Feedback] = Field(default_factory=list)  # answers, comments, findings
+    #: The user's answers and comments on the inputs this task builds on, such as the
+    #: briefs a research answer is written from, so the answer follows that guidance.
+    input_feedback: list[Feedback] = Field(default_factory=list)
     findings: list[Finding] = Field(default_factory=list)  # from the last failed verdict
     previous_output: Artifact | None = None  # set on retries and revisions
     upstream_diff: str | None = None  # set on revisions

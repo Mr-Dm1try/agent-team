@@ -20,9 +20,9 @@ from agent_team.core.models import (
 from agent_team.orchestrator.base import (
     CHILD_ORIGINS,
     ESCALATION,
-    KEEP_HINT,
     OrchestratorBase,
     can_keep,
+    reply_options,
 )
 from agent_team.orchestrator.control import create_user_task
 from agent_team.orchestrator.lineage import ancestry
@@ -252,14 +252,13 @@ class SettleMixin(OrchestratorBase):
         """Ask the user how to get an escalated task unstuck."""
         why = task.last_error or "it failed its check with no attempts left"
         failed = await self.verdicts.latest_for_task(task.id)
-        keep = KEEP_HINT if can_keep(task, failed) else ""
         child = await create_user_task(
             self.tasks,
             run,
             phase=task.phase,
             question=(
                 f"{upper_first(plain_agent(task.agent))} is stuck on: {task.objective} "
-                f"({why}). Reply with guidance to retry it, or 'stop'.{keep}"
+                f"({why}). {reply_options(keep=can_keep(task, failed))}"
             ),
             origin=TaskOrigin.QUESTION,
             parent=task,

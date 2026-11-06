@@ -102,6 +102,8 @@ class AuditContext:
     task: Task | None = None
     artifact: Artifact | None = None  # task sweep: the task's output
     previous: Artifact | None = None  # task sweep: the version before it, on revisions
+    #: Task sweep of a research answer: the briefs it was written from.
+    briefs: list[ResearchBrief] = field(default_factory=list)
     outputs: list[tuple[Task, Artifact]] = field(default_factory=list)  # in scope
     latest: dict[str, Artifact] = field(default_factory=dict)  # latest of every kind
     tasks: list[Task] = field(default_factory=list)  # every task in the run
@@ -642,7 +644,10 @@ def _unsourced_pins(
 
 @helper("brief_complete")
 def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
-    """P2: every question in the brief has an answer or a reason it couldn't."""
+    """P2: every question in a brief has an answer or a reason it couldn't; a final
+    answer is written from its briefs and pins no version its briefs contradict."""
+    if isinstance(ctx.artifact, ResearchAnswer):
+        return _answer_matches_briefs(ctx, rule, ctx.artifact)
     brief = ctx.artifact
     if not isinstance(brief, ResearchBrief):
         return HelperResult()
@@ -665,6 +670,48 @@ def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
                     artifact=brief,
                 )
             )
+    return res
+
+
+def _pins(text: str) -> dict[str, set[str]]:
+    """The releases each package is pinned to in ``text``, by normal package name,
+    with trailing zero parts dropped, so ``==2.3`` and ``~=2.3.0`` are one release."""
+    found: dict[str, set[str]] = {}
+    for m in _PIN.finditer(text):
+        if m[1].lower() not in _NOT_PACKAGES:
+            found.setdefault(_package(m[1]), set()).add(re.sub(r"(\.0)+$", "", m[3]))
+    return found
+
+
+def _answer_matches_briefs(ctx: AuditContext, rule: Rule, answer: ResearchAnswer) -> HelperResult:
+    """P2 for a final answer: it pins no package at a version its briefs don't, when
+    the briefs pin that package. The briefs' answers go in as notes, so the model can
+    judge the rest of the answer against them."""
+    res = HelperResult()
+    if not ctx.briefs:
+        res.notes.append("the answer was written from no research brief")
+        return res
+    brief_pins: dict[str, set[str]] = {}
+    for brief in ctx.briefs:
+        for a in brief.answers:
+            said = a.answer if a.answer else f"(no answer: {a.gap or 'no reason given'})"
+            res.notes.append(f"{ref_of(brief)} on {a.question[:80]!r}: {said[:300]}")
+        for package, versions in _pins(_research_text(brief)).items():
+            brief_pins.setdefault(package, set()).update(versions)
+    for package, versions in sorted(_pins(_research_text(answer)).items()):
+        known = brief_pins.get(package)
+        if not known or versions <= known:
+            continue
+        stated = ", ".join(sorted(versions - known))
+        res.findings.append(
+            hit(
+                rule,
+                f"pins {package} at {stated}, but its briefs found {', '.join(sorted(known))}",
+                item=package,
+                artifact=answer,
+                fix="answer from the briefs, or say why the answer departs from them",
+            )
+        )
     return res
 
 

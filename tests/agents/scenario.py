@@ -9,7 +9,7 @@ from typing import Any
 
 from agent_team.agents.prompts import RUN_SUMMARY
 from agent_team.core.models import AgentName
-from agent_team.llm.types import ContentBlock, LLMRequest, ToolResultBlock
+from agent_team.llm.types import ContentBlock, LLMRequest, ToolResultBlock, ToolUseBlock
 from agents.fakes import reply, tool_call
 
 Responder = Callable[[LLMRequest], list[ContentBlock] | str]
@@ -77,6 +77,11 @@ def _last_is_tool_result(request: LLMRequest) -> bool:
 MESSAGE_PROMPT = "You are the orchestrator of a software-building agent team"
 
 
+def message_reply(text: str, *kinds: str) -> str:
+    """The message loop's final JSON: the message's kinds and the reply."""
+    return json.dumps({"kinds": list(kinds) or ["run_question"], "reply": text})
+
+
 def read_message(request: LLMRequest) -> tuple[str, list[str]]:
     """The user's message and the waiting task ids from a message-loop prompt."""
     text = getattr(request.messages[0].content[0], "text", "")
@@ -91,16 +96,29 @@ def default_message(kind: str) -> Responder:
     def respond(request: LLMRequest) -> list[ContentBlock] | str:
         """One turn of the scripted message loop."""
         if _last_is_tool_result(request):
-            return json.dumps({"reply": "On it."})
+            return message_reply("On it.", *called_kinds(request, kind))
         said, waiting = read_message(request)
         text = getattr(request.messages[0].content[0], "text", "")
         if text.startswith("No run is in progress."):
             return tool_call("start_run", {"request": said, "kind": kind})
         if waiting:
             return tool_call("answer_pending", {"task_id": waiting[0], "text": said})
-        return json.dumps({"reply": "Noted."})
+        return message_reply("Noted.")
 
     return respond
+
+
+def called_kinds(request: LLMRequest, kind: str) -> list[str]:
+    """The kinds that fit the action tools the scripted loop called so far."""
+    names = {
+        b.name
+        for m in request.messages
+        if m.role == "assistant"
+        for b in m.content
+        if isinstance(b, ToolUseBlock)
+    }
+    kinds = {"start_run": kind, "answer_pending": "answer", "request_change": "change"}
+    return [k for name, k in kinds.items() if name in names] or ["run_question"]
 
 
 def orchestrator_responder(

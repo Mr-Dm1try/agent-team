@@ -476,7 +476,7 @@ def decide_error(
                 run,
                 task.id,
                 f"The {_who(task)} still can't produce valid output after its attempts and "
-                f"the stronger model ({error}). Reply with guidance to retry it, or 'stop'.",
+                f"the stronger model ({error}). How should I proceed?",
                 "policy.ask_after_stronger_model",
                 [],
             )

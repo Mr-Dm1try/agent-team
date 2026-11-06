@@ -292,3 +292,21 @@ async def test_search_failures_are_tool_errors(ctx: ToolContext) -> None:
         await tools["web_search"]({"query": " "}, ctx)
     empty = await web_tools(CONFIG, search=lambda q, n: [])["web_search"]({"query": "x"}, ctx)
     assert empty.content == "no results"
+
+
+async def test_an_attempt_has_a_web_call_budget_shared_by_both_tools(ctx: ToolContext) -> None:
+    config = CONFIG.model_copy(update={"max_calls_per_attempt": 2})
+    web = Web({"docs.example": [PUBLIC]}, {"docs.example/": html(ARTICLE)})
+    tools = web_tools(
+        config,
+        search=lambda q, n: [],
+        transport=httpx.MockTransport(web.handle),
+        resolver=web.resolve,
+    )
+    await tools["web_search"]({"query": "fastapi"}, ctx)
+    await tools["web_fetch"]({"url": "https://docs.example/"}, ctx)
+    with pytest.raises(ToolError, match="used all 2 of its web calls; write your output now"):
+        await tools["web_fetch"]({"url": "https://docs.example/"}, ctx)
+    # The next attempt starts with the whole budget again.
+    ctx.task.attempt += 1
+    await tools["web_search"]({"query": "fastapi"}, ctx)

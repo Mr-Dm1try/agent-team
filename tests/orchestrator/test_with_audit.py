@@ -112,6 +112,7 @@ async def test_a_dangerous_action_cannot_be_kept_as_it_is(tmp_path: Path) -> Non
         if t.agent is AgentName.USER
     ]
     assert "unsafe" in asked.objective and "keep the work" not in asked.objective
+    assert "'stop'" not in asked.objective and "the run stays stopped" in asked.objective
     reply = await team.orch.answer(reply.run_id, "ok")
     # Taken as guidance for one more attempt, never as accepting the flagged work.
     assert reply.kind == "done", reply.text

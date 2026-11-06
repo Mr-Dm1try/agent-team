@@ -42,6 +42,7 @@ from agent_team.core.models import (
     Event,
     EventName,
     Feedback,
+    FeedbackSource,
     Finding,
     ResultStatus,
     RuleScope,
@@ -69,6 +70,11 @@ INPUT_KINDS: dict[AgentName, tuple[str, ...]] = {
     AgentName.ENGINEER: ("plan", "spec", "prd", "research_brief"),
     AgentName.QA: ("plan", "prd", "spec", "code_change"),
 }
+
+#: Outputs whose task also reads the user's feedback on the inputs it builds on.
+READS_INPUT_FEEDBACK = frozenset({"research_answer"})
+#: Feedback from the user, as opposed to the auditor, QA or the harness.
+USER_SOURCES = frozenset({FeedbackSource.USER_ANSWER, FeedbackSource.USER_COMMENT})
 
 #: Errors that pause the run rather than fail the attempt.
 PAUSING_ERRORS = frozenset({"BudgetExceeded", "RunStopped"})
@@ -334,6 +340,10 @@ class Dispatcher:
                 task_ids=[t.id for t in chain],
             )
 
+        input_feedback: list[Feedback] = []
+        if self.feedback is not None and task.output_kind in READS_INPUT_FEEDBACK:
+            input_feedback = await self._input_feedback(run.id, refs, all_tasks)
+
         findings: list[Finding] = []
         if self.verdicts is not None:
             verdict = await self.verdicts.latest_for_task(task.id)
@@ -356,6 +366,7 @@ class Dispatcher:
             constraints=constraints,
             memories=memories,
             feedback=feedback,
+            input_feedback=input_feedback,
             findings=findings,
             previous_output=previous,
             upstream_diff=await self._upstream_diff(run.id, previous, inputs) if previous else None,
@@ -364,6 +375,27 @@ class Dispatcher:
             trace_id=task.trace_id or run.trace_id,
             span_id=task.span_id or run.span_id,
         )
+
+    async def _input_feedback(
+        self, run_id: str, refs: list[ArtifactRef], all_tasks: list[Task]
+    ) -> list[Feedback]:
+        """The user's feedback on each research brief in ``refs``: on the line of work
+        that wrote it (its task, the tasks it was reopened from and their versions)."""
+        assert self.feedback is not None
+        found: dict[str, Feedback] = {}
+        for ref in refs:
+            producer = next((t for t in all_tasks if t.output == ref), None)
+            if ref.kind != "research_brief" or producer is None:
+                continue
+            chain = ancestry(producer, all_tasks)
+            for fb in await self.feedback.for_work(
+                run_id,
+                refs=[t.output for t in chain if t.output is not None],
+                task_ids=[t.id for t in chain],
+            ):
+                if fb.source in USER_SOURCES:
+                    found.setdefault(fb.id, fb.model_copy(update={"artifact": fb.artifact or ref}))
+        return sorted(found.values(), key=lambda fb: fb.created_at)
 
     async def _previous_attempt(self, task: Task) -> str | None:
         """How the attempt before this one failed and what it did, when it ended with

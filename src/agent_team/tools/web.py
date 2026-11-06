@@ -98,6 +98,31 @@ def is_public(address: str) -> bool:
     return True
 
 
+class WebBudget:
+    """The web calls each attempt has made, shared by web_search and web_fetch, so one
+    attempt can't spend its steps fetching page after page."""
+
+    def __init__(self, limit: int) -> None:
+        """Allow ``limit`` calls per attempt."""
+        self.limit = limit
+        #: Per task: the attempt being counted and its calls so far, failed ones too.
+        self._used: dict[str, tuple[int, int]] = {}
+
+    def take(self, ctx: ToolContext, tool: str) -> None:
+        """Count one call of this attempt; ToolError once the attempt's calls are used.
+        A new attempt of the task starts from zero."""
+        attempt, used = self._used.get(ctx.task.id, (ctx.task.attempt, 0))
+        if attempt != ctx.task.attempt:
+            used = 0
+        if used >= self.limit:
+            raise ToolError(
+                f"this attempt has used all {self.limit} of its web calls; write your "
+                "output now from what you found, and list what is still unknown as gaps",
+                tool=tool,
+            )
+        self._used[ctx.task.id] = (ctx.task.attempt, used + 1)
+
+
 class WebSearchTool:
     """Search the web and return titles, URLs and snippets."""
 
@@ -118,10 +143,18 @@ class WebSearchTool:
     )
     safe_to_repeat: bool = True
 
-    def __init__(self, config: WebConfig, *, search: SearchFn | None = None) -> None:
-        """Search with ``search`` (ddgs by default) within ``config``'s limits."""
+    def __init__(
+        self,
+        config: WebConfig,
+        *,
+        search: SearchFn | None = None,
+        budget: WebBudget | None = None,
+    ) -> None:
+        """Search with ``search`` (ddgs by default) within ``config``'s limits and the
+        attempt's share of ``budget``."""
         self.config = config
         self.search = search or _ddgs_search
+        self.budget = budget or WebBudget(config.max_calls_per_attempt)
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         """Run the search in a thread, with a timeout, and list the results."""
@@ -133,6 +166,7 @@ class WebSearchTool:
         if isinstance(wanted, bool) or not isinstance(wanted, int) or wanted < 1:
             raise ToolError("max_results must be a positive integer", tool=name)
         limit = min(wanted, self.config.max_results)
+        self.budget.take(ctx, name)
         try:
             async with asyncio.timeout(self.config.timeout_s):
                 found = await asyncio.to_thread(self.search, query.strip(), limit)
@@ -178,11 +212,14 @@ class WebFetchTool:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         resolver: Resolver | None = None,
+        budget: WebBudget | None = None,
     ) -> None:
-        """Fetch within ``config``'s limits; tests pass a fake transport and resolver."""
+        """Fetch within ``config``'s limits and the attempt's share of ``budget``;
+        tests pass a fake transport and resolver."""
         self.config = config
         self.transport = transport
         self.resolver = resolver or _system_resolver
+        self.budget = budget or WebBudget(config.max_calls_per_attempt)
 
     async def _pinned(self, url: str) -> tuple[httpx.URL, dict[str, str], dict[str, Any]]:
         """The URL rewritten to a checked public address, plus the Host header and TLS
@@ -255,6 +292,7 @@ class WebFetchTool:
         if not isinstance(url, str) or not url.strip():
             raise ToolError("url must be a non-empty string", tool=name)
         url = url.strip()
+        self.budget.take(ctx, name)
         client = httpx.AsyncClient(
             transport=self.transport,
             timeout=httpx.Timeout(self.config.timeout_s),
@@ -405,9 +443,10 @@ def web_tools(
     transport: httpx.AsyncBaseTransport | None = None,
     resolver: Resolver | None = None,
 ) -> dict[str, Tool]:
-    """web_search and web_fetch, keyed by name."""
+    """web_search and web_fetch, keyed by name, sharing one budget per attempt."""
+    budget = WebBudget(config.max_calls_per_attempt)
     tools: list[Tool] = [
-        WebSearchTool(config, search=search),
-        WebFetchTool(config, transport=transport, resolver=resolver),
+        WebSearchTool(config, search=search, budget=budget),
+        WebFetchTool(config, transport=transport, resolver=resolver, budget=budget),
     ]
     return {t.spec.name: t for t in tools}

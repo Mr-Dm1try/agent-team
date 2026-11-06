@@ -34,7 +34,13 @@ STREAM = [
     _event(EventName.RUN_STARTED),
     _event(EventName.PHASE_STARTED, phase="spec"),
     _state("t1", AgentName.ARCHITECT, "running", attempt=1, **SPEC_TASK),
-    _event(EventName.LLM_CALL_AFTER, input_tokens=1200, output_tokens=300, cost_usd=0.012),
+    _event(
+        EventName.LLM_CALL_AFTER,
+        provider="anthropic",
+        input_tokens=1200,
+        output_tokens=300,
+        cost_usd=0.012,
+    ),
     _state("t1", AgentName.ARCHITECT, "auditing", **SPEC_TASK),
     _event(EventName.AUDIT_VERDICT, "t1", scope="task", passed=True, findings=[]),
     _state("t1", AgentName.ARCHITECT, "done", **SPEC_TASK),
@@ -93,7 +99,7 @@ async def test_the_tree_shows_phases_tasks_tools_and_the_ticker() -> None:
     assert text.index("✓ spec") < text.index("▶ implementation")
     assert "✓ architect: the design · Design the books API" in text
     assert "▶ engineer: the code · attempt 2 · Write app.py · write_file app.py" in text
-    assert "1 model calls · 1,200 tokens in · 300 out · $0.0120" in text
+    assert "1 model calls · Claude 1.2k in / 300 out · $0.0120" in text
 
 
 async def test_plain_lines_are_stable() -> None:
@@ -226,3 +232,137 @@ async def test_a_provider_going_down_and_back_gets_a_line() -> None:
         "  ollama is unreachable; calls use the next provider and try it again every 60.0s",
         "  ollama is reachable again",
     ]
+
+
+QUESTION = "How do you run a FastMCP server over stdio?"
+BRIEF_TASK = {"phase": "planning", "kind": "research_brief", "objective": QUESTION}
+OTHER_BRIEF = {"phase": "planning", "kind": "research_brief", "objective": "Which mcp version?"}
+STUCK = (
+    "The researcher is stuck on: How do you run a FastMCP server over stdio? (no valid "
+    "output within 80 steps). Reply with guidance for another try, or 'stop'."
+)
+
+
+def _labelled_run() -> list[Event]:
+    """Two briefs, a check of one of them, the run's check and a stuck step's question."""
+    return [
+        _event(EventName.RUN_STARTED),
+        _event(EventName.PHASE_STARTED, phase="planning"),
+        _state("b1", AgentName.RESEARCHER, "done", **BRIEF_TASK),
+        _state("b2", AgentName.RESEARCHER, "running", **OTHER_BRIEF),
+        _state(
+            "c1",
+            AgentName.AUDITOR,
+            "done",
+            phase="planning",
+            kind="verdict",
+            objective="Check research brief from the researcher",
+            parent="b1",
+        ),
+        _state(
+            "c2",
+            AgentName.AUDITOR,
+            "running",
+            phase="planning",
+            kind="verdict",
+            objective="Check the whole run",
+            parent=None,
+        ),
+        _state(
+            "u1",
+            AgentName.USER,
+            "waiting",
+            phase="planning",
+            kind="user_answer",
+            objective=STUCK,
+            origin="question",
+            parent="b2",
+            task_reason="escalation",
+        ),
+    ]
+
+
+async def test_checks_say_what_they_check_and_questions_are_short() -> None:
+    console = _console()
+    view = RunView(console)
+    await _feed(view, _labelled_run())
+    console.print(view.render())
+    text = console.export_text()
+    assert "✓ check: the research [How do you run a FastMCP server over st…]" in text
+    assert "▶ check: the whole run" in text
+    assert "auditor: check" not in text
+    assert "? you: decide how a stuck step goes on" in text
+    assert STUCK not in text  # the full question prints under the tree, with the reply
+    assert "? waiting for you: 1 question, shown below" in text
+
+
+async def test_plain_lines_label_checks_and_questions_too() -> None:
+    console = _console()
+    view = RunView(console, plain=True)
+    await _feed(view, _labelled_run())
+    lines = console.export_text().splitlines()
+    assert (
+        "  planning: check: the research [How do you run a FastMCP server over st…] done" in lines
+    )
+    assert "  planning: check: the whole run running" in lines
+    assert "  planning: you: decide how a stuck step goes on waiting" in lines
+
+
+async def test_the_ticker_keeps_paid_and_local_tokens_apart() -> None:
+    console = _console()
+    view = RunView(console)
+    calls = [
+        ("anthropic", 210_000, 2_000, 0.30),
+        ("ollama", 1_300_000, 40_000, 0.0),
+        ("anthropic", 400, 100, 0.06),
+    ]
+    await _feed(
+        view,
+        [_event(EventName.RUN_STARTED)]
+        + [
+            _event(
+                EventName.LLM_CALL_AFTER,
+                provider=p,
+                input_tokens=i,
+                output_tokens=o,
+                cost_usd=c,
+            )
+            for p, i, o, c in calls
+        ],
+    )
+    assert view.runs[RUN].ticker.text() == (
+        "3 model calls · Claude 210k in / 2.1k out · local 1.3M in / 40k out · $0.3600"
+    )
+
+
+async def test_model_calls_outside_a_run_are_counted_apart() -> None:
+    view = RunView(_console())
+    outside = Event(
+        name=EventName.LLM_CALL_AFTER,
+        run_id="session",
+        data={"provider": "anthropic", "input_tokens": 900, "output_tokens": 50, "cost_usd": 0.01},
+    )
+    await view.on_event(outside)
+    assert view.runs == {}
+    assert view.session.text() == "1 model calls · Claude 900 in / 50 out · $0.0100"
+
+
+async def test_the_tree_prints_once_per_change_not_once_per_reply() -> None:
+    console = _console()
+    view = RunView(console)
+    for _ in range(2):  # two replies that change nothing on the tree
+        view.start()
+        await _feed(view, STREAM)
+        view.stop()
+    view.start()
+    await _feed(view, [_state("t2", AgentName.ENGINEER, "done", **CODE_TASK)])
+    view.stop()
+    text = console.export_text()
+    assert text.count("run run_1\n") == 2
+    assert "reading your message" not in text
+
+
+def test_the_view_before_any_run_says_what_it_is_doing() -> None:
+    console = _console()
+    console.print(RunView(console).render())
+    assert console.export_text().strip() == "reading your message…"

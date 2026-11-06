@@ -33,6 +33,8 @@ ACCEPT = re.compile(
     r"^\s*(accept(ed)?|approve[ds]?|ok(ay)?|yes|y|lgtm|looks good|done)[\s.!]*$", re.I
 )
 REVIEW_PROMPT = "Type 'accept' to finish, or describe a change."
+#: The status line's word for each run status, as the user would say it.
+STATE_WORDS = {RunStatus.WAITING: "waiting for you"}
 
 #: Reads one line of input; None at the end of input.
 LineReader = Callable[[], Awaitable[str | None]]
@@ -92,6 +94,7 @@ class Session:
             return await self._talk(reply, reply.run_id)
         finally:
             self.lock.release_all()
+            self._outside_runs()
 
     async def resume(self, run_id: str) -> int:
         """Resume a run after a stop, a crash or a question left open, and talk on."""
@@ -110,18 +113,21 @@ class Session:
             return await self._talk(reply, run_id)
         finally:
             self.lock.release_all()
+            self._outside_runs()
+
+    def _outside_runs(self) -> None:
+        """Say what reading messages outside any run cost, since no run's stats hold it."""
+        spent = self.view.session
+        if spent.calls:
+            self.say(f"Outside any run: {spent.text()}")
 
     async def _show(self, reply: Reply) -> None:
-        """Print a reply, with the run id and state. A run that halted is shown as the
-        stats table shows it, paused (it can resume after the budget) or stopped."""
+        """Print a reply, with the run id and the run's state as the store has it, such
+        as done, paused (it can resume after the budget) or waiting for you."""
         self.say(reply.text)
         if reply.run_id:
-            state: str = reply.kind
-            if reply.kind == "stopped":
-                run = await self.team.stores.tasks.get_run(reply.run_id)
-                if run.status in (RunStatus.PAUSED, RunStatus.STOPPED):
-                    state = run.status.value
-            self.say(f"[run {reply.run_id}: {state}]")
+            run = await self.team.stores.tasks.get_run(reply.run_id)
+            self.say(f"[run {reply.run_id}: {STATE_WORDS.get(run.status, run.status.value)}]")
 
     async def _talk(self, reply: Reply, run_id: str | None) -> int:
         """Show each reply and pass on the user's lines. Returns the exit code: 0 once

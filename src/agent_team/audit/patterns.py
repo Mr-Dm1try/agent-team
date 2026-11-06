@@ -584,15 +584,28 @@ def injection_markers(text: str) -> list[str]:
 # --- sources (R2) ------------------------------------------------------------------
 
 
+#: A file on GitHub as its web page shows it: owner, repo, blob or raw, then ref/path.
+_GITHUB_FILE = re.compile(r"^/([^/]+)/([^/]+)/(?:blob|raw)/(.+)$")
+
+
 def normalize_source(ref: str, workspace: str = "") -> str:
     """A URL or path in one canonical form, so a citation can be matched to the call
-    that opened it."""
+    that opened it. For URLs that drops a trailing slash, the ``#fragment`` and
+    ``utm_*`` tracking parameters, and reads a GitHub file page (``/blob/`` or
+    ``/raw/``) as the raw.githubusercontent.com file it shows. Nothing else is
+    loosened: another page of the same site is another source."""
     ref = ref.strip()
     if re.match(r"^https?://", ref, re.IGNORECASE):
         parts = urlsplit(ref)
+        host = parts.netloc.lower()
         path = parts.path.rstrip("/")
-        query = f"?{parts.query}" if parts.query else ""
-        return f"{parts.scheme.lower()}://{parts.netloc.lower()}{path}{query}"
+        github = _GITHUB_FILE.match(path) if host in ("github.com", "www.github.com") else None
+        if github:
+            host = "raw.githubusercontent.com"
+            path = "/{}/{}/{}".format(*github.groups())
+        kept = [p for p in parts.query.split("&") if p and not p.lower().startswith("utm_")]
+        query = f"?{'&'.join(kept)}" if kept else ""
+        return f"{parts.scheme.lower()}://{host}{path}{query}"
     path = posixpath.normpath(ref.replace("\\", "/"))
     if workspace and path.startswith(posixpath.normpath(workspace) + "/"):
         path = path[len(posixpath.normpath(workspace)) + 1 :]

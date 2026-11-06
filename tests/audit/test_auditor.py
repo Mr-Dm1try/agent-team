@@ -12,10 +12,12 @@ from agent_team.core.artifacts import (
     PRD,
     AcceptanceCriterion,
     AnsweredQuestion,
+    ArtifactRef,
     Ask,
     CodeChange,
     Plan,
     Requirement,
+    ResearchAnswer,
     ResearchBrief,
     Source,
 )
@@ -435,3 +437,32 @@ async def test_r6_passes_a_wrapped_run_and_fails_a_masked_failure(rig: Rig, run:
     verdict = await rig.auditor.audit_task(eng, change, run)
     [r6] = [f for f in verdict.blockers if f.rule_id == "R6"]
     assert "2 failed" in r6.message and "echo EXIT" in r6.message
+
+
+async def test_an_answer_check_sees_every_brief_it_was_written_from(rig: Rig, run: Run) -> None:
+    answer_task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_answer")
+    rig.tool_log.record(call(run, answer_task, "web_fetch", "page", url=TUTORIAL))
+    for version, question in ((1, "How to test?"), (2, "Which client?")):
+        await rig.artifacts.save(brief(run, f"task_brief{version}", question, version=version))
+    answer = ResearchAnswer(
+        summary="s",
+        run_id=run.id,
+        task_id=answer_task.id,
+        built_from=[
+            ArtifactRef(kind="plan", version=1),
+            ArtifactRef(kind="research_brief", version=1),
+            ArtifactRef(kind="research_brief", version=2),
+        ],
+        question="How do I test FastAPI?",
+        answer="Use the test client.",
+        sources=[Source(ref=TUTORIAL)],
+    )
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_task(answer_task, answer, run)
+    assert verdict.passed, verdict.findings
+    prompt = getattr(rig.llm.requests[0].messages[0].content[0], "text", "")
+    # Both briefs, not only the latest one of the kind.
+    assert "## Built from research_brief@v1" in prompt
+    assert "## Built from research_brief@v2" in prompt
+    assert "Upstream research_brief@v2" not in prompt
+    assert "'How to test?'" in prompt and "'Which client?'" in prompt

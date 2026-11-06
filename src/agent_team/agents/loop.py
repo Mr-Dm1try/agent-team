@@ -52,6 +52,12 @@ CUT_OFF_REPLY = (
     "the reply hit the output token limit; reply with shorter JSON that reports what "
     "you did, such as the paths of files you wrote, without repeating their contents"
 )
+#: Added to the model's next turn once few steps are left.
+STEPS_LEFT_NOTE = (
+    "You have {turns} turn(s) left before this attempt ends with no output. Stop "
+    "gathering and reply now with your final JSON from what you have; list what is "
+    "still unknown as gaps or open questions."
+)
 INTERRUPTED_NOTE = (
     "This tool call was running when the process stopped. It was not repeated because "
     "it is not safe to repeat. Check the current state before trying it again."
@@ -67,6 +73,8 @@ class LoopSettings:
     max_steps: int = 80  # checkpointed steps: one per model call and one per tool round
     max_repairs: int = 2
     max_tokens: int | None = None
+    #: Share of the steps left when the model is told to write its output now.
+    warn_at: float = 0.15
 
 
 @dataclass
@@ -346,6 +354,7 @@ class ToolLoop[M: BaseModel]:
         repairs = 0
         pending_calls: list[ToolUseBlock] = []
         final_text: str | None = None
+        warned = False
 
         saved = await self.checkpoints.load_latest(self.task_id, self.attempt) if resume else None
         if saved is None:
@@ -385,6 +394,7 @@ class ToolLoop[M: BaseModel]:
                     errors=["step limit reached"],
                 )
                 return self._outcome(None, messages, error=err)
+            warned = self._warn_steps_left(messages, warned)
 
             messages = await self._maybe_compact(messages)
             response = await self._complete(messages)
@@ -417,6 +427,19 @@ class ToolLoop[M: BaseModel]:
                 final_text = None
                 continue
             final_text = response.text
+
+    def _warn_steps_left(self, messages: list[Message], warned: bool) -> bool:
+        """Once only ``warn_at`` of the steps are left, tell the model on its next turn
+        how many it has and to write its output now. Returns whether it was told."""
+        left = self.settings.max_steps - self._step
+        if warned or left > max(2, round(self.settings.max_steps * self.settings.warn_at)):
+            return warned
+        last = messages[-1]
+        if last.role != "user":
+            return warned
+        note = TextBlock(text=STEPS_LEFT_NOTE.format(turns=max(1, left // 2)))
+        messages[-1] = Message(role="user", content=[*last.content, note])
+        return True
 
     def _outcome(
         self, value: M | None, messages: list[Message], *, error: Exception | None = None

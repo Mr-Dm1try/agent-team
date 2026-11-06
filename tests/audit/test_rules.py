@@ -24,6 +24,7 @@ from agent_team.core.artifacts import (
     QAReport,
     Question,
     Requirement,
+    ResearchAnswer,
     ResearchBrief,
     ResearchFinding,
     ResearchQuestion,
@@ -322,6 +323,90 @@ def test_p2_brief_complete(run: Run) -> None:
     bad_brief = ResearchBrief(summary="s", answers=[AnsweredQuestion(question="q?", answer=None)])
     bad = AuditContext(run=run, scope=RuleScope.TASK, task=task, artifact=bad_brief)
     assert blockers(run_helper("P2", bad)) == ["q?"]
+
+
+def test_r2_github_file_pages_and_tracking_links_are_one_source(run: Run) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    cited = [
+        "https://github.com/modelcontextprotocol/python-sdk/blob/v1.26.0/README.md",
+        "https://docs.example.org/guide/?utm_source=ddg&utm_medium=web#stdio",
+    ]
+    brief = ResearchBrief(
+        summary="s",
+        answers=[AnsweredQuestion(question="q", answer="a")],
+        findings=[ResearchFinding(claim="c", sources=[Source(ref=r) for r in cited])],
+    )
+    opened = [
+        call(
+            run,
+            task,
+            "web_fetch",
+            "readme",
+            url="https://raw.githubusercontent.com/modelcontextprotocol/python-sdk/v1.26.0/README.md",
+        ),
+        call(run, task, "web_fetch", "guide", url="https://docs.example.org/guide"),
+    ]
+    ctx = AuditContext(run=run, scope=RuleScope.TASK, task=task, artifact=brief, tool_calls=opened)
+    assert blockers(run_helper("R2", ctx)) == []
+
+
+@pytest.mark.parametrize(
+    ("cited", "opened"),
+    [
+        # Another file, ref or repo is another source.
+        (
+            "https://github.com/o/r/blob/main/docs/a.md",
+            "https://raw.githubusercontent.com/o/r/main/README.md",
+        ),
+        (
+            "https://github.com/o/r/blob/v2/README.md",
+            "https://raw.githubusercontent.com/o/r/v1/README.md",
+        ),
+        # A query that isn't tracking still names another page, and so does the scheme.
+        ("https://docs.example.org/guide?page=2", "https://docs.example.org/guide"),
+        ("http://docs.example.org/guide", "https://docs.example.org/guide"),
+    ],
+)
+def test_r2_stays_strict_about_other_pages(run: Run, cited: str, opened: str) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    brief = ResearchBrief(
+        summary="s",
+        answers=[AnsweredQuestion(question="q", answer="a")],
+        findings=[ResearchFinding(claim="c", sources=[Source(ref=cited)])],
+    )
+    fetched = [call(run, task, "web_fetch", "page", url=opened)]
+    ctx = AuditContext(run=run, scope=RuleScope.TASK, task=task, artifact=brief, tool_calls=fetched)
+    assert blockers(run_helper("R2", ctx)) == [cited]
+
+
+def test_p2_an_answer_may_not_pin_what_its_briefs_did_not_find(run: Run) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_answer")
+    brief = ResearchBrief(
+        summary="The user wants mcp 1.x; mcp==1.26.0 is the last 1.x release.",
+        answers=[AnsweredQuestion(question="Which mcp?", answer="Pin mcp==1.26.0 for 1.x.")],
+    )
+    contradicting = ResearchAnswer(
+        summary="s",
+        question="How do you run FastMCP over stdio?",
+        answer="Install mcp==2.3.0 and call mcp.run().",
+        sources=[Source(ref="https://pypi.org/pypi/mcp/json")],
+    )
+    ctx = AuditContext(
+        run=run, scope=RuleScope.TASK, task=task, artifact=contradicting, briefs=[brief]
+    )
+    found = run_helper("P2", ctx)
+    assert blockers(found) == ["mcp"]
+    assert "pins mcp at 2.3, but its briefs found 1.26" in found.findings[0].message
+    assert any("Pin mcp==1.26.0 for 1.x." in n for n in found.notes)
+
+    # The same release, written another way, agrees.
+    agreeing = contradicting.model_copy(update={"answer": "Install mcp~=1.26."})
+    ctx = AuditContext(run=run, scope=RuleScope.TASK, task=task, artifact=agreeing, briefs=[brief])
+    assert blockers(run_helper("P2", ctx)) == []
+    # A package the briefs never pinned is R2's business, not a contradiction.
+    other = contradicting.model_copy(update={"answer": "Install anyio==4.6.0."})
+    ctx = AuditContext(run=run, scope=RuleScope.TASK, task=task, artifact=other, briefs=[brief])
+    assert blockers(run_helper("P2", ctx)) == []
 
 
 def test_s1_secrets(run: Run) -> None:

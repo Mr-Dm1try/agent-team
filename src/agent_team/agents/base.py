@@ -116,6 +116,15 @@ def render_envelope(envelope: TaskEnvelope, tools: dict[str, Tool]) -> str:
             "\n## Feedback on your work (answers to your questions go into the "
             "question's `answer`)\n" + "\n".join(lines)
         )
+    if envelope.input_feedback:
+        lines = [
+            f"- [{fb.source.value} on {fb.artifact or 'an input'}] {fb.text}"
+            for fb in envelope.input_feedback
+        ]
+        parts.append(
+            "\n## The user's guidance on your inputs\nYour inputs were written to follow "
+            "it. Follow it too, and don't contradict those inputs.\n" + "\n".join(lines)
+        )
     return "\n".join(parts)
 
 

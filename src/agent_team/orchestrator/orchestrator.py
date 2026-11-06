@@ -108,7 +108,11 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
         return run
 
     async def resume(self, run_id: str) -> Reply:
-        """After a crash: interrupted attempts continue from their checkpoints."""
+        """After a crash: interrupted attempts continue from their checkpoints. A
+        finished run is only shown: nothing re-runs and no lifecycle event repeats."""
+        run = await self.tasks.get_run(run_id)
+        if run.status is RunStatus.DONE:
+            return await done_reply(run, await self.tasks.list_tasks(run_id), self.artifacts)
         for task in await self.tasks.list_tasks(run_id, status=TaskStatus.RUNNING):
             task.last_error = INTERRUPTED
             await self.tasks.update_task(task)

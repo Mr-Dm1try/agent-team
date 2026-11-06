@@ -62,7 +62,7 @@ def test_run_answers_questions_from_stdin(config_file: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "Paginate the list?" in result.output
-    assert result.output.count(": waiting]") == 1  # blank lines don't repeat the question
+    assert result.output.count(": waiting for you]") == 1  # blank lines don't repeat the question
     assert "'Build a books API' is done." in result.output
 
 

@@ -49,6 +49,8 @@ rules:
     helper: brief_complete
     statement: >-
       The brief answers each research question it was given, or says why it couldn't.
+      A final answer answers the user's question from the briefs it was written from,
+      and doesn't contradict them, such as by pinning a version they didn't find.
 
   - id: R3
     title: Testable PRD

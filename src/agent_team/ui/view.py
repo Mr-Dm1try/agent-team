@@ -2,8 +2,11 @@
 
 ``RunView`` subscribes to every event and keeps what the user watches: each phase, each
 task with its agent, status, attempt and current tool call, and a token and cost
-ticker. It draws a Rich tree that redraws in place, or with ``plain`` it prints one
-stable line per event that matters, for CI and logs.
+ticker that keeps paid (Claude) and local tokens apart. It draws a Rich tree that
+redraws in place while the team works and is cleared when it stops; the tree is then
+printed once, only if it changed, so the scrollback holds one copy per change, not
+one per reply. With ``plain`` it prints one stable line per event that matters, for
+CI and logs.
 
 The view must never break a run. Every event is handled inside a guard: if drawing
 fails, the error is logged once and the view falls back to plain lines.
@@ -48,6 +51,16 @@ STATUS_STYLE = {
 }
 #: Task changes worth a plain line: starting, finishing, retrying and waiting.
 PLAIN_STATES = frozenset({"running", "done", "retry", "escalated", "waiting", "superseded"})
+#: How each provider's tokens are named in the ticker; Claude's are the paid ones.
+PROVIDER_NAMES = {"anthropic": "Claude", "ollama": "local"}
+#: A user task's short label, by the reason it was created for.
+USER_LABELS = {
+    "confirm_change": "confirm a change",
+    "confirm_stop": "confirm a stop",
+    "escalation": "decide how a stuck step goes on",
+    "policy": "decide how a failed check goes on",
+    "run_audit": "decide on the run's final check",
+}
 
 
 @dataclass
@@ -63,32 +76,60 @@ class TaskRow:
     attempt: int = 0
     tool: str | None = None
     origin: str = "plan"
+    parent: str | None = None  # the task this one checks, asks about or revises
+    reason: str | None = None  # why the task exists, such as "confirm_change"
 
     @property
     def label(self) -> str:
-        """Who does what, in a few words."""
+        """Who does what, in a few words. A check is labelled by what it checks in
+        ``label``, which can see the other rows."""
         if self.agent == "user":
-            return f"you: {self.objective}"
+            if self.origin == "review":
+                return f"you: review the {self.phase} phase"
+            return f"you: {USER_LABELS.get(self.reason or '', 'answer a question')}"
         if self.agent == "auditor":
-            return "auditor: check"
+            return "check"
         return f"{self.agent}: {plain_kind(self.kind)}"
+
+
+def compact(n: int) -> str:
+    """A token count in a few characters: 950, 210k, 1.3M."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 10_000:
+        return f"{n // 1000}k"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
 
 
 @dataclass
 class Ticker:
-    """Tokens and cost across the model calls seen so far."""
+    """Tokens and cost across the model calls seen so far, with the tokens kept per
+    provider so paid and local ones read apart."""
 
-    input_tokens: int = 0
-    output_tokens: int = 0
     cost_usd: float = 0.0
     calls: int = 0
+    #: Input and output tokens per provider, in the order providers were first seen.
+    tokens: dict[str, list[int]] = field(default_factory=dict)
+
+    def add(self, provider: str, tokens_in: int, tokens_out: int, cost_usd: float) -> None:
+        """Count one model call."""
+        self.calls += 1
+        self.cost_usd += cost_usd
+        counts = self.tokens.setdefault(provider, [0, 0])
+        counts[0] += tokens_in
+        counts[1] += tokens_out
 
     def text(self) -> str:
-        """The ticker as one line."""
-        return (
-            f"{self.calls} model calls · {self.input_tokens:,} tokens in · "
-            f"{self.output_tokens:,} out · ${self.cost_usd:.4f}"
-        )
+        """The ticker as one line, such as "4 model calls · Claude 210k in / 3.1k out ·
+        local 1.3M in / 40k out · $0.3600"."""
+        parts = [f"{self.calls} model calls"]
+        for provider, (tokens_in, tokens_out) in self.tokens.items():
+            name = PROVIDER_NAMES.get(provider, provider)
+            parts.append(f"{name} {compact(tokens_in)} in / {compact(tokens_out)} out")
+        parts.append(f"${self.cost_usd:.4f}")
+        return " · ".join(parts)
 
 
 @dataclass
@@ -102,7 +143,7 @@ class RunState:
     finished: bool = False
 
 
-def _short(value: Any, limit: int = 60) -> str:
+def short(value: Any, limit: int = 60) -> str:
     """A value cut to one short line."""
     text = " ".join(str(value).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -122,7 +163,25 @@ def _tag(state: RunState, row: TaskRow) -> str:
     ]
     if not siblings or row.agent in ("user", "auditor") or not row.objective:
         return ""
-    return f" [{_short(row.objective, 40)}]"
+    return f" [{short(row.objective, 40)}]"
+
+
+def label(state: RunState, row: TaskRow) -> str:
+    """A row's label. A check names what it checks, such as "check: the research
+    [How do you run…]", or "check: the whole run"."""
+    if row.agent != "auditor":
+        return row.label
+    subject = state.tasks.get(row.parent or "")
+    if subject is not None:
+        return f"check: {plain_kind(subject.kind)}{_tag(state, subject)}"
+    if row.parent is None:
+        return "check: the whole run"
+    return f"check: {short(row.objective.removeprefix('Check '), 50)}"
+
+
+def waiting(state: RunState) -> list[TaskRow]:
+    """The items of the run waiting on the user."""
+    return [t for t in state.tasks.values() if t.agent == "user" and t.status == "waiting"]
 
 
 def tool_summary(tool: str, args: Any) -> str:
@@ -133,7 +192,7 @@ def tool_summary(tool: str, args: Any) -> str:
         value = args.get(key)
         if value:
             shown = " ".join(map(str, value)) if isinstance(value, list) else value
-            return f"{tool} {_short(shown, 50)}"
+            return f"{tool} {short(shown, 50)}"
     return tool
 
 
@@ -145,8 +204,12 @@ class RunView:
         self.console = console
         self.plain = plain
         self.runs: dict[str, RunState] = {}
+        #: Model calls made outside any run, such as reading a message with no run open.
+        self.session = Ticker()
         self._live: Live | None = None
         self._broken = False
+        #: What the last printed tree showed, so an unchanged tree isn't printed again.
+        self._printed: tuple[object, ...] | None = None
 
     def attach(self, bus: EventBus) -> None:
         """Receive every event from the bus. Tool calls only pass the before hooks, so
@@ -167,20 +230,38 @@ class RunView:
             return
         try:
             self._live = Live(
-                self.render(), console=self.console, auto_refresh=False, transient=False
+                self.render(), console=self.console, auto_refresh=False, transient=True
             )
             self._live.start()
         except Exception:
             self._fall_back("start the live view")
 
     def stop(self) -> None:
-        """Stop redrawing and leave the last frame on screen."""
+        """Stop redrawing, which clears the live frame, then print the tree once if it
+        changed since it was last printed."""
         live, self._live = self._live, None
-        if live is not None:
-            try:
-                live.stop()
-            except Exception:
-                self._fall_back("stop the live view")
+        if live is None:
+            return
+        try:
+            live.stop()
+            shown = self._shown()
+            if self.runs and shown != self._printed:
+                self.console.print(self.render())
+                self._printed = shown
+        except Exception:
+            self._fall_back("stop the live view")
+
+    def _shown(self) -> tuple[object, ...]:
+        """What the tree shows, leaving out the ticker and tool calls, which change
+        on every call."""
+        return tuple(
+            (
+                state.run_id,
+                tuple(sorted(state.phases.items())),
+                tuple((t.id, t.status, t.attempt) for t in state.tasks.values()),
+            )
+            for state in self.runs.values()
+        )
 
     def _fall_back(self, what: str) -> None:
         """Log the first failure and switch to plain lines for good."""
@@ -210,6 +291,8 @@ class RunView:
                 status=task.status.value,
                 attempt=task.attempt,
                 origin=task.origin.value,
+                parent=task.parent_task_id,
+                reason=task.reason,
             )
         for phase in {t.phase for t in state.tasks.values()}:
             rows = [t for t in state.tasks.values() if t.phase == phase]
@@ -244,11 +327,13 @@ class RunView:
 
     def apply(self, event: Event) -> str | None:
         """Update the state from one event; return its plain line, if it gets one."""
-        if event.run_id == "session":
-            return None
-        state = self._run(event.run_id)
         data = event.data
         name = event.name
+        if event.run_id == "session":
+            if name is EventName.LLM_CALL_AFTER:
+                self.session.add(*_call_usage(data))
+            return None
+        state = self._run(event.run_id)
         if name is EventName.RUN_STARTED:
             return f"run {event.run_id} started"
         if name is EventName.PHASE_STARTED:
@@ -258,11 +343,7 @@ class RunView:
             state.phases[str(data.get("phase"))] = "done"
             return f"phase {data.get('phase')} finished"
         if name is EventName.LLM_CALL_AFTER:
-            ticker = state.ticker
-            ticker.calls += 1
-            ticker.input_tokens += int(data.get("input_tokens") or 0)
-            ticker.output_tokens += int(data.get("output_tokens") or 0)
-            ticker.cost_usd += float(data.get("cost_usd") or 0.0)
+            state.ticker.add(*_call_usage(data))
             return None
         if name is EventName.PROVIDER_DOWN:
             return (
@@ -292,6 +373,8 @@ class RunView:
                     kind=str(data.get("kind", "")),
                     objective=str(data.get("objective", "")),
                     origin=str(data.get("origin", "plan")),
+                    parent=data.get("parent"),
+                    reason=data.get("task_reason"),
                 )
                 state.tasks[row.id] = row
             row.status = str(data.get("to", row.status))
@@ -301,7 +384,7 @@ class RunView:
             if row.status not in PLAIN_STATES:
                 return None
             attempt = f" (attempt {row.attempt})" if row.attempt > 1 else ""
-            return f"  {row.phase}: {row.label}{_tag(state, row)} {row.status}{attempt}"
+            return f"  {row.phase}: {label(state, row)}{_tag(state, row)} {row.status}{attempt}"
         if row is None:
             return None
         if name is EventName.TASK_STARTED:
@@ -321,9 +404,10 @@ class RunView:
         if name is EventName.AUDIT_VERDICT:
             findings = data.get("findings") or []
             blockers = [f for f in findings if f.get("severity") == "blocker"]
+            what = f"{label(state, row)}{_tag(state, row)}"
             if data.get("passed"):
-                return f"    audit passed: {row.label}{_tag(state, row)}"
-            return f"    audit failed: {row.label}{_tag(state, row)} ({len(blockers)} blockers)"
+                return f"    audit passed: {what}"
+            return f"    audit failed: {what} ({len(blockers)} blockers)"
         return None
 
     # --- drawing ---------------------------------------------------------------------
@@ -331,7 +415,7 @@ class RunView:
     def render(self) -> Group:
         """The tree of every run the view has seen, with its ticker."""
         trees = [self._tree(state) for state in self.runs.values()]
-        return Group(*trees) if trees else Group(Text("starting…", style="dim"))
+        return Group(*trees) if trees else Group(Text("reading your message…", style="dim"))
 
     def _tree(self, state: RunState) -> Tree:
         """One run as a tree: phases, then their tasks, then the ticker."""
@@ -346,19 +430,33 @@ class RunView:
             mark = "✓" if status == "done" else "▶" if status == "running" else "·"
             branch = tree.add(Text(f"{mark} {phase}", style="bold" if status else "dim"))
             for row in rows:
-                branch.add(self._row(row))
+                branch.add(self._row(state, row))
+        asks = waiting(state)
+        if asks:
+            what = "1 question" if len(asks) == 1 else f"{len(asks)} questions"
+            tree.add(Text(f"? waiting for you: {what}, shown below", style="bold yellow"))
         tree.add(Text(state.ticker.text(), style="dim"))
         return tree
 
     @staticmethod
-    def _row(row: TaskRow) -> Text:
+    def _row(state: RunState, row: TaskRow) -> Text:
         """One task line: mark, who and what, attempt and current tool."""
         text = Text(f"{STATUS_MARK.get(row.status, '·')} ", style=STATUS_STYLE.get(row.status, ""))
-        text.append(row.label, style="dim" if row.status == "superseded" else "")
+        text.append(label(state, row), style="dim" if row.status == "superseded" else "")
         if row.attempt > 1:
             text.append(f" · attempt {row.attempt}", style="yellow")
         if row.agent not in ("user", "auditor") and row.objective:
-            text.append(f" · {_short(row.objective, 50)}", style="dim")
+            text.append(f" · {short(row.objective, 50)}", style="dim")
         if row.tool:
             text.append(f" · {row.tool}", style="cyan")
         return text
+
+
+def _call_usage(data: dict[str, Any]) -> tuple[str, int, int, float]:
+    """A model call's provider, tokens in and out, and cost, from llm_call_after."""
+    return (
+        str(data.get("provider") or "model"),
+        int(data.get("input_tokens") or 0),
+        int(data.get("output_tokens") or 0),
+        float(data.get("cost_usd") or 0.0),
+    )
