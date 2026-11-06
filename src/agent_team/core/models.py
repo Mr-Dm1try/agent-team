@@ -383,6 +383,9 @@ class Verdict(Contract):
     summary: str | None = None  # the auditor model's short explanation of the verdict
     findings: list[Finding] = Field(default_factory=list)
     rules_checked: list[str] = Field(default_factory=list)
+    #: The evidence helpers' notes the auditor model read, by rule id, such as the
+    #: logged test run R6 matched, so a pass can be audited afterwards.
+    notes: dict[str, list[str]] = Field(default_factory=dict)
     model: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
 

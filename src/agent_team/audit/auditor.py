@@ -225,6 +225,7 @@ class LLMAuditor:
                 base.passed = True
                 return _seal(base)
             helpers = gather(ctx, rules)
+            base.notes = stored_notes(helpers)
             return _seal(await self._judge(base, ctx, rules, helpers))
         except (BudgetExceeded, RunStopped):
             raise  # the run must stop cleanly; nothing is passed
@@ -332,6 +333,19 @@ class LLMAuditor:
 # --- verdict assembly ----------------------------------------------------------------
 
 _Builder = Callable[[], Awaitable[tuple[AuditContext, list[Rule]]]]
+
+
+#: Longest helper note kept on a stored verdict.
+NOTE_CHARS = 2_000
+
+
+def stored_notes(helpers: dict[str, HelperResult]) -> dict[str, list[str]]:
+    """The helpers' notes to keep on the verdict, by rule id, each cut to ``NOTE_CHARS``."""
+    return {
+        rule_id: [n if len(n) <= NOTE_CHARS else n[:NOTE_CHARS] + " [cut]" for n in r.notes]
+        for rule_id, r in helpers.items()
+        if r.notes
+    }
 
 
 def _seal(verdict: Verdict) -> Verdict:
