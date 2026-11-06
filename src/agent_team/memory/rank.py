@@ -8,7 +8,10 @@ keyword score; with no vectors (the embedder is down, or the memory was saved wh
 was) it is the keyword score alone. The keyword score is BM25, squashed to 0 to 1 as
 ``s / (1 + s)``, or the share of words in common when that is higher: BM25 gives a
 term no weight when it is in half the memories or more, which with a handful of
-memories is nearly every term. Its ``score``
+memories is nearly every term. A decision or research fact from another run must
+pass ``strong_match`` on a stricter match (``strong_relevance``) that takes the words
+in common, not BM25: in a small store one rare shared word, such as "API", gives BM25
+a squashed score above 0.6 on its own. Its ``score``
 adds recency, which halves every ``recency_half_life_days``, and usefulness, which
 grows as ``u / (u + 2)``. The weights come from the ``memory:`` config.
 """
@@ -87,6 +90,17 @@ def relevance(match: MemoryMatch, config: MemoryConfig) -> float:
     return (w.cosine * cosine + w.bm25 * keyword) / (w.cosine + w.bm25)
 
 
+def strong_relevance(match: MemoryMatch, config: MemoryConfig) -> float:
+    """The text match a memory from another run is held to, 0 to 1: like
+    ``relevance``, but the keyword part is the share of words in common, since BM25
+    over a few memories rates one shared word as a strong match."""
+    w = config.weights
+    if match.cosine is None:
+        return match.words
+    cosine = min(max(match.cosine, 0.0), 1.0)
+    return (w.cosine * cosine + w.bm25 * match.words) / (w.cosine + w.bm25)
+
+
 def recency(created_at: datetime, now: datetime, half_life_days: float) -> float:
     """1 for a memory saved now, halving every ``half_life_days``."""
     age_days = max((now - created_at).total_seconds(), 0.0) / 86_400
@@ -138,7 +152,11 @@ def rank(
         if rel < config.min_relevance:
             continue
         other_run = run_id is not None and match.memory.origin.run_id != run_id
-        if other_run and match.memory.kind in RUN_BOUND and rel < config.strong_match:
+        if (
+            other_run
+            and match.memory.kind in RUN_BOUND
+            and strong_relevance(match, config) < config.strong_match
+        ):
             continue
         out.append(Ranked(match.memory, rel, score(match, rel, config, now)))
     out.sort(key=lambda r: (-r.score, -r.memory.created_at.timestamp(), r.memory.id))

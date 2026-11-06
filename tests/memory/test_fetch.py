@@ -188,3 +188,39 @@ async def test_a_long_query_is_cut_before_it_is_embedded(tmp_path: Path) -> None
     search = MemorySearch(idx, Embeddings(embedder, retry_after_s=60), MemoryConfig())
     await search.search("books " * 5_000, [MemoryKind.LESSON], run_id=None)
     assert len(embedder.seen[0]) == MAX_QUERY
+
+
+async def test_another_projects_decisions_need_more_than_one_shared_word(tmp_path: Path) -> None:
+    # Memories from a library-API run, fetched for a vault MCP server run.
+    embedder = FakeEmbedder(fail=True)  # keyword match only, where BM25 counts most
+    idx = await SqliteMemoryIndex.open(Database(tmp_path / "team.db"))
+    old = [
+        (MemoryKind.DECISION, "Use FastAPI with SQLite for the library inventory API"),
+        (MemoryKind.DECISION, "Store books in one SQLite table keyed by ISBN"),
+        (MemoryKind.RESEARCH_FACT, "Python sqlite3 needs check_same_thread=False across threads"),
+        (MemoryKind.LESSON, "Engineer, implementation: run pytest as python -m pytest"),
+        (MemoryKind.RESEARCH_FACT, "Pydantic v2 uses model_dump instead of dict"),
+        (MemoryKind.PREFERENCE, "The user wants type hints everywhere"),
+        (MemoryKind.PREFERENCE, "Keep commits small"),
+        (MemoryKind.RUN_SUMMARY, "Built the inventory service with 73 tests"),
+        (MemoryKind.LESSON, "QA, implementation: start the server and call each endpoint"),
+        (MemoryKind.DECISION, "Return 404 for a missing book"),
+        (MemoryKind.RESEARCH_FACT, "httpx is the test client FastAPI documents"),
+    ]
+    for kind, text in old:
+        memory = Memory(kind=kind, text=text, sources=[MemorySource(run_id="run_old")])
+        await idx.save(memory, None, merge_at=0.92)
+    vault = Run(id="run_vault", title="vault", request="An MCP vault server", workspace="/w")
+    architect = Task(
+        run_id=vault.id,
+        phase=Phase.SPEC,
+        agent=AgentName.ARCHITECT,
+        objective="Which Python MCP SDK version and API should the server use to expose "
+        "list, read and search tools over Markdown notes?",
+        output_kind="spec",
+        attempt=1,
+    )
+    settings = MemoryConfig()
+    search = MemorySearch(idx, Embeddings(embedder, retry_after_s=60), settings)
+    lines = await MemoryFetch(search, idx, FakeBus(), settings)(architect, vault, [])
+    assert not [line for line in lines if line.startswith(("Decision", "Research fact"))], lines
