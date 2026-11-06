@@ -13,7 +13,12 @@ fallbacks: [anthropic, ollama]
 # Model each provider uses when it stands in for another one.
 fallback_models: {anthropic: claude-haiku-5-5, ollama: "gpt-oss:20b"}
 budget: {max_usd_per_run: 1.00, max_minutes_per_run: 30}
-limits: {max_attempts: 3, max_upstream_reruns: 2, max_concurrent_calls: 4}
+# Research agents ask for mid-run: at most max_research_tasks per run, and at depth 1 a
+# task made from a request can't ask for more. Past a limit a task answers with what it
+# has and lists the rest as open gaps.
+limits:
+  {max_attempts: 3, max_upstream_reruns: 2, max_concurrent_calls: 4,
+   max_research_tasks: 6, max_research_depth: 1}
 review: auto_assumptions
 
 # Gateway details.

@@ -30,6 +30,7 @@ from agent_team.core.models import (
     RuleScope,
     Run,
     Severity,
+    TaskOrigin,
     TaskStatus,
 )
 from agent_team.llm.types import TextBlock
@@ -349,7 +350,12 @@ async def test_a_revision_diffs_against_the_task_it_was_reopened_from(rig: Rig, 
     old = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
     sibling = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
     new = make_task(
-        run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief", parent_task_id=old.id
+        run,
+        AgentName.RESEARCHER,
+        Phase.PLANNING,
+        "research_brief",
+        origin=TaskOrigin.REVISION,
+        parent_task_id=old.id,
     )
     for t in (old, sibling, new):
         await rig.tasks.create_task(t)
@@ -359,6 +365,52 @@ async def test_a_revision_diffs_against_the_task_it_was_reopened_from(rig: Rig, 
     verdict = await rig.auditor.audit_task(new, brief(run, new.id, "FastAPI?", version=3), run)
     assert "R12" in verdict.rules_checked
     assert "Previous version research_brief@v1" in str(rig.llm.requests[0].messages[0].content[0])
+
+
+async def test_r12_never_compares_across_task_lines_including_requested_research(
+    rig: Rig, run: Run
+) -> None:
+    """Parallel briefs and the research a brief asked for each have their own line: a
+    child's first brief has no previous version, even though its parent is a
+    Researcher task that wrote a brief, and a revision of the child diffs only against
+    the child's own brief."""
+    mcp = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    vault = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    child = make_task(
+        run,
+        AgentName.RESEARCHER,
+        Phase.PLANNING,
+        "research_brief",
+        origin=TaskOrigin.RESEARCH_REQUEST,
+        parent_task_id=mcp.id,
+    )
+    child_fix = make_task(
+        run,
+        AgentName.RESEARCHER,
+        Phase.PLANNING,
+        "research_brief",
+        origin=TaskOrigin.REVISION,
+        parent_task_id=child.id,
+    )
+    for t in (mcp, vault, child, child_fix):
+        await rig.tasks.create_task(t)
+    await rig.artifacts.save(brief(run, mcp.id, "mcp SDK import path?", version=1))
+    await rig.artifacts.save(brief(run, vault.id, "Obsidian links?", version=2))
+    await rig.artifacts.save(brief(run, mcp.id, "mcp SDK import path?", version=3))
+    rig.llm.push(PASS, PASS)
+    first = await rig.auditor.audit_task(child, brief(run, child.id, "FastMCP?", version=4), run)
+    assert "R12" not in first.rules_checked
+    assert "Previous version" not in str(rig.llm.requests[0].messages[0].content[0])
+    await rig.artifacts.save(brief(run, child.id, "FastMCP?", version=4))
+    await rig.artifacts.save(brief(run, vault.id, "Obsidian links?", version=5))
+    later = await rig.auditor.audit_task(
+        child_fix, brief(run, child_fix.id, "FastMCP?", version=6), run
+    )
+    assert "R12" in later.rules_checked
+    prompt = str(rig.llm.requests[1].messages[0].content[0])
+    assert "Previous version research_brief@v4" in prompt
+    assert "Previous version research_brief@v3" not in prompt
+    assert "Previous version research_brief@v5" not in prompt
 
 
 async def test_r6_passes_a_wrapped_run_and_fails_a_masked_failure(rig: Rig, run: Run) -> None:

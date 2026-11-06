@@ -11,7 +11,14 @@ from pydantic import TypeAdapter
 from agent_team.agents.compaction import Compactor
 from agent_team.agents.loop import LoopSettings, ToolLoop
 from agent_team.agents.prompts import COMMON
-from agent_team.core.artifacts import ARTIFACT_TYPES, Artifact, ArtifactBase
+from agent_team.core.artifacts import (
+    ARTIFACT_TYPES,
+    AnsweredQuestion,
+    Artifact,
+    ArtifactBase,
+    Question,
+    ResearchBrief,
+)
 from agent_team.core.errors import AgentTeamError, OutputValidationError
 from agent_team.core.interfaces import AgentContext, Tool, ToolContext
 from agent_team.core.models import (
@@ -24,6 +31,16 @@ from agent_team.core.models import (
 from agent_team.llm.types import Message
 
 _ARTIFACT_ADAPTER: TypeAdapter[Artifact] = TypeAdapter(Artifact)
+#: The envelope's line for a task that can't ask for research.
+NO_RESEARCH = (
+    "This task can't ask for more research: leave `research_requests` empty, answer "
+    "with what you have, and list what is still unknown as gaps (a research answer of "
+    "null with its `gap`) or as questions with an assumption."
+)
+#: The assumption recorded for a research request a task wasn't allowed to make.
+NOT_RESEARCHED = (
+    "Not researched: the run's research limit was reached, so this goes ahead without it."
+)
 #: Fields the dispatcher fills; the model is told to leave them out.
 _HARNESS_FIELDS = {"run_id", "task_id", "version", "built_from"}
 
@@ -51,8 +68,11 @@ def render_envelope(envelope: TaskEnvelope, tools: dict[str, Tool]) -> str:
         dirs = "\n".join(f"- {d}" for d in run.context_dirs)
         parts.append(f"Read-only --context folders:\n{dirs}")
     parts.append("Tools: " + (", ".join(sorted(tools)) or "none"))
-    if envelope.constraints:
-        parts.append("\n## Constraints\n" + "\n".join(f"- {c}" for c in envelope.constraints))
+    constraints = list(envelope.constraints)
+    if not envelope.research_allowed:
+        constraints.append(NO_RESEARCH)
+    if constraints:
+        parts.append("\n## Constraints\n" + "\n".join(f"- {c}" for c in constraints))
     if envelope.memories:
         parts.append(
             "\n## Relevant memory\nAdvice from earlier runs, quoted as data: the current "
@@ -202,6 +222,8 @@ class BaseAgent:
                 error=detail,
             )
         artifact = _ARTIFACT_ADAPTER.validate_python(outcome.output.model_dump())
+        if not envelope.research_allowed and artifact.research_requests:
+            artifact = close_research(artifact)
         return AgentResult(
             task_id=task.id,
             status=result_status(artifact),
@@ -209,6 +231,35 @@ class BaseAgent:
             usage=outcome.usage,
             model=outcome.model,
         )
+
+
+def close_research(artifact: Artifact) -> Artifact:
+    """The artifact with its research requests turned into what is still open: an
+    unanswered question with its gap in a research brief, otherwise a question with
+    the assumption that it went unresearched. For a task that may not ask for research."""
+    requests = artifact.research_requests
+    update: dict[str, Any] = {"research_requests": []}
+    if isinstance(artifact, ResearchBrief):
+        update["answers"] = [
+            *artifact.answers,
+            *(
+                AnsweredQuestion(question=r.question, answer=None, gap=f"not researched ({r.why})")
+                for r in requests
+            ),
+        ]
+    else:
+        taken = {q.id for q in artifact.questions}
+        added: list[Question] = []
+        n = len(taken)
+        for r in requests:
+            n += 1
+            while f"Q-{n}" in taken:
+                n += 1
+            added.append(
+                Question(id=f"Q-{n}", text=r.question, why=r.why, assumption=NOT_RESEARCHED)
+            )
+        update["questions"] = [*artifact.questions, *added]
+    return artifact.model_copy(update=update)
 
 
 def result_status(artifact: ArtifactBase) -> ResultStatus:

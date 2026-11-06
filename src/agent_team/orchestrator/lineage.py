@@ -40,21 +40,39 @@ def downstream(tasks: list[Task], root: Task) -> set[str]:
     return found
 
 
+#: Origins whose parent link is not a reopening: planned work points at the planner,
+#: and a research request, question or check is new work that its parent asked for,
+#: even when, like a Researcher's request, it has the parent's agent and output kind.
+NEW_WORK = frozenset(
+    {TaskOrigin.PLAN, TaskOrigin.RESEARCH_REQUEST, TaskOrigin.QUESTION, TaskOrigin.CHECK}
+)
+
+
+def reopens_parent(task: Task) -> bool:
+    """Whether ``task`` redoes its parent's work (a retry, revision, fix or rerun), so
+    the parent's output is an earlier version of its own."""
+    return task.parent_task_id is not None and task.origin not in NEW_WORK
+
+
 def ancestry(task: Task, tasks: list[Task]) -> list[Task]:
     """The tasks ``task`` was reopened from, oldest first, ending with ``task``: the
-    chain of ``parent_task_id`` links through tasks of the same agent and output."""
+    chain of ``parent_task_id`` links through tasks of the same agent and output, up to
+    the first task that was new work rather than a reopening."""
     by_id = {t.id: t for t in tasks}
     chain = [task]
     seen = {task.id}
+    current = task
     parent = by_id.get(task.parent_task_id or "")
     while (
         parent is not None
+        and reopens_parent(current)
         and parent.id not in seen
         and parent.agent is task.agent
         and parent.output_kind == task.output_kind
     ):
         chain.append(parent)
         seen.add(parent.id)
+        current = parent
         parent = by_id.get(parent.parent_task_id or "")
     return chain[::-1]
 

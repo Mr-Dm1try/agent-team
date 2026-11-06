@@ -239,6 +239,9 @@ class Task(Contract):
     max_attempts: int = 3
     origin: TaskOrigin = TaskOrigin.PLAN
     parent_task_id: str | None = None  # the task this one came from (retry, revision...)
+    #: False once the task may not ask for research any more: a request of its was
+    #: refused for a limit, so its next attempt answers with what it has.
+    may_request_research: bool = True
     reason: str | None = None  # why it exists, in words, for the decision log
     model: str | None = None  # the model that ran the latest attempt
     output: ArtifactRef | None = None
@@ -262,6 +265,7 @@ class FeedbackSource(StrEnum):
     USER_COMMENT = "user_comment"
     AUDITOR = "auditor"
     QA = "qa"
+    HARNESS = "harness"  # a limit the harness applied, such as on research requests
 
 
 class Feedback(Contract):
@@ -292,6 +296,9 @@ class TaskEnvelope(Contract):
     findings: list[Finding] = Field(default_factory=list)  # from the last failed verdict
     previous_output: Artifact | None = None  # set on retries and revisions
     upstream_diff: str | None = None  # set on revisions
+    #: False when the task can't ask for research (a depth or run limit); its
+    #: requests are then turned into open gaps or assumptions.
+    research_allowed: bool = True
     trace_id: str
     span_id: str
 

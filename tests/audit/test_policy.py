@@ -17,6 +17,7 @@ from agent_team.core.models import (
     Run,
     Severity,
     Task,
+    TaskOrigin,
     TaskStatus,
     Verdict,
     utcnow,
@@ -166,6 +167,7 @@ def test_still_failing_after_an_upstream_rerun_asks_the_user(run: Run) -> None:
         Phase.IMPLEMENTATION,
         "code_change",
         attempt=3,
+        origin=TaskOrigin.REVISION,
         parent_task_id=eng.id,
     )
     assert kinds(decide_task(run, child, v, [], [earlier], LIMITS))[-1] is DecisionKind.ASK_USER

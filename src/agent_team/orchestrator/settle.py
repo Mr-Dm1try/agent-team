@@ -4,6 +4,7 @@ tasks ask the user for guidance."""
 
 from __future__ import annotations
 
+from agent_team.core.artifacts import ResearchRequest
 from agent_team.core.models import (
     AgentName,
     Decision,
@@ -23,8 +24,10 @@ from agent_team.orchestrator.base import (
     can_keep,
 )
 from agent_team.orchestrator.control import create_user_task
+from agent_team.orchestrator.lineage import ancestry
 from agent_team.orchestrator.phases import is_work
 from agent_team.orchestrator.replies import plain_agent, upper_first
+from agent_team.orchestrator.research import find_same
 
 
 class SettleMixin(OrchestratorBase):
@@ -47,12 +50,17 @@ class SettleMixin(OrchestratorBase):
                 await self._audit(run, task, artifact)
                 changed = True
             elif task.status in (TaskStatus.WAITING, TaskStatus.ESCALATED):
+                # Its own questions and research, and research another task asked
+                # for first that this one waits on instead of asking again.
                 children = [
                     by_id[d]
                     for d in task.depends_on
                     if d in by_id
                     and by_id[d].origin in CHILD_ORIGINS
-                    and by_id[d].parent_task_id == task.id
+                    and (
+                        by_id[d].parent_task_id == task.id
+                        or by_id[d].origin is TaskOrigin.RESEARCH_REQUEST
+                    )
                 ]
                 live_children = [c for c in children if c.status is not TaskStatus.SUPERSEDED]
                 if live_children:
@@ -133,34 +141,8 @@ class SettleMixin(OrchestratorBase):
                         made_by="model",
                     )
                 )
-        for i, req in enumerate(artifact.research_requests, start=1):
-            child = await self.tasks.create_task(
-                Task(
-                    run_id=run.id,
-                    phase=task.phase,
-                    agent=AgentName.RESEARCHER,
-                    objective=req.question,
-                    inputs=[task.output] if task.output else [],
-                    output_kind="research_brief",
-                    origin=TaskOrigin.RESEARCH_REQUEST,
-                    parent_task_id=task.id,
-                    reason=f"research request {i} from {task.agent.value}: {req.why}",
-                    max_attempts=self.config.max_attempts,
-                )
-            )
-            child_ids.append(child.id)
-            await self._record(
-                Decision(
-                    run_id=run.id,
-                    task_id=task.id,
-                    kind=DecisionKind.DELEGATE,
-                    inputs={"question": req.question, "research_task": child.id},
-                    choice="researcher",
-                    reason=req.why,
-                    made_by="code",
-                    rule="research_request",
-                )
-            )
+        if artifact.research_requests:
+            child_ids += await self._plan_research(run, task, artifact.research_requests)
         task = await self.tasks.get_task(task.id)
         if child_ids:
             task.depends_on = [*task.depends_on, *child_ids]
@@ -168,8 +150,86 @@ class SettleMixin(OrchestratorBase):
         else:
             task.max_attempts = max(task.max_attempts, task.attempt + 1)
             await self.tasks.update_task(task)
-            await self.tasks.transition(task.id, TaskStatus.READY, reason="assumptions recorded")
+            await self.tasks.transition(
+                task.id, TaskStatus.READY, reason="assumptions recorded or research reused"
+            )
         return True
+
+    async def _plan_research(
+        self, run: Run, task: Task, requests: list[ResearchRequest]
+    ) -> list[str]:
+        """Turn ``task``'s research requests into the tasks it waits for, and return
+        their ids. A request the run already asked is answered by that task: a finished
+        brief joins the inputs, an open one is waited for. Past a limit, or for a
+        question the task already has the answer to, the request is refused and the
+        task told to answer with what it has; it may not ask again."""
+        limits = self.config.research
+        tasks = await self.tasks.list_tasks(run.id)
+        own = {t.id for t in ancestry(task, tasks)}
+        waits: list[str] = []
+        refused: list[str] = []
+        task = await self.tasks.get_task(task.id)
+        for i, req in enumerate(requests, start=1):
+            match = find_same(req.question, [t for t in tasks if t.id not in own])
+            choice, why, target = "", req.why, None
+            if match is not None and match.answered:
+                assert match.task.output is not None
+                if match.task.output in task.inputs:
+                    refused.append(f"{req.question} (already answered in your inputs)")
+                    choice, target = "refuse: already answered", match.task.id
+                else:
+                    task.inputs.append(match.task.output)
+                    choice, target = "reuse the finished research", match.task.id
+            elif match is not None and match.task.origin is TaskOrigin.RESEARCH_REQUEST:
+                waits.append(match.task.id)
+                choice, target = "wait for the same open research", match.task.id
+            elif match is not None:
+                refused.append(f"{req.question} (another task is researching it now)")
+                choice, target = "refuse: being researched", match.task.id
+            elif (limit := limits.refusal(task, tasks)) is not None:
+                refused.append(f"{req.question} ({limit})")
+                choice, why = "refuse: research limit", limit
+            else:
+                child = await self.tasks.create_task(
+                    Task(
+                        run_id=run.id,
+                        phase=task.phase,
+                        agent=AgentName.RESEARCHER,
+                        objective=req.question,
+                        inputs=[task.output] if task.output else [],
+                        output_kind="research_brief",
+                        origin=TaskOrigin.RESEARCH_REQUEST,
+                        parent_task_id=task.id,
+                        reason=f"research request {i} from {task.agent.value}: {req.why}",
+                        max_attempts=self.config.max_attempts,
+                    )
+                )
+                tasks.append(child)
+                waits.append(child.id)
+                choice, target = "researcher", child.id
+            await self._record(
+                Decision(
+                    run_id=run.id,
+                    task_id=task.id,
+                    kind=DecisionKind.DELEGATE,
+                    inputs={"question": req.question, "research_task": target},
+                    choice=choice,
+                    reason=why,
+                    made_by="code",
+                    rule="research_request",
+                )
+            )
+        if refused:
+            task.may_request_research = False
+            text = (
+                "No more research will be run for this task: "
+                + "; ".join(refused)
+                + ". Answer with what you have, and list what is still unknown as gaps "
+                "or as questions with an assumption, not as research_requests."
+            )
+            await self.feedback.add(run.id, self._feedback(task, FeedbackSource.HARNESS, text))
+        await self.tasks.update_task(task)
+        return list(dict.fromkeys(waits))
 
     async def _ask_about_escalation(self, run: Run, task: Task) -> None:
         """Ask the user how to get an escalated task unstuck."""

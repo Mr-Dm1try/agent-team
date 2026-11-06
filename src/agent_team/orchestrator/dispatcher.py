@@ -53,7 +53,8 @@ from agent_team.core.models import (
 )
 from agent_team.core.tracing import Tracer
 from agent_team.llm.types import LLMClient
-from agent_team.orchestrator.lineage import ancestry
+from agent_team.orchestrator.lineage import ancestry, reopens_parent
+from agent_team.orchestrator.research import ResearchLimits
 
 #: Marks a task whose attempt was cut short (crash, budget, kill switch). Its next
 #: dispatch resumes the same attempt from the checkpoint instead of starting a new one.
@@ -94,6 +95,8 @@ class Dispatcher:
     timeout_s: float = 600.0
     timeouts: dict[AgentName, float] = field(default_factory=dict)
     auditor: Auditor | None = None
+    #: Limits on research agents ask for; None leaves it unlimited.
+    research: ResearchLimits | None = None
 
     async def dispatch(self, task: Task) -> AgentResult:
         """Run one attempt of ``task`` and move it on; never raises for agent errors."""
@@ -308,17 +311,18 @@ class Dispatcher:
 
         previous: Artifact | None = None
         parent: Task | None = None
-        if task.parent_task_id:
+        if task.parent_task_id and reopens_parent(task):
             parent = await self.tasks.get_task(task.parent_task_id)
         prev_ref = task.output or (parent.output if parent else None)
         if prev_ref is not None and prev_ref.kind == task.output_kind:
             previous = await self.artifacts.load(run.id, prev_ref)
 
+        all_tasks = await self.tasks.list_tasks(run.id)
         feedback: list[Feedback] = []
         if self.feedback is not None:
             # This line of work only: the task, the tasks it was reopened from, and the
             # versions they wrote. Sibling work of the same kind keeps its own.
-            chain = ancestry(task, await self.tasks.list_tasks(run.id))
+            chain = ancestry(task, all_tasks)
             feedback = await self.feedback.for_work(
                 run.id,
                 refs=[t.output for t in chain if t.output is not None],
@@ -349,6 +353,8 @@ class Dispatcher:
             findings=findings,
             previous_output=previous,
             upstream_diff=await self._upstream_diff(run.id, previous, inputs) if previous else None,
+            research_allowed=self.research is None
+            or self.research.refusal(task, all_tasks) is None,
             trace_id=task.trace_id or run.trace_id,
             span_id=task.span_id or run.span_id,
         )

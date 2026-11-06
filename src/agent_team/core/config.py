@@ -59,6 +59,10 @@ class LimitsConfig(_Cfg):
     max_check_attempts: int = 3
     #: Wall-clock limit on one attempt of a task or a check.
     task_timeout_s: float = 600.0
+    #: Research tasks agents may ask for in one run, on top of the planned ones.
+    max_research_tasks: int = Field(default=6, ge=0)
+    #: How deep requests may chain: at 1, a task made from a request can't ask for more.
+    max_research_depth: int = Field(default=1, ge=0)
 
 
 class RetryConfig(_Cfg):
