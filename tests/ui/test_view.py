@@ -223,6 +223,6 @@ async def test_a_provider_going_down_and_back_gets_a_line() -> None:
     down = _event(EventName.PROVIDER_DOWN, "r1", provider="ollama", retry_after_s=60.0)
     await _feed(view, [down, _event(EventName.PROVIDER_UP, "r1", provider="ollama")])
     assert console.export_text().splitlines() == [
-        "  ollama is unreachable; calls go to the fallback for 60.0s",
+        "  ollama is unreachable; calls use the next provider and try it again every 60.0s",
         "  ollama is reachable again",
     ]

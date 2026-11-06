@@ -491,10 +491,11 @@ async def test_a_provider_still_down_after_the_wait_gives_no_second_event(
 
 async def test_when_every_provider_is_down_they_are_still_tried(sleeps: Sleeps) -> None:
     fake = FakeProvider([refused(), "ok"])
-    backup = FakeProvider([refused()], name="backup")
+    backup = FakeProvider([refused()] * 4, name="backup")
     gw = gateway(fake, backup, sleeps=sleeps, clock=Clock())
     with pytest.raises(TransientLLMError):
-        await gw.complete(request())
+        await gw.complete(request())  # the last route retries before it gives up
+    assert sleeps.calls == [1, 2, 4]
     assert (await gw.complete(request())).text == "ok"
 
 
@@ -510,3 +511,11 @@ async def test_the_context_budget_follows_a_fallback_while_the_provider_is_down(
     assert gw.context_budget(AgentName.RESEARCHER, "task_1") == 200
     await gw.complete(request(AgentName.RESEARCHER))
     assert gw.context_budget(AgentName.RESEARCHER, "task_1") == 1000  # the defaults'
+
+
+async def test_with_no_other_route_a_refused_connection_still_retries(sleeps: Sleeps) -> None:
+    config = make_config(fallbacks=[])
+    fake = FakeProvider([refused(), "ok"])
+    gw = gateway(fake, sleeps=sleeps, config=config, clock=Clock())
+    assert (await gw.complete(request())).text == "ok"
+    assert sleeps.calls == [1]

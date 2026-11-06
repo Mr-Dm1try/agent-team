@@ -24,7 +24,7 @@ from collections.abc import Awaitable, Callable, Sequence
 
 from agent_team.agents.prompts import RUN_SUMMARY
 from agent_team.audit import patterns
-from agent_team.core.artifacts import Artifact, ResearchAnswer, ResearchBrief, Spec
+from agent_team.core.artifacts import Artifact, ArtifactRef, ResearchAnswer, ResearchBrief, Spec
 from agent_team.core.base import Contract
 from agent_team.core.config import MemoryConfig
 from agent_team.core.interfaces import (
@@ -277,22 +277,28 @@ class MemoryWriter:
         ][:MAX_LESSONS]
         here = MemorySource(run_id=task.run_id, task_id=task.id)
         out: list[tuple[MemoryKind, str, MemorySource]] = []
+        chain = [t.id for t in ancestry(task, await self.tasks.list_tasks(task.run_id))]
+        before: list[Artifact | None] = []  # the version before this one, loaded once
+
+        async def failed_output(finding: Finding) -> Artifact | None:
+            """The output the failed check judged: the finding's artifact when it is the
+            same kind, else the version before the passing one in this line of work."""
+            ref = finding.artifact
+            if ref is not None and ref.kind == artifact.kind and ref.version < artifact.version:
+                return await self._load(task.run_id, ref)
+            if not before:
+                before.append(await previous_version(self.artifacts, task.run_id, artifact, chain))
+            return before[0]
+
         for finding in findings:
-            old = await self._failed_output(task, failed, finding, artifact)
+            old = await failed_output(finding)
             out.append((MemoryKind.LESSON, lesson_text(task, finding, old, artifact), here))
         return out
 
-    async def _failed_output(
-        self, task: Task, failed: Verdict, finding: Finding, artifact: Artifact
-    ) -> Artifact | None:
-        """The output the failed check judged: the finding's artifact when it is the
-        same kind, else the version before the passing one in this line of work."""
-        ref = finding.artifact
-        if ref is None or ref.kind != artifact.kind or ref.version >= artifact.version:
-            chain = [t.id for t in ancestry(task, await self.tasks.list_tasks(task.run_id))]
-            return await previous_version(self.artifacts, task.run_id, artifact, chain)
+    async def _load(self, run_id: str, ref: ArtifactRef) -> Artifact | None:
+        """One artifact version, or None if it doesn't exist."""
         try:
-            return await self.artifacts.load(task.run_id, ref)
+            return await self.artifacts.load(run_id, ref)
         except KeyError:
             return None
 

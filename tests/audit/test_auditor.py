@@ -290,7 +290,7 @@ def test_second_check_material_keeps_the_start_and_the_end() -> None:
     assert cut.startswith("REQUEST") and cut.endswith("TOOLLOG") and len(cut) < 24_100
 
 
-# --- fixes from a real run -------------------------------------------------------------
+# --- web pages, sibling versions and wrapped test runs ---------------------------
 
 TUTORIAL = "https://fastapi.tiangolo.com/tutorial/testing/"
 SAMPLE_PAGE = 'client.get("/items/foo", headers={"X-Token": "coneofsilence"})\n'

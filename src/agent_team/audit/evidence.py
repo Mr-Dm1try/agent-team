@@ -76,7 +76,7 @@ OUTGOING_TOOLS = frozenset({"web_fetch", "web_search", "fetch", "http_request", 
 #: Tools whose results are text from outside, such as a web page. S1 doesn't scan
 #: those results, since a tutorial's sample token isn't ours to leak and S6 already
 #: checks them for planted instructions; it still scans their args.
-UNTRUSTED_RESULT_TOOLS = frozenset({"web_fetch", "web_search", "fetch", "http_request", "open_url"})
+UNTRUSTED_RESULT_TOOLS = OUTGOING_TOOLS
 
 
 _KIND_OF_TYPE: dict[type[ArtifactBase], str] = {cls: kind for kind, cls in ARTIFACT_TYPES.items()}
@@ -804,12 +804,14 @@ def tests_ran(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 
 def _commands_of(ctx: AuditContext, task: Task) -> list[tuple[ToolCall, patterns.CommandShape]]:
-    """The task's commands that ran, each with its normalised shape."""
+    """The task's commands that ran, each with its normalised shape. Only a call whose
+    args hold a command counts: install_deps also logs an argv (pip's), but its args
+    are packages, so ``pytest`` in a package list is never taken for a test run."""
     out: list[tuple[ToolCall, patterns.CommandShape]] = []
     for call in ctx.ran():
         if call.task_id != task.id:
             continue
-        argv = call.data.get("argv") or call.args.get("argv")
+        argv = call.args.get("argv")
         if isinstance(argv, list) and argv:
             out.append((call, patterns.command_shape([str(a) for a in argv])))
         elif patterns.command_text(call.args):

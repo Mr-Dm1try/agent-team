@@ -602,10 +602,17 @@ def test_only_a_failed_connection_counts_as_a_provider_being_down() -> None:
     from agent_team.llm import anthropic_provider, ollama_provider
 
     req = httpx2.Request("POST", "http://l")
-    down = ollama_provider.translate_error(openai.APIConnectionError(request=req), "ollama")
-    slow = ollama_provider.translate_error(openai.APITimeoutError(request=req), "ollama")
-    assert isinstance(down, TransientLLMError) and down.unreachable
-    assert isinstance(slow, TransientLLMError) and not slow.unreachable
+    stopped = openai.APIConnectionError(request=req)
+    stopped.__cause__ = httpx2.ConnectError("refused")
+    reset = openai.APIConnectionError(request=req)
+    reset.__cause__ = httpx2.ReadError("reset")
+    for exc, down in [
+        (stopped, True),
+        (reset, False),
+        (openai.APITimeoutError(request=req), False),
+    ]:
+        mapped = ollama_provider.translate_error(exc, "ollama")
+        assert isinstance(mapped, TransientLLMError) and mapped.unreachable is down
 
     refused = anthropic.APIConnectionError(request=req)
     refused.__cause__ = httpx2.ConnectError("refused")

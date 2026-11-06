@@ -12,9 +12,11 @@ Per call, in order:
 4. Per route: rate limit slot, chaos, provider call. Transient errors retry after the
    configured delays (1, 2, 4 s), then move to the next route. Other provider errors
    move to the next route at once. A provider that refuses the connection is marked
-   down for ``retry.provider_down_s``: calls skip it and go straight to the next
-   route until then, unless every route is down. ``provider_down`` is emitted when it
-   goes down and ``provider_up`` once a call to it succeeds again.
+   down for ``retry.provider_down_s``: the call moves to the next route without
+   retrying, and later calls skip it until then, unless every route is down. With no
+   other route left, a refused connection retries like any transient error.
+   ``provider_down`` is emitted when it goes down and ``provider_up`` once a call to it
+   succeeds again.
 5. Cost from the price table (by the requested model, then the model the provider
    reports), usage recorded in memory and, when a task store is given, added to
    ``Run.usage``. ``llm_call_after`` is emitted. A run's first call in a process
@@ -312,14 +314,26 @@ class Gateway:
         return response
 
     async def _on_error(
-        self, request: LLMRequest, provider: str, model: str, exc: Exception, try_no: int
+        self,
+        request: LLMRequest,
+        provider: str,
+        model: str,
+        exc: Exception,
+        try_no: int,
+        *,
+        last_route: bool,
     ) -> bool:
         """Log one failed try. Returns True when the same route should retry. A refused
-        connection never retries: the provider is marked down instead."""
+        connection marks the provider down, and retries only on the ``last_route``,
+        since no other provider can take the call."""
         usage = self.budget.usage(request.run_id)
         transient = isinstance(exc, TransientLLMError)
         unreachable = isinstance(exc, TransientLLMError) and exc.unreachable
-        will_retry = transient and not unreachable and try_no < len(self.config.retry.delays_s)
+        will_retry = (
+            transient
+            and not (unreachable and not last_route)
+            and try_no < len(self.config.retry.delays_s)
+        )
         await self.bus.emit(
             self._event(
                 EventName.ERROR,
@@ -398,8 +412,9 @@ class Gateway:
             effort = self._effort(request, primary)
             started = time.monotonic()
             last: Exception | None = None
-            for name, model in routes:
+            for i, (name, model) in enumerate(routes):
                 fallback = (name, model) != (primary.provider, primary.model)
+                last_route = i == len(routes) - 1
                 provider = self.providers[name]
                 try_no = 0
                 while True:
@@ -414,7 +429,9 @@ class Gateway:
                     except Exception as exc:
                         last = exc
                         self.budget.usage(request.run_id).failed_calls += 1
-                        if await self._on_error(request, name, model, exc, try_no):
+                        if await self._on_error(
+                            request, name, model, exc, try_no, last_route=last_route
+                        ):
                             try_no += 1
                             continue
                         break
@@ -435,8 +452,9 @@ class Gateway:
             effort = self._effort(request, primary)
             started = time.monotonic()
             last: Exception | None = None
-            for name, model in routes:
+            for i, (name, model) in enumerate(routes):
                 fallback = (name, model) != (primary.provider, primary.model)
+                last_route = i == len(routes) - 1
                 provider = self.providers[name]
                 try_no = 0
                 while True:
@@ -465,7 +483,9 @@ class Gateway:
                             raise
                         last = exc
                         self.budget.usage(request.run_id).failed_calls += 1
-                        if await self._on_error(request, name, model, exc, try_no):
+                        if await self._on_error(
+                            request, name, model, exc, try_no, last_route=last_route
+                        ):
                             try_no += 1
                             continue
                         break

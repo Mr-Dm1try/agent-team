@@ -588,6 +588,18 @@ def test_r6_prose_in_the_command_names_the_runs_and_the_fix(run: Run) -> None:
     assert "exact argv" in (finding.suggested_fix or "")
 
 
+def test_r6_an_install_of_pytest_is_not_a_test_run(run: Run) -> None:
+    ctx = code_ctx(
+        run, tests=UnitTestRun(command="pytest", passed=3, failed=0, exit_code=0, output_tail="")
+    )
+    [eng] = [t for t, _ in ctx.outputs]
+    install = call(run, eng, "install_deps", "installed", packages=["pytest"])
+    pip = ["python", "-I", "-m", "pip", "install", "pytest"]
+    ctx.tool_calls = [install.model_copy(update={"data": {"argv": pip, "exit_code": 0}})]
+    [finding] = run_helper("R6", ctx).findings
+    assert "matches no command this task ran" in finding.message
+
+
 def test_r6_matches_after_assignments_and_whitespace(run: Run) -> None:
     ctx = code_ctx(
         run,

@@ -109,9 +109,10 @@ def _short(value: Any, limit: int = 60) -> str:
 
 
 def _tag(state: RunState, row: TaskRow) -> str:
-    """A short objective after a task's plain lines when a sibling (another live task of
-    the same phase, agent and output) would print the same label, such as two research
-    questions running at once; empty otherwise."""
+    """A short objective after a task's plain lines when a sibling (another task of the
+    same phase, agent and output that isn't superseded) prints the same label, such as
+    two research questions running at once or work packages one after another; empty
+    otherwise."""
     siblings = [
         t
         for t in state.tasks.values()
@@ -265,8 +266,8 @@ class RunView:
             return None
         if name is EventName.PROVIDER_DOWN:
             return (
-                f"  {data.get('provider')} is unreachable; calls go to the fallback for "
-                f"{data.get('retry_after_s')}s"
+                f"  {data.get('provider')} is unreachable; calls use the next provider and "
+                f"try it again every {data.get('retry_after_s')}s"
             )
         if name is EventName.PROVIDER_UP:
             return f"  {data.get('provider')} is reachable again"
