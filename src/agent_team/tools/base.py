@@ -5,13 +5,14 @@ Path rules (docs/DESIGN.md, "Sandbox"): every path resolves inside the run's
 workspace, except folders passed with ``--context``, which tools may read but never
 write, and large tool results saved under ``runs/<id>/tool_results``, which are
 read-only too. Symlinks and ``..`` are resolved before the check, so neither can escape.
-Secrets files (``.env`` and ``.env.*``, but not ``.env.example``) in a ``--context``
-folder are refused, so pointing ``--context`` at a project never hands its API keys
-to the model.
+Secrets files (``.env``, ``.env.*``, ``*.env`` and ``.envrc``, but not templates such
+as ``.env.example``) in a ``--context`` folder are refused, so pointing ``--context`` at
+a project never hands its API keys to the model.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from agent_team.core.errors import ToolError
@@ -26,9 +27,26 @@ def _inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+#: Committed templates that list variable names without values.
+_ENV_TEMPLATES = frozenset({".env.example", ".env.sample", ".env.template"})
+
+
 def is_env_file(name: str) -> bool:
-    """True for ``.env`` and ``.env.*`` names other than ``.env.example``."""
-    return name == ".env" or (name.startswith(".env.") and name != ".env.example")
+    """True for secrets-file names: ``.env``, ``.env.*``, ``*.env`` and ``.envrc``, in any
+    letter case (macOS folders ignore it), but not the templates such as ``.env.example``."""
+    name = name.casefold()
+    if name in _ENV_TEMPLATES:
+        return False
+    return name == ".envrc" or name.startswith(".env.") or name.endswith(".env")
+
+
+def _asked_parts(asked: Path, roots: tuple[Path, ...]) -> tuple[str, ...]:
+    """The names in the path as asked, below the first root it is written under, so a
+    symlink called ``.env`` anywhere along it counts; just its last name otherwise."""
+    for root in roots:
+        if _inside(asked, root):
+            return asked.relative_to(root).parts
+    return (asked.name,)
 
 
 def resolve_path(raw: str, run: Run, *, write: bool, tool: str) -> Path:
@@ -53,16 +71,18 @@ def resolve_path(raw: str, run: Run, *, write: bool, tool: str) -> Path:
     for ctx_dir in run.context_dirs:
         root = Path(ctx_dir).resolve()
         if _inside(resolved, root):
-            # The name as asked too, so a symlink called .env is refused as well.
-            parts = resolved.relative_to(root).parts
-            named = (candidate.name,) if resolved != root else ()
-            if any(is_env_file(part) for part in (*named, *parts)):
-                raise ToolError(f"{raw} is a secrets file and can't be read", tool=tool)
             if write:
                 raise ToolError(
                     f"{raw} is in a read-only --context folder; write inside the workspace",
                     tool=tool,
                 )
+            asked = Path(os.path.normpath(candidate))
+            names = (
+                *resolved.relative_to(root).parts,
+                *_asked_parts(asked, (workspace, Path(ctx_dir).absolute(), root)),
+            )
+            if resolved != root and any(is_env_file(name) for name in names):
+                raise ToolError(f"{raw} is a secrets file and can't be read", tool=tool)
             return resolved
     raise ToolError(
         f"{raw} is outside the workspace and the --context folders",

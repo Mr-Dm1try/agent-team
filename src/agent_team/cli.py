@@ -68,8 +68,13 @@ def load_env(folder: Path | None = None) -> bool:
 
 
 def entry() -> None:
-    """The ``agent-team`` command: load ``.env``, then run the CLI."""
-    load_env()
+    """The ``agent-team`` command: load ``.env``, then run the CLI. It loads here, not in
+    the ``app`` callback, so tests that drive ``app`` never pick up a developer's .env."""
+    try:
+        load_env()
+    except (OSError, UnicodeDecodeError) as exc:
+        typer.echo(f"Can't read .env: {exc}", err=True)
+        raise SystemExit(2) from exc
     app()
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from importlib.metadata import entry_points
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -56,7 +56,21 @@ def test_entry_loads_env_from_the_current_folder(
     assert seen == ["from-cwd"]
 
 
-def test_the_installed_command_goes_through_entry() -> None:
+def test_an_unreadable_env_file_fails_with_a_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A .env that isn't UTF-8 stops the command with one line, not a traceback."""
+    (tmp_path / ".env").write_bytes("KEY=value\n".encode("utf-16"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "app", lambda: pytest.fail("the CLI ran"))
+    with pytest.raises(SystemExit) as exit_info:
+        cli.entry()
+    assert exit_info.value.code == 2
+    assert "Can't read .env" in capsys.readouterr().err
+
+
+def test_the_command_starts_at_entry() -> None:
     """``agent-team`` starts at ``entry``, so .env is loaded for every command."""
-    [script] = entry_points(group="console_scripts", name="agent-team")
-    assert script.value == "agent_team.cli:entry"
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
+    assert scripts["agent-team"] == "agent_team.cli:entry"
