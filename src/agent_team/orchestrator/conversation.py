@@ -59,7 +59,7 @@ from agent_team.orchestrator.messages import (
     scrub,
 )
 from agent_team.orchestrator.phases import expert_tasks
-from agent_team.orchestrator.replies import Reply, pending_items, waiting_reply
+from agent_team.orchestrator.replies import Reply, WorkingReply, pending_items, waiting_reply
 
 #: The order actions are carried out in: answers and a new run, then preferences (kept
 #: under the new run when there is one), changes, and a stop last.
@@ -70,6 +70,18 @@ _ORDER = {
     "request_change": 2,
     "stop_run": 3,
 }
+#: Actions that change the run, so a message typed while the team works waits with
+#: them until it stops.
+_HELD = frozenset({"answer_pending", "request_change", "start_run"})
+#: The reply to a message held until the team stops.
+HELD_REPLY = (
+    "I'll take that up as soon as the team stops: when it next waits for you or "
+    "finishes. To stop it now, type stop."
+)
+#: The reply when a message typed while the team works asks for a stop in other words.
+TYPE_STOP = "To stop the run, type stop."
+#: The fallback when the message loop can't read a message.
+DIDNT_CATCH = "I didn't catch that. Could you say it another way?"
 
 
 class ConversationMixin(OrchestratorBase):
@@ -93,18 +105,65 @@ class ConversationMixin(OrchestratorBase):
         self, message: str, run: Run | None, context_dirs: list[str] | None = None
     ) -> Reply:
         """Read one message and carry out what it means; see ``handle``."""
+        waiting = await self._pending(run.id) if run else []
+        try:
+            meant = await self._read(message, run, waiting)
+        except PAUSING as exc:
+            return await self._paused_while_reading(run, exc)
+        if meant is None:
+            return self._didnt_catch(run, waiting)
+        return await self._carry_out(run, message, meant, context_dirs or [])
+
+    async def handle_while_working(self, message: str, run_id: str) -> WorkingReply:
+        """A message typed while the team works on the run. The message loop reads it
+        as usual, but only what can't disturb the work is done now: the reply to a
+        question and any preference. A message that changes the run (an answer, a
+        change, a new run) is held for the session to send again once the team stops.
+        The session stops the run itself when the user types stop; a stop asked in
+        other words gets a hint to type it."""
+        run = await self.tasks.get_run(run_id)
+        async with Tracer(self.bus).in_run(run, "user message", "other", agent=AgentName.USER):
+            try:
+                meant = await self._read(
+                    message, run, await self._pending(run.id), while_working=True
+                )
+            except PAUSING:
+                return WorkingReply(
+                    "The run is stopping, so I couldn't read that. Send it again once it has."
+                )
+            if meant is None:
+                return WorkingReply(DIDNT_CATCH)
+            tools = {a.tool for a in meant.actions}
+            if tools & _HELD:
+                return WorkingReply(HELD_REPLY, held=True)
+            if not meant.actions:
+                await self._log_action(run.id, message, meant, None)
+            for action in meant.actions:
+                if action.tool == "remember_preference":
+                    await self._remember(run, message, action.args["text"])
+            said = [meant.reply, TYPE_STOP] if "stop_run" in tools else [meant.reply]
+            return WorkingReply("\n\n".join(scrub(t, message) for t in said))
+
+    async def _read(
+        self, message: str, run: Run | None, waiting: list[Task], *, while_working: bool = False
+    ) -> Interpretation | None:
+        """Log the message and run the message loop on it. Returns None when the loop
+        failed (logged as an error), so nothing is acted on; a stop or the budget
+        running out while reading propagates."""
+        data: dict[str, object] = {"text": message}
+        if while_working:
+            data["while_working"] = True
         await self.bus.emit(
             Event(
                 name=EventName.USER_MESSAGE,
                 run_id=run.id if run else SESSION,
                 agent=AgentName.USER,
-                data={"text": message},
+                data=data,
             )
         )
-        waiting = await self._pending(run.id) if run else []
         pending = [(t, await self._asker(t)) for t in waiting]
         try:
-            meant = await interpret(
+            return await interpret(
                 message,
                 run,
                 pending,
@@ -118,8 +177,8 @@ class ConversationMixin(OrchestratorBase):
                 llm=self.llm,
                 workspace=str(self.config.runs_dir),
             )
-        except PAUSING as exc:
-            return await self._paused_while_reading(run, exc)
+        except PAUSING:
+            raise
         except Exception as exc:  # a failed read is never an action
             await self.bus.emit(
                 Event(
@@ -133,10 +192,7 @@ class ConversationMixin(OrchestratorBase):
                     },
                 )
             )
-            meant = None
-        if meant is None:
-            return self._didnt_catch(run, waiting)
-        return await self._carry_out(run, message, meant, context_dirs or [])
+            return None
 
     async def _paused_while_reading(self, run: Run | None, exc: Exception) -> Reply:
         """The budget ran out or the run was stopped while reading the message: pause the
@@ -284,7 +340,7 @@ class ConversationMixin(OrchestratorBase):
 
     def _didnt_catch(self, run: Run | None, waiting: list[Task]) -> Reply:
         """The fallback when the loop fails: act on nothing and list what's waiting."""
-        text = "I didn't catch that. Could you say it another way?"
+        text = DIDNT_CATCH
         if waiting:
             text += " Here's what's waiting on you:\n" + "\n".join(
                 f"- {t.objective}" for t in waiting

@@ -207,6 +207,8 @@ class RunView:
         #: Model calls made outside any run, such as reading a message with no run open.
         self.session = Ticker()
         self._live: Live | None = None
+        #: A dim line under the live tree, such as how to talk to the team meanwhile.
+        self._hint: str | None = None
         self._broken = False
         #: What the last printed tree showed, so an unchanged tree isn't printed again.
         self._printed: tuple[object, ...] | None = None
@@ -224,13 +226,15 @@ class RunView:
 
     # --- the live display ------------------------------------------------------------
 
-    def start(self) -> None:
-        """Start redrawing in place, unless the view prints plain lines."""
+    def start(self, *, hint: str | None = None) -> None:
+        """Start redrawing in place, with ``hint`` under the tree, unless the view
+        prints plain lines."""
         if self.plain or self._live is not None:
             return
+        self._hint = hint
         try:
             self._live = Live(
-                self.render(), console=self.console, auto_refresh=False, transient=True
+                self._frame(), console=self.console, auto_refresh=False, transient=True
             )
             self._live.start()
         except Exception:
@@ -315,7 +319,7 @@ class RunView:
                 if line:
                     self.console.print(line, highlight=False, markup=False)
             elif self._live is not None:
-                self._live.update(self.render(), refresh=True)
+                self._live.update(self._frame(), refresh=True)
         except Exception:
             self._fall_back("draw")
 
@@ -411,6 +415,12 @@ class RunView:
         return None
 
     # --- drawing ---------------------------------------------------------------------
+
+    def _frame(self) -> Group:
+        """What the live display draws: the tree, then the hint."""
+        if self._hint is None:
+            return self.render()
+        return Group(self.render(), Text(self._hint, style="dim"))
 
     def render(self) -> Group:
         """The tree of every run the view has seen, with its ticker."""

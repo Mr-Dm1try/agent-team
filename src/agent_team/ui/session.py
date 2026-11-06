@@ -1,11 +1,15 @@
 """One terminal session with the team: start or resume a run, show it live, pass on
 what the user types, and review the finished run.
 
-While the team works, the live view (or plain lines) shows it. When the run waits on
-the user, each line typed is sent as a message; ending the input (Ctrl-D) leaves the
-run waiting. When the run is done, the session shows the summary and asks the user to
-accept it or describe a change, and after a change re-runs it shows what changed.
-A question asked at that prompt is answered and the prompt comes back.
+While the team works, the live view (or plain lines) shows it, and each line typed is
+read at once. "stop" stops the run at its next model call. Any other line goes to the
+message loop: a question about the run is answered under the view, and a line that
+changes the run (an answer, a change, new work) is held and sent again as soon as the
+team stops. When the run waits on the user, each line typed is sent as a message;
+ending the input (Ctrl-D) leaves the run waiting. When the run is done, the session
+shows the summary and asks the user to accept it or describe a change, and after a
+change re-runs it shows what changed. A question asked at that prompt is answered and
+the prompt comes back.
 
 The session holds the run's drive lock while the team works on the run, and lets go
 while it waits for the user's next line. So ``agent-team stop`` knows whether a
@@ -15,15 +19,19 @@ session will see its flag at the next model call, or must mark the run stopped i
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import sys
+import threading
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from rich.console import Console
 
 from agent_team.app import App
 from agent_team.core.control import DriveLock
 from agent_team.core.models import Event, EventName, RunStatus
+from agent_team.orchestrator.messages import says_stop
 from agent_team.orchestrator.replies import Reply
 from agent_team.ui.diffs import Snapshot, change_report, snapshot
 from agent_team.ui.summary import summarize
@@ -36,16 +44,43 @@ REVIEW_PROMPT = "Type 'accept' to finish, or describe a change."
 #: The status line's word for each run status, as the user would say it.
 STATE_WORDS = {RunStatus.WAITING: "waiting for you"}
 
+#: The hint under the live view while the team works.
+TYPE_HINT = "Type a question or a change, or stop to stop the run."
+#: What the session says when the user types stop while the team works.
+STOPPING = "Stopping the run at its next model call."
+
 #: Reads one line of input; None at the end of input.
 LineReader = Callable[[], Awaitable[str | None]]
 
 
-async def read_stdin() -> str | None:
-    """One line from stdin without blocking the event loop; None at end of input."""
-    sys.stdout.write("> ")
-    sys.stdout.flush()
-    line = await asyncio.to_thread(sys.stdin.readline)
-    return line.strip() if line else None
+class StdinLines:
+    """Reads stdin on a daemon thread, so a line typed while the team works is read at
+    once, and a read still waiting when the session ends doesn't keep the process
+    alive (a thread from ``asyncio.to_thread`` would)."""
+
+    def __init__(self) -> None:
+        """The thread starts on the first read, on the running loop."""
+        self._lines: asyncio.Queue[str | None] | None = None
+
+    async def __call__(self) -> str | None:
+        """The next line, stripped; None at the end of input."""
+        if self._lines is None:
+            self._lines = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            threading.Thread(target=self._pump, args=(loop, self._lines), daemon=True).start()
+        return await self._lines.get()
+
+    @staticmethod
+    def _pump(loop: asyncio.AbstractEventLoop, lines: asyncio.Queue[str | None]) -> None:
+        """Hand each line of stdin to the loop, then None at the end of input."""
+        while True:
+            line = sys.stdin.readline()
+            try:
+                loop.call_soon_threadsafe(lines.put_nowait, line.strip() if line else None)
+            except RuntimeError:
+                return  # the loop has closed: the session is over
+            if not line:
+                return
 
 
 class Session:
@@ -57,33 +92,102 @@ class Session:
         console: Console,
         *,
         plain: bool = False,
-        read_line: LineReader = read_stdin,
+        read_line: LineReader | None = None,
+        listen: bool = True,
     ) -> None:
-        """Show the run on ``console`` and read the user's lines with ``read_line``."""
+        """Show the run on ``console`` and read the user's lines with ``read_line``
+        (stdin by default); ``listen`` also reads them while the team works."""
         self.team = team
         self.console = console
-        self.read_line = read_line
+        self.read_line = read_line or StdinLines()
+        self.listen = listen
         self.view = RunView(console, plain=plain)
         self.view.attach(team.bus)
         self.lock = DriveLock(team.runs_dir)
         team.bus.on_after(EventName.RUN_STARTED, self._on_run_started)
         self._seen: dict[str, Snapshot] = {}  # per run, the versions last reviewed
+        #: The read in flight, kept when the team stops first so no line is lost.
+        self._reading: asyncio.Task[str | None] | None = None
+        self._ended = False  # the input has ended
+        #: Lines typed while the team worked that change the run, sent once it stops.
+        self._held: list[str] = []
+        self._started: str | None = None  # the run this session started last
 
     async def _on_run_started(self, event: Event) -> None:
         """Hold the lock of a run this session just started."""
+        self._started = event.run_id
         self.lock.acquire(event.run_id)
 
     def say(self, text: str) -> None:
         """Print text as it is, without Rich markup."""
         self.console.print(text, markup=False, highlight=False)
 
-    async def _drive(self, work: Awaitable[Reply]) -> Reply:
-        """Await the team's work with the live view running."""
-        self.view.start()
+    async def _drive(self, work: Awaitable[Reply], run_id: str | None = None) -> Reply:
+        """Await the team's work on ``run_id`` (or the run it starts) with the live view
+        running, reading what the user types meanwhile when the session listens."""
+        self.view.start(hint=TYPE_HINT if self.listen else None)
         try:
-            return await work
+            if not self.listen:
+                return await work
+            return await self._listen(asyncio.ensure_future(work), run_id)
         finally:
             self.view.stop()
+
+    async def _listen(self, work: asyncio.Future[Reply], run_id: str | None) -> Reply:
+        """Read lines while ``work`` runs and hand each to ``_while_working``. A read
+        still waiting when the work ends is kept for the next prompt."""
+        try:
+            while True:
+                if self._reading is None and not self._ended:
+                    self._reading = asyncio.ensure_future(self.read_line())
+                waits: set[asyncio.Future[Any]] = {work}
+                if self._reading is not None:
+                    waits.add(self._reading)
+                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+                if work.done():
+                    return work.result()
+                line = self._take()
+                if line:
+                    await self._while_working(line, run_id or self._started)
+        finally:
+            if not work.done():
+                work.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await work
+
+    def _take(self) -> str | None:
+        """The finished read's line; None marks the end of input."""
+        assert self._reading is not None and self._reading.done()
+        reading, self._reading = self._reading, None
+        line = reading.result()
+        if line is None:
+            self._ended = True
+        return line
+
+    async def _while_working(self, line: str, run_id: str | None) -> None:
+        """One line typed while the team works: "stop" stops the run at its next model
+        call; anything else goes to the message loop, and its reply prints under the
+        view. A line that changes the run, or one typed before the run exists, is held
+        until the team stops."""
+        if run_id is None:
+            self._held.append(line)
+            self._under_view("I'll take that up as soon as the team stops.")
+            return
+        if says_stop(line):
+            self.team.kill_switch.stop(run_id, "the user typed stop while the team worked")
+            self._under_view(STOPPING)
+            return
+        reply = await self.team.orchestrator.handle_while_working(line, run_id)
+        if reply.held:
+            self._held.append(line)
+        self._under_view(reply.text)
+
+    def _under_view(self, text: str) -> None:
+        """Print text under the live view: the view stops (printing the tree once if it
+        changed), the text prints, and the view starts again."""
+        self.view.stop()
+        self.say(text)
+        self.view.start(hint=TYPE_HINT)
 
     async def start(self, request: str, *, context_dirs: list[str] | None = None) -> int:
         """Start a run for ``request`` and talk until it is done or left waiting."""
@@ -109,7 +213,7 @@ class Session:
         try:
             self.team.kill_switch.clear(run_id)  # a stop is lifted by resuming
             self.view.load(run_id, await self.team.stores.tasks.list_tasks(run_id))
-            reply = await self._drive(self.team.orchestrator.resume(run_id))
+            reply = await self._drive(self.team.orchestrator.resume(run_id), run_id)
             return await self._talk(reply, run_id)
         finally:
             self.lock.release_all()
@@ -158,7 +262,7 @@ class Session:
             if run_id and not self.lock.acquire(run_id):
                 self.say(f"Run {run_id} is being driven by another session.")
                 return 1
-            reply = await self._drive(self.team.orchestrator.handle(line, run_id=run_id))
+            reply = await self._drive(self.team.orchestrator.handle(line, run_id=run_id), run_id)
 
     async def _is_done(self, run_id: str) -> bool:
         """Whether the run is finished, so the user is reviewing it."""
@@ -166,11 +270,26 @@ class Session:
         return run.status is RunStatus.DONE
 
     async def _next_line(self) -> str | None:
-        """The next non-empty line, or None at the end of input."""
-        line = await self.read_line()
+        """The next non-empty line, or None at the end of input. A line held while the
+        team worked comes first, echoed as if typed now."""
+        if self._held:
+            held = self._held.pop(0)
+            self.say(f"> {held}")
+            return held
+        line = await self._read()
         while line == "":
-            line = await self.read_line()
+            line = await self._read()
         return line
+
+    async def _read(self) -> str | None:
+        """One line at a prompt: the read already in flight, or a new one."""
+        if self._ended:
+            return None
+        self.console.print("> ", end="", markup=False, highlight=False)
+        if self._reading is None:
+            self._reading = asyncio.ensure_future(self.read_line())
+        await asyncio.wait({self._reading})
+        return self._take()
 
     async def _review(self, run_id: str) -> str | None:
         """Show the finished run, and what changed since the user last reviewed it; then

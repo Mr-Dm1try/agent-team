@@ -148,7 +148,7 @@ async def test_the_review_shows_the_answers_sources(tmp_path: Path) -> None:
     app = await e2e_app(tmp_path, script=_script(_from_memory))
     console, out = _console()
     with app:
-        session = Session(app, console, plain=True, read_line=await _typed("accept"))
+        session = Session(app, console, plain=True, read_line=await _typed("accept"), listen=False)
         assert await session.start(QUESTION) == 0
     text = out.getvalue()
     assert "Sources:\n  - Project notes: notes.md\n" in text
@@ -171,7 +171,7 @@ async def test_resuming_a_done_run_reruns_nothing(tmp_path: Path) -> None:
 
     again.bus.on_after(EventName.LLM_CALL_AFTER, count)
     with again:
-        session = Session(again, console, plain=True, read_line=await _typed(None))
+        session = Session(again, console, plain=True, read_line=await _typed(None), listen=False)
         assert await session.resume(run_id) == 0
         run = await again.stores.tasks.get_run(run_id)
     after = read_events(again.runs_dir, run_id)

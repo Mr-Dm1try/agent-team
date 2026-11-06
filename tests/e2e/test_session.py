@@ -4,6 +4,7 @@ lock the session holds while it works."""
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 from collections.abc import Iterator
@@ -24,8 +25,10 @@ from agent_team import cli
 from agent_team.app import App
 from agent_team.core.control import DriveLock
 from agent_team.core.models import AgentName, DecisionKind, Event, EventName, RunStatus
+from agent_team.core.tracing import read_events
 from agent_team.llm.types import ContentBlock, LLMRequest, ToolUseBlock
-from agent_team.ui.session import Session
+from agent_team.orchestrator.conversation import HELD_REPLY
+from agent_team.ui.session import STOPPING, Session, StdinLines
 from e2e.team import asking_script, e2e_app, e2e_config, e2e_script, engineer_with_tests
 
 PAGED_PRD = dict(
@@ -121,7 +124,7 @@ async def test_a_change_request_shows_the_section_and_code_diffs(tmp_path: Path)
     console, out = _console()
     typist = Typist(app, "paginate the list", "yes", "accept")
     with app:
-        session = Session(app, console, plain=True, read_line=typist.read_line)
+        session = Session(app, console, plain=True, read_line=typist.read_line, listen=False)
         code = await session.start("Build a books API")
         (run,) = await app.stores.tasks.list_runs()
     text = out.getvalue()
@@ -153,9 +156,9 @@ async def test_accepting_right_away_shows_no_diff(tmp_path: Path) -> None:
     console, out = _console()
     typist = Typist(app, "lgtm")
     with app:
-        code = await Session(app, console, plain=True, read_line=typist.read_line).start(
-            "Build a books API"
-        )
+        code = await Session(
+            app, console, plain=True, read_line=typist.read_line, listen=False
+        ).start("Build a books API")
     text = out.getvalue()
     assert code == 0, text
     assert "What changed:" not in text
@@ -168,9 +171,9 @@ async def test_a_question_at_the_review_prompt_brings_the_prompt_back(tmp_path: 
     console, out = _console()
     typist = Typist(app, "what did you build?", "accept")
     with app:
-        code = await Session(app, console, plain=True, read_line=typist.read_line).start(
-            "Build a books API"
-        )
+        code = await Session(
+            app, console, plain=True, read_line=typist.read_line, listen=False
+        ).start("Build a books API")
     text = out.getvalue()
     assert code == 0, text
     after = text.split("Noted.", 1)[1]
@@ -193,7 +196,7 @@ async def test_a_stop_while_the_session_waits_on_the_user_stops_the_run(
         return await typist.read_line()
 
     with app:
-        session = Session(app, console, plain=True, read_line=stop_then_answer)
+        session = Session(app, console, plain=True, read_line=stop_then_answer, listen=False)
         code = await session.start("Build a books API")
         (run,) = await app.stores.tasks.list_runs()
         stops = [d for d in await app.stores.decisions.list(run.id) if d.kind is DecisionKind.STOP]
@@ -217,11 +220,164 @@ async def test_a_stop_while_the_team_works_is_logged_with_its_reason(tmp_path: P
 
     app.bus.on_after(EventName.TASK_STATE_CHANGED, stop_at_the_code)
     with app:
-        code = await Session(app, console, plain=True, read_line=Typist(app).read_line).start(
-            "Build a books API"
-        )
+        code = await Session(
+            app, console, plain=True, read_line=Typist(app).read_line, listen=False
+        ).start("Build a books API")
         (run,) = await app.stores.tasks.list_runs()
         stops = [d for d in await app.stores.decisions.list(run.id) if d.kind is DecisionKind.STOP]
     assert code == 1, out.getvalue()
     assert run.status is RunStatus.STOPPED
     assert len(stops) == 1 and "lunch" in stops[0].reason
+
+
+class MidRunTypist:
+    """Types ``mid`` while the team works, once the Engineer starts, and then each of
+    ``lines`` only once the session is at a prompt (its output ends with "> ")."""
+
+    def __init__(self, app: App, out: io.StringIO, mid: str, *lines: str | None) -> None:
+        """Watch ``app``'s bus for the Engineer and ``out`` for the prompt."""
+        self.out = out
+        self.mid: str | None = mid
+        self.lines = _lines(*lines)
+        self.seen = 0  # how much output there was when the last line was typed
+        self.engineer = asyncio.Event()
+        app.bus.on_after(EventName.TASK_STATE_CHANGED, self._on_state)
+
+    async def _on_state(self, event: Event) -> None:
+        """Let the typed line through when the Engineer first starts, and give the
+        session time to read it before the Engineer's next model call, as a real
+        model call would."""
+        engineer = event.agent is AgentName.ENGINEER and event.data.get("to") == "running"
+        if engineer and not self.engineer.is_set():
+            self.engineer.set()
+            await asyncio.sleep(0.05)
+
+    async def read_line(self) -> str | None:
+        """The mid-run line first, then the prompt lines."""
+        async with asyncio.timeout(10):
+            if self.mid is not None:
+                await self.engineer.wait()
+                line, self.mid = self.mid, None
+                return line
+            while not self._at_prompt():  # noqa: ASYNC110 (the console has no event)
+                await asyncio.sleep(0.005)
+            self.seen = len(self.out.getvalue())
+            return next(self.lines)
+
+    def _at_prompt(self) -> bool:
+        """Whether the session printed a new prompt since the last line was typed."""
+        text = self.out.getvalue()
+        return len(text) > self.seen and text.endswith("> ")
+
+
+async def test_typing_stop_while_the_team_works_stops_the_run(tmp_path: Path) -> None:
+    app = await e2e_app(tmp_path)
+    console, out = _console()
+    calls: list[str] = []
+
+    async def count(event: Event) -> None:
+        """Note each agent's model calls."""
+        calls.append(event.agent.value if event.agent else "-")
+
+    app.bus.on_after(EventName.LLM_CALL_AFTER, count)
+    typist = MidRunTypist(app, out, "stop the run")
+    with app:
+        code = await Session(app, console, plain=True, read_line=typist.read_line).start(
+            "Build a books API"
+        )
+        (run,) = await app.stores.tasks.list_runs()
+        stops = [d for d in await app.stores.decisions.list(run.id) if d.kind is DecisionKind.STOP]
+        qa = [t for t in await app.stores.tasks.list_tasks(run.id) if t.agent is AgentName.QA]
+    text = out.getvalue()
+    assert code == 1, text
+    assert STOPPING in text
+    assert run.status is RunStatus.STOPPED
+    assert len(stops) == 1 and "typed stop" in stops[0].reason
+    # Stopped at the Engineer's first model call: it never answered, and QA never ran.
+    assert "engineer" not in calls
+    assert qa and all(t.started_at is None for t in qa)
+
+
+async def test_a_question_typed_while_the_team_works_is_answered_under_the_view(
+    tmp_path: Path,
+) -> None:
+    script = e2e_script()
+    default = orchestrator_responder()
+
+    def message(request: LLMRequest) -> list[ContentBlock] | str:
+        """Answer the progress question; otherwise answer like the default."""
+        said, _ = read_message(request)
+        if said == "how is it going?":
+            return message_reply("The engineer is writing the code now.", "run_question")
+        return default(request)
+
+    script[AgentName.ORCHESTRATOR] = orchestrator_responder(message=message)
+    app = await e2e_app(tmp_path, script=script)
+    console, out = _console()
+    typist = MidRunTypist(app, out, "how is it going?", "accept")
+    with app:
+        code = await Session(app, console, plain=True, read_line=typist.read_line).start(
+            "Build a books API"
+        )
+        (run,) = await app.stores.tasks.list_runs()
+    text = out.getvalue()
+    assert code == 0, text
+    assert run.status is RunStatus.DONE
+    # The answer printed while the team worked, before the run finished.
+    answered = text.index("The engineer is writing the code now.")
+    assert answered < text.index(f"run {run.id} finished")
+    said = [e for e in read_events(app.runs_dir, run.id) if e.name is EventName.USER_MESSAGE]
+    assert said[0].data == {"text": "how is it going?", "while_working": True}
+    assert "Accepted. Run" in text
+
+
+async def test_a_change_typed_while_the_team_works_waits_until_it_stops(
+    tmp_path: Path,
+) -> None:
+    app = await e2e_app(tmp_path, script=_paging_script())
+    console, out = _console()
+    typist = MidRunTypist(app, out, "paginate the list", "yes", "accept")
+    with app:
+        code = await Session(app, console, plain=True, read_line=typist.read_line).start(
+            "Build a books API"
+        )
+    text = out.getvalue()
+    assert code == 0, text
+    held = text.index(HELD_REPLY)
+    # Held while the team worked, then sent once the run was done and shown.
+    assert held < text.index("Audit report:") < text.index("> paginate the list")
+    assert "Go ahead? (yes or no)" in text
+    assert "prd v1 → v2:" in text.split("What changed:\n", 1)[1]
+    assert "Accepted. Run" in text
+
+
+async def test_a_reply_while_the_team_works_prints_under_the_live_tree(tmp_path: Path) -> None:
+    script = e2e_script()
+    default = orchestrator_responder()
+
+    def message(request: LLMRequest) -> list[ContentBlock] | str:
+        """Answer the progress question; otherwise answer like the default."""
+        said, _ = read_message(request)
+        if said == "how is it going?":
+            return message_reply("The engineer is writing the code now.", "run_question")
+        return default(request)
+
+    script[AgentName.ORCHESTRATOR] = orchestrator_responder(message=message)
+    app = await e2e_app(tmp_path, script=script)
+    out = io.StringIO()
+    console = Console(file=out, width=120, color_system=None, force_terminal=True)
+    typist = MidRunTypist(app, out, "how is it going?", "accept")
+    with app:
+        code = await Session(app, console, read_line=typist.read_line).start("Build a books API")
+    text = out.getvalue()
+    assert code == 0, text
+    # The tree printed once when the view stopped for the reply, then the reply.
+    reply = text.index("The engineer is writing the code now.")
+    assert text.rfind("run run_", 0, reply) >= 0 and "engineer" in text[:reply]
+    assert "Accepted. Run" in text[reply:]
+
+
+async def test_stdin_lines_are_read_on_a_thread(monkeypatch: Any) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO("first\n  second  \n"))
+    read = StdinLines()
+    assert [await read(), await read(), await read()] == ["first", "second", None]
