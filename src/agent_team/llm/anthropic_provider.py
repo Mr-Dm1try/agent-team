@@ -180,6 +180,8 @@ class AnthropicProvider:
                 {"name": t.name, "description": t.description, "input_schema": t.input_schema}
                 for t in request.tools
             ]
+            if request.tool_choice == "none":
+                params["tool_choice"] = {"type": "none"}
         thinking = dict(self.config.thinking)
         if self._binding:
             thinking["block_binding"] = {"prefix_mismatch_behavior": self.config.on_history_edit}

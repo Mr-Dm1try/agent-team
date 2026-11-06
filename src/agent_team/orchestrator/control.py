@@ -5,7 +5,6 @@ the user. Code validates every call; a bad call is an error result, never an act
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +21,8 @@ from agent_team.core.interfaces import (
 )
 from agent_team.core.models import (
     AgentName,
+    Event,
+    EventName,
     Phase,
     Run,
     Task,
@@ -29,6 +30,7 @@ from agent_team.core.models import (
     TaskStatus,
     ToolResult,
 )
+from agent_team.core.tracing import cut_strings, format_event
 from agent_team.llm.types import ToolSpec
 
 USER_OUTPUT = "user_answer"
@@ -245,43 +247,115 @@ class ListDecisions:
         return ToolResult(content="\n".join(lines) or "no decisions yet")
 
 
+#: Events read_trace leaves out unless asked for by name: bookkeeping, not what happened.
+TRACE_NOISE = frozenset(
+    {EventName.CHECKPOINT_SAVED, EventName.SPAN_STARTED, EventName.SPAN_FINISHED}
+)
+#: The most characters read_trace returns; older lines go first.
+TRACE_CHARS = 6_000
+#: Longest string kept from an event's data in a summary line, and in a full line.
+TRACE_SUMMARY_CHARS = 120
+TRACE_FULL_CHARS = 1_000
+
+
 class ReadTrace:
-    """Reads runs/<run_id>/logs/events.jsonl, written by the tracer hook."""
+    """Reads runs/<run_id>/logs/events.jsonl, written by the tracer hook. By default
+    each event is one short line and bookkeeping events are left out, so a few calls
+    can't fill the context; ``full`` gives the events' JSON instead."""
 
     def __init__(self) -> None:
         """Read-only, so it is safe to repeat on resume."""
         self.safe_to_repeat = True
         self.spec = ToolSpec(
             name="read_trace",
-            description="Recent events from the run's trace, optionally for one task.",
+            description=(
+                "Recent events from the run's trace, one short line each, newest last. "
+                "Narrow it with task_id, agent, event names or errors_only; pass full "
+                "for an event's JSON. Prefer list_tasks, get_task and get_verdicts, "
+                "which already say how each task went."
+            ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
-                    "limit": {"type": "integer", "description": "Default 50"},
+                    "agent": {"type": "string", "enum": [a.value for a in AgentName]},
+                    "events": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": [e.value for e in EventName]},
+                    },
+                    "errors_only": {"type": "boolean", "description": "Warnings and errors"},
+                    "full": {"type": "boolean", "description": "Each event's JSON"},
+                    "limit": {"type": "integer", "description": "Default 30"},
                 },
             },
         )
 
     async def __call__(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        """The last events from the run's events.jsonl, optionally for one task."""
+        """The run's last matching events, as short lines (or JSON), within
+        ``TRACE_CHARS``."""
+        name = self.spec.name
         path = Path(ctx.run.workspace).parent / "logs" / "events.jsonl"
         if not path.is_file():
             return ToolResult(content="no trace file yet", is_error=True)
-        limit = args.get("limit", 50)
-        if not isinstance(limit, int) or limit <= 0:
-            limit = 50
-        task_id = args.get("task_id")
-        lines = []
+        limit = args.get("limit", 30)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            limit = 30
+        task_id = str_arg(args, "task_id", name, required=False)
+        agent = str_arg(args, "agent", name, required=False)
+        wanted = args.get("events") or []
+        if not isinstance(wanted, list):
+            raise ToolError("events must be a list of event names", tool=name)
+        try:
+            names = {EventName(str(w)) for w in wanted}
+        except ValueError as exc:
+            raise ToolError(str(exc), tool=name) from exc
+        errors_only, full = bool(args.get("errors_only")), bool(args.get("full"))
+        found: list[str] = []
         for raw in path.read_text(encoding="utf-8").splitlines():
             try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
+                event = Event.model_validate_json(raw)
+            except ValueError:
                 continue
-            if task_id and event.get("task_id") != task_id:
+            if task_id and event.task_id != task_id:
                 continue
-            lines.append(raw)
-        return ToolResult(content="\n".join(lines[-limit:]) or "no matching events")
+            if agent and (event.agent is None or event.agent.value != agent):
+                continue
+            if names and event.name not in names:
+                continue
+            if not names and event.name in TRACE_NOISE:
+                continue
+            if errors_only and event.level not in ("warning", "error"):
+                continue
+            found.append(_trace_line(event, full=full))
+        return ToolResult(content=_fit(found[-limit:]), data={"matched": len(found)})
+
+
+def _trace_line(event: Event, *, full: bool) -> str:
+    """One event for read_trace: a short summary line, or its JSON with long strings
+    cut."""
+    if full:
+        data = cut_strings(event.data, TRACE_FULL_CHARS, one_line=False)
+        cut = event.model_copy(update={"data": data})
+        return cut.model_dump_json(exclude_none=True)
+    return format_event(event, TRACE_SUMMARY_CHARS)
+
+
+def _fit(lines: list[str]) -> str:
+    """The newest lines that fit in ``TRACE_CHARS``, saying how many older ones were
+    left out."""
+    kept: list[str] = []
+    size = 0
+    for line in reversed(lines):
+        if kept and size + len(line) + 1 > TRACE_CHARS:
+            break
+        kept.append(line[:TRACE_CHARS])
+        size += len(line) + 1
+    kept.reverse()
+    if not kept:
+        return "no matching events"
+    dropped = len(lines) - len(kept)
+    head = [f"[{dropped} older events left out; narrow the filters to see them]"]
+    return "\n".join((head if dropped else []) + kept)
 
 
 class CreateTask:

@@ -666,3 +666,80 @@ async def test_an_unclear_message_with_no_run_starts_nothing(tmp_path: Path) -> 
     reply = await team.orch.handle("make me something with books")
     assert reply.text == "Do you want an API or a CLI?"
     assert await team.tasks.list_runs() == []
+
+
+def _results(request: LLMRequest) -> list[ToolResultBlock]:
+    """Every tool result the message loop has read so far."""
+    return [
+        b
+        for m in request.messages
+        if m.role == "user"
+        for b in m.content
+        if isinstance(b, ToolResultBlock)
+    ]
+
+
+def _keeps_reading() -> Responder:
+    """A model that reads the run's history call after call, as Haiku did in rehearsal,
+    and then tries to answer an escalation from long ago; it replies only when it may
+    not call a tool, from what it read."""
+    reads: list[tuple[str, dict[str, Any]]] = [
+        ("list_tasks", {}),
+        ("get_task", {}),
+        ("get_verdicts", {}),
+        ("read_trace", {}),
+        ("read_trace", {"errors_only": True}),
+        ("list_decisions", {}),
+    ]
+
+    def respond(request: LLMRequest) -> list[ContentBlock] | str:
+        """The next read; the answer once tools are taken away."""
+        read = _results(request)
+        if request.tool_choice == "none":
+            listing = read[0].content
+            attempts = re.search(r"product done attempt (\d+)/(\d+)", listing)
+            assert attempts, listing
+            return message_reply(
+                f"Product needed {attempts[1]} of its {attempts[2]} attempts.", "run_question"
+            )
+        if len(read) < len(reads):
+            name, args = reads[len(read)]
+            if name in ("get_task", "get_verdicts"):
+                args = {"task_id": read[0].content.split()[0]}
+            return tool_call(name, args)
+        return tool_call("answer_pending", {"task_id": "task_36b69e6e40054d94", "text": "retry"})
+
+    return respond
+
+
+async def test_a_history_question_on_a_done_run_is_answered_from_the_store(
+    tmp_path: Path,
+) -> None:
+    team = await _team(tmp_path, _keeps_reading())
+    done = await team.orch.handle("Build a books API")
+    assert done.kind == "done" and done.run_id
+    before = len(team.llm.requests)
+    reply = await team.orch.handle("Why did the engineer need four attempts?", run_id=done.run_id)
+    calls = [r for r in team.llm.requests[before:] if r.system.startswith("You are the orch")]
+    assert "didn't catch" not in reply.text
+    assert reply.text == "Product needed 1 of its 3 attempts."
+    # Five tool rounds, then a call that may only reply; nothing waits, so the tools
+    # never offer answer_pending.
+    assert [r.tool_choice for r in calls] == ["auto"] * 5 + ["none"]
+    assert all("answer_pending" not in {t.name for t in r.tools} for r in calls)
+    assert "no answer_pending tool" in _prompt(calls[0])
+    assert (await team.tasks.get_run(done.run_id)).status is RunStatus.DONE
+
+
+async def test_answer_pending_is_offered_while_something_waits(tmp_path: Path) -> None:
+    offered: list[set[str]] = []
+
+    def message(request: LLMRequest) -> list[ContentBlock] | str:
+        """Note the tools, then reply."""
+        offered.append({t.name for t in request.tools})
+        return message_reply("Noted.")
+
+    team = await _team(tmp_path, message, QUESTIONS[:1])
+    reply = await team.orch.handle("Build a books API")
+    await team.orch.handle("what is it asking?", run_id=reply.run_id)
+    assert offered and "answer_pending" in offered[0]

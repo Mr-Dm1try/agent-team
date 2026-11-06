@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from agents.fakes import FakeBus
 
 from agent_team.core.errors import ToolError
 from agent_team.core.interfaces import ToolContext
-from agent_team.core.models import AgentName, Phase, RequestKind, Task, TaskStatus
-from agent_team.orchestrator.control import control_tools
+from agent_team.core.models import (
+    AgentName,
+    Event,
+    EventName,
+    Phase,
+    RequestKind,
+    Task,
+    TaskStatus,
+)
+from agent_team.orchestrator.control import TRACE_CHARS, control_tools
 from agent_team.orchestrator.phases import PhaseMachine
 from orchestrator.harness import make_team
 
@@ -135,3 +145,62 @@ def test_phase_machine() -> None:
     question = task(Phase.PRD, AgentName.USER, TaskStatus.WAITING)
     assert build.current([plan, prd, question]) is Phase.PRD
     assert PhaseMachine(RequestKind.RESEARCH_QUESTION).phases == (Phase.PLANNING,)
+
+
+def _trace(ctx: ToolContext, events: list[Event]) -> None:
+    """Write ``events`` as the run's trace."""
+    logs = Path(ctx.run.workspace).parent / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "events.jsonl").write_text("".join(e.model_dump_json() + "\n" for e in events))
+
+
+def _event(ctx: ToolContext, name: EventName, **kw: Any) -> Event:
+    """An event of the context's run and task."""
+    return Event(name=name, run_id=ctx.run.id, task_id=ctx.task.id, attempt=1, **kw)
+
+
+async def test_read_trace_gives_one_short_line_per_event(tmp_path: Path) -> None:
+    _team, tools, ctx = await _ctx(tmp_path)
+    page = "x" * 5_000
+    _trace(
+        ctx,
+        [
+            _event(ctx, EventName.CHECKPOINT_SAVED, level="debug", data={"step": 1}),
+            _event(ctx, EventName.SPAN_STARTED, data={"name": "attempt 1"}),
+            _event(
+                ctx,
+                EventName.TOOL_CALL_AFTER,
+                agent=AgentName.RESEARCHER,
+                data={"tool": "web_fetch", "result": page},
+            ),
+            _event(ctx, EventName.ERROR, level="error", data={"error": "boom"}),
+        ],
+    )
+    out = (await tools["read_trace"]({}, ctx)).content.splitlines()
+    # Bookkeeping is left out, and the fetched page is cut to a short line.
+    assert [line.split()[3] for line in out] == ["tool_call_after", "error"]
+    assert len(out[0]) < 400 and "web_fetch" in out[0]
+    errors = await tools["read_trace"]({"errors_only": True}, ctx)
+    assert "boom" in errors.content and "web_fetch" not in errors.content
+    named = await tools["read_trace"]({"events": ["checkpoint_saved"]}, ctx)
+    assert "checkpoint_saved" in named.content and named.data == {"matched": 1}
+    full = await tools["read_trace"]({"events": ["tool_call_after"], "full": True}, ctx)
+    data = json.loads(full.content)["data"]
+    assert data["tool"] == "web_fetch" and len(data["result"]) == 1_003  # 1000 and "..."
+    by_agent = await tools["read_trace"]({"agent": "qa"}, ctx)
+    assert by_agent.content == "no matching events"
+    with pytest.raises(ToolError):
+        await tools["read_trace"]({"events": ["not_an_event"]}, ctx)
+
+
+async def test_read_trace_keeps_the_newest_lines_within_its_cap(tmp_path: Path) -> None:
+    _team, tools, ctx = await _ctx(tmp_path)
+    many = [
+        _event(ctx, EventName.ERROR, level="error", data={"error": f"e{i} " + "y" * 200})
+        for i in range(200)
+    ]
+    _trace(ctx, many)
+    out = (await tools["read_trace"]({"limit": 200}, ctx)).content
+    assert len(out) <= TRACE_CHARS + 100
+    assert out.startswith("[") and "older events left out" in out.splitlines()[0]
+    assert "e199 " in out and "e0 " not in out

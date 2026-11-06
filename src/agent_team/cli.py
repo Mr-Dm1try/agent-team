@@ -13,12 +13,11 @@ there instead of in the shell. Variables already set in the shell win.
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 import typer
 from dotenv import load_dotenv
@@ -33,9 +32,16 @@ from agent_team.core.db import Database
 from agent_team.core.errors import SandboxError
 from agent_team.core.events import InMemoryEventBus
 from agent_team.core.interfaces import Embedder
-from agent_team.core.models import Event, MemoryKind, RunStatus
+from agent_team.core.models import MemoryKind, RunStatus
 from agent_team.core.stores import SqliteDecisionLog, SqliteTaskStore
-from agent_team.core.tracing import JsonlTracer, load_spans, read_events, render_tree, span_tree
+from agent_team.core.tracing import (
+    JsonlTracer,
+    format_event,
+    load_spans,
+    read_events,
+    render_tree,
+    span_tree,
+)
 from agent_team.llm.chaos import parse_chaos
 from agent_team.memory import open_search
 from agent_team.memory.rank import line
@@ -331,26 +337,6 @@ async def _stats(config: Config, run_id: str | None) -> int:
 def _no_run(config: Config, run_id: str) -> str:
     """The message for a run id the database doesn't have, naming where it looked."""
     return f"No run {run_id} in {config.paths.db_file()}."
-
-
-def format_event(event: Event) -> str:
-    """One log line: time, agent, task and attempt, event name and its data."""
-    who = event.agent.value if event.agent else "-"
-    where = f"{event.task_id}#{event.attempt}" if event.task_id else "-"
-    data = json.dumps(_short(event.data), ensure_ascii=False, default=str)
-    return f"{event.ts:%H:%M:%S.%f}"[:-3] + f"  {who:<12} {where:<24} {event.name.value}  {data}"
-
-
-def _short(value: Any, limit: int = 200) -> Any:
-    """``value`` with long strings cut, so one event stays on one readable line."""
-    if isinstance(value, str):
-        value = value.replace("\n", " ")
-        return value if len(value) <= limit else value[:limit] + "..."
-    if isinstance(value, dict):
-        return {k: _short(v, limit) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_short(v, limit) for v in value]
-    return value
 
 
 if __name__ == "__main__":

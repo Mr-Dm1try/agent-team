@@ -115,6 +115,28 @@ def read_events(
     return events
 
 
+def format_event(event: Event, limit: int = 200) -> str:
+    """One log line: time, agent, task and attempt, event name and its data, with every
+    string in the data cut to ``limit`` characters."""
+    who = event.agent.value if event.agent else "-"
+    where = f"{event.task_id}#{event.attempt}" if event.task_id else "-"
+    data = json.dumps(cut_strings(event.data, limit), ensure_ascii=False, default=str)
+    return f"{event.ts:%H:%M:%S.%f}"[:-3] + f"  {who:<12} {where:<24} {event.name.value}  {data}"
+
+
+def cut_strings(value: Any, limit: int, *, one_line: bool = True) -> Any:
+    """``value`` with every string longer than ``limit`` cut, and with ``one_line``
+    its newlines made spaces, so one event stays on one readable line."""
+    if isinstance(value, str):
+        value = value.replace("\n", " ") if one_line else value
+        return value if len(value) <= limit else value[:limit] + "..."
+    if isinstance(value, dict):
+        return {k: cut_strings(v, limit, one_line=one_line) for k, v in value.items()}
+    if isinstance(value, list):
+        return [cut_strings(v, limit, one_line=one_line) for v in value]
+    return value
+
+
 # --- spans -------------------------------------------------------------------------
 
 

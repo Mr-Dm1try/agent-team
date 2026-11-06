@@ -132,6 +132,19 @@ async def test_anthropic_translates_request_and_response() -> None:
     assert (resp.usage.input_tokens, resp.usage.output_tokens) == (11, 7)
 
 
+async def test_anthropic_sends_tool_choice_none_for_a_reply_only_call() -> None:
+    messages = StubAnthropicMessages(sdk_message())
+    provider = ap.AnthropicProvider(client=anthropic_client(messages))
+    await provider.complete(request(messages=HISTORY, tools=TOOLS), model="claude-haiku-5-5")
+    await provider.complete(
+        request(messages=HISTORY, tools=TOOLS, tool_choice="none"), model="claude-haiku-5-5"
+    )
+    auto, none = messages.calls
+    assert "tool_choice" not in auto
+    # The tools still go, since the history holds tool calls; the model may only reply.
+    assert none["tool_choice"] == {"type": "none"} and none["tools"] == auto["tools"]
+
+
 async def test_anthropic_streams_calls_that_may_write_a_long_reply() -> None:
     messages = StubAnthropicMessages(sdk_message())
     provider = ap.AnthropicProvider(client=anthropic_client(messages))

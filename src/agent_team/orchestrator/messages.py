@@ -64,8 +64,9 @@ CHANGE_TARGETS = ("plan", "prd", "spec", "code_change")
 #: Preferences one message may state, and the longest one kept.
 MAX_PREFERENCES = 3
 MAX_PREFERENCE_CHARS = 300
-#: About six tool turns: each turn is a model step and a tool step, plus the reply.
-SETTINGS = LoopSettings(max_steps=13, max_repairs=1)
+#: Five tool turns (each a model step and a tool step), then a turn that can only
+#: reply, and room to repair that reply once.
+SETTINGS = LoopSettings(max_steps=15, max_repairs=1, final_reply=True)
 
 #: A typed confirmation that agrees ("yes", "yes, go ahead", "sure, do it").
 YES = re.compile(
@@ -281,7 +282,9 @@ class _Actions:
         return {a.args["task_id"] for a in self.actions if a.tool == tool}
 
     def tools(self) -> dict[str, Tool]:
-        """The action tools, keyed by name."""
+        """The action tools, keyed by name. answer_pending is offered only while
+        something waits on the user, so an old, answered question can't be answered
+        again."""
         made = [
             _Tool(
                 _spec(
@@ -337,7 +340,7 @@ class _Actions:
                 safe=False,
             ),
         ]
-        return {t.spec.name: t for t in made}
+        return {t.spec.name: t for t in made if self.pending or t.spec.name != "answer_pending"}
 
     def answer_pending(self, args: dict[str, Any]) -> ToolResult:
         """The task must be waiting on the user and not answered yet in this message; a
@@ -434,7 +437,10 @@ def prompt(message: str, run: Run | None, pending: list[tuple[Task, str]]) -> st
         items = "\n".join(f"- task_id={t.id}, asked by {who}: {t.objective}" for t, who in pending)
         waiting = f"Waiting on the user:\n{items}"
     else:
-        waiting = "Nothing is waiting on the user."
+        waiting = (
+            "Nothing is waiting on the user, so there is no answer_pending tool: questions "
+            "and escalations in the run's history are already answered."
+        )
     return f"{state}\n\n{waiting}\n\nThe user's message:\n{message}"
 
 

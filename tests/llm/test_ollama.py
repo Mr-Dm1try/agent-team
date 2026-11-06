@@ -414,6 +414,16 @@ async def test_an_answer_without_a_limit_or_a_loaded_model_is_asked_once() -> No
     assert await provider.window("gpt-oss:20b") == 32_768
 
 
+async def test_ollama_sends_no_tools_for_a_reply_only_call() -> None:
+    provider, _ = ollama(counted(0))
+    auto, _ = await provider._body(request(tools=TOOLS), "gpt-oss:20b", None, stream=False)
+    none, _ = await provider._body(
+        request(tools=TOOLS, tool_choice="none"), "gpt-oss:20b", None, stream=False
+    )
+    assert auto["tools"][0]["function"]["name"] == "read"
+    assert "tools" not in none  # Ollama has no tool choice
+
+
 async def test_ollama_timeout_grows_with_the_reply_it_may_write() -> None:
     provider, _ = ollama(counted(0))
     body, short = await provider._body(request(max_tokens=1_000), "gpt-oss:20b", None, stream=False)

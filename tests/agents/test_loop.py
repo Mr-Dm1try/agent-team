@@ -10,7 +10,13 @@ from llm.test_ollama import error, ollama
 
 from agent_team.agents import Engineer, Product
 from agent_team.agents.compaction import Compactor
-from agent_team.agents.loop import INTERRUPTED_NOTE, STEPS_LEFT_NOTE, LoopSettings, ToolLoop
+from agent_team.agents.loop import (
+    FINAL_REPLY_NOTE,
+    INTERRUPTED_NOTE,
+    STEPS_LEFT_NOTE,
+    LoopSettings,
+    ToolLoop,
+)
 from agent_team.core.artifacts import CodeChange, ResearchBrief
 from agent_team.core.errors import BudgetExceeded
 from agent_team.core.interfaces import AgentContext, ToolContext
@@ -610,7 +616,9 @@ async def test_repair_prompt_allows_a_tool_call_first(tmp_path: Path) -> None:
     )
 
 
-def _reading_loop(tmp_path: Path, llm: FakeLLM, max_steps: int) -> ToolLoop[ResearchBrief]:
+def _reading_loop(
+    tmp_path: Path, llm: FakeLLM, max_steps: int, *, final_reply: bool = False
+) -> ToolLoop[ResearchBrief]:
     """A Researcher loop over ``llm`` with the file tools, ``max_steps`` long."""
     env = envelope(tmp_path, AgentName.RESEARCHER, "research_brief")
     (Path(env.run.workspace) / "notes.md").write_text("notes\n")
@@ -627,7 +635,7 @@ def _reading_loop(tmp_path: Path, llm: FakeLLM, max_steps: int) -> ToolLoop[Rese
         run=env.run,
         task_id=env.task.id,
         attempt=1,
-        settings=LoopSettings(max_steps=max_steps),
+        settings=LoopSettings(max_steps=max_steps, final_reply=final_reply),
     )
 
 
@@ -649,6 +657,35 @@ async def test_the_model_is_told_to_write_its_output_when_few_steps_are_left(
     # (index 8) is told it has one turn left; the note is given once.
     assert told == [8]
     assert _notes(llm.requests[8]) == [STEPS_LEFT_NOTE.format(turns=1)]
+
+
+async def test_a_loop_near_its_step_limit_gets_a_reply_only_turn(tmp_path: Path) -> None:
+    """A model that would keep reading is called with tool choice "none" once only the
+    steps for a reply and its repairs are left, so the attempt ends with an answer."""
+    read = tool_call("read_file", {"path": "notes.md"})
+
+    def researcher(request: LLMRequest) -> Any:
+        """Read again whenever a tool may be called; reply only when it can't."""
+        return json.dumps(BRIEF) if request.tool_choice == "none" else read
+
+    llm = FakeLLM({AgentName.RESEARCHER: researcher})
+    loop = _reading_loop(tmp_path, llm, max_steps=15, final_reply=True)
+    outcome = await loop.run_loop(Message.user("go"))
+    assert outcome.output is not None, outcome.error
+    choices = [r.tool_choice for r in llm.requests]
+    # 15 steps and 2 repairs: forced once 6 are left, after the 4th tool round (step 9).
+    assert choices == ["auto"] * 4 + ["none"]
+    last = llm.requests[-1].messages[-1].content
+    assert [b.text for b in last if isinstance(b, TextBlock)] == [FINAL_REPLY_NOTE]
+    assert llm.requests[-1].tools  # still sent: the history holds tool calls
+
+
+async def test_without_final_reply_every_call_may_use_tools(tmp_path: Path) -> None:
+    read = tool_call("read_file", {"path": "notes.md"})
+    llm = FakeLLM({AgentName.RESEARCHER: lambda request: read})
+    outcome = await _reading_loop(tmp_path, llm, max_steps=9).run_loop(Message.user("go"))
+    assert outcome.output is None
+    assert {r.tool_choice for r in llm.requests} == {"auto"}
 
 
 async def test_an_ollama_tool_call_error_takes_no_loop_step(tmp_path: Path) -> None:

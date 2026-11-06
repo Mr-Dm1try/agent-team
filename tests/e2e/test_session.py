@@ -139,7 +139,7 @@ async def test_a_change_request_shows_the_section_and_code_diffs(tmp_path: Path)
     assert "code: code_change v1 → v2:" in changed
     assert "-print('books')" in changed and "+print('books, 20 per page')" in changed
     assert text.rstrip().endswith(
-        "is done.\nOutside any run: 2 model calls · fake 1.7k in / 19 out · $0.0000"
+        "is done.\nOutside any run: 2 model calls · fake 1.9k in / 19 out · $0.0000"
     )
     assert "Accepted. Run" in text
     # The session held the run's lock while the team worked, and let go at prompts.
