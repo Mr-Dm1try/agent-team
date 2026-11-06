@@ -67,7 +67,7 @@ There's no agent framework. The brief lets us use any harness or SDK, but it gra
 | Language and packaging | Python 3.12 with uv | One lock file and fast installs; `uv run agent-team` starts it |
 | Concurrency and streaming | asyncio (standard library) | Runs independent tasks in parallel and streams events to the CLI |
 | Claude models | anthropic SDK, with Claude Haiku 5.5 by default and Sonnet 5.5 where an agent needs more | Official client with streaming, tool use and retries. Haiku costs $0.10 in and $0.50 out per million tokens, a few cents per run (estimate); Sonnet costs $2 and $10 |
-| Local models and embeddings | openai SDK pointed at Ollama, running gpt-oss-20b or Qwen3 14B | Ollama serves an OpenAI-compatible API, so one client covers chat and embeddings. Covers the open-source and local model bonuses |
+| Local models and embeddings | httpx against Ollama's native API, running gpt-oss-20b or Qwen3 14B | The native /api/chat honours the context window we ask for, which the OpenAI-compatible endpoint ignores; /api/embed covers embeddings. Covers the open-source and local model bonuses |
 | Schemas and config | Pydantic v2 and PyYAML | Agent outputs, task envelopes and the routing file, all validated |
 | Storage | sqlite3 (standard library) with WAL and FTS5 | Runs, tasks, artifacts, checkpoints, rules and memory in one file |
 | Memory search | numpy | Exact cosine similarity over a few thousand vectors |
@@ -100,6 +100,12 @@ The team is one orchestrator, five experts and an auditor, and every expert retu
 - run\_command and install\_deps only work inside the Docker sandbox. install\_deps is the one step with the network on, and it takes only plain package specifiers, so the pre-check sees every package it installs.
 
 Context is gathered up front, but not only once. If the Architect or Engineer hits a gap, it returns a research request instead of guessing, and the orchestrator turns that into a new Researcher task.
+
+**Research requests are bounded.** Without limits, research fans out: in one demo run four planned questions became 22 requested tasks, many of them the same question, and planning never ended. So:
+
+- A request that repeats a question the run already asked is answered by that task. Questions match on their content words (with filler such as "the official docs" dropped), at 70% overlap. A finished brief joins the asker's inputs, and an open requested task is waited for. A question another planned task is still researching, or one whose answer is already in the asker's inputs, is refused.
+- A task made from a request can't ask for more (`limits.max_research_depth`, 1), and a run makes at most `limits.max_research_tasks` (6) requested tasks.
+- Past a limit, the request is refused, the decision log says why, and the task is told to answer with what it has. A refused task may not ask again. A task that may not ask is told so in its envelope, and any request it still files is turned into what is still open: an unanswered question with its gap in a brief, or a question with an assumption elsewhere.
 
 Every expert also reads the feedback on its own work: your answers to its questions, your comments on its last version and the auditor's findings. See Questions and feedback below.
 
@@ -149,7 +155,7 @@ A retry goes back to Ready with the audit findings attached, and a task with no 
 
 **Delegation.** The orchestrator never calls an agent directly. It gives the dispatcher a task envelope with the objective, input artifacts, output schema, constraints, fetched memories and trace context. The dispatcher runs the agent with a timeout, catches errors, logs every step, and returns a result with a status, the artifact, token usage and any errors. Independent tasks run in parallel with asyncio, for example several research questions at once. Within a run, Engineer tasks run one at a time, since they share the run's workspace. Experts never call each other or create tasks: they return an artifact plus any questions or research requests, and only the orchestrator turns those into new tasks.
 
-**Artifacts and lineage.** Artifacts are versioned files under runs/\<run\_id>/artifacts, such as plan.v1.json and prd.v2.json. Each one records the versions it was built from and the task that wrote it. Versions are numbered per kind across the run, so two research questions share one counter; a revision's previous version is the latest one its own line of work wrote (the task and the tasks it was reopened from), never a sibling's. When a change request produces a new PRD, everything built from the old one is marked stale and its tasks are queued again as updates, while unaffected work is kept.
+**Artifacts and lineage.** Artifacts are versioned files under runs/\<run\_id>/artifacts, such as plan.v1.json and prd.v2.json. Each one records the versions it was built from and the task that wrote it. Versions are numbered per kind across the run, so two research questions share one counter; a revision's previous version is the latest one its own line of work wrote (the task and the tasks it was reopened from), never a sibling's. A line of work starts at a task that is new work: a planned task, or one made from a research request, a question or a check. Such a task has a parent but doesn't redo it, so its first output has no previous version, and it gets neither the parent's output nor its findings. When a change request produces a new PRD, everything built from the old one is marked stale and its tasks are queued again as updates, while unaffected work is kept.
 
 **Updates, not rebuilds.** A stale task re-runs as a revision, never from scratch. The agent gets its previous output, a diff of what changed upstream and the reason, such as a change request or your comment, and is asked to change only what that diff requires.
 
@@ -167,7 +173,7 @@ A retry goes back to Ready with the audit findings attached, and a task with no 
 - If a new request looks like a change to an existing run, it asks whether to apply it there or start fresh.
 - You can switch mid-session by asking, or with /runs, /switch and /new. The current run pauses at the next safe point between tasks, and the other run picks up with its open questions and pending reviews.
 - The active run's title shows in the prompt, so you always know where a message goes.
-- One run executes at a time. The long-term store from the Memory section is shared across runs: lessons and preferences apply everywhere, while decisions and research facts are tagged with their run and fetched elsewhere only on a strong match. Workspaces, artifacts and conversations stay with their own run.
+- One run executes at a time. The long-term store from the Memory section is shared across runs: lessons and preferences apply everywhere (a lesson only to the agent that learned it), while decisions and research facts are tagged with their run and fetched elsewhere only on a strong match. Workspaces, artifacts and conversations stay with their own run.
 - Resuming after a crash works the same way as continuing a run.
 
 **Checkpoints.** Each attempt saves its message history after every model or tool step, so a crash mid-attempt loses at most the step in flight.
@@ -290,7 +296,7 @@ In other words, it is RAG over our own memory store. It differs from typical RAG
 For each task, step by step:
 
 1. **Build the query.** Use fixed fields only, with no model call, so the same task always builds the same query: the task's objective, agent and phase plus the titles of its input artifacts, for example "Engineer, implementation, FastAPI endpoints for books, SQLite".
-2. **Filter.** Keep only the kinds that agent uses, such as lessons, decisions and preferences for the Engineer, and drop decisions and facts from other runs unless they match strongly.
+2. **Filter.** Keep only the kinds that agent uses, such as lessons, decisions and preferences for the Engineer, drop decisions and facts from other runs unless they match strongly, and drop lessons another agent learned: an Engineer's R6 fix says nothing to a Researcher.
 3. **Search.** Embed the query with a local embedding model and compare it with each memory's stored vector, and also score exact terms with BM25 from SQLite's full-text index. Both are deterministic: the same query against the same store returns the same results.
 4. **Rank.** Combine the meaning and keyword scores with recency and usefulness, and keep the best.
 5. **Fit the budget.** Add memories in rank order, skipping weak matches, until 10 memories or about 500 tokens are used. Both limits are settings.
@@ -303,13 +309,15 @@ For example, on a second API run the Engineer's prompt starts with "Lesson: Fast
 
 **Memory is data.** Memories are quoted in the prompt under a header that says the current request wins and nothing quoted is an instruction. The writer drops any text that reads like instructions, a research fact is saved only with a source its brief cites (the ones rule R2 checked), and memory\_search results go through the auditor's injected-instructions check (S6) like any other read tool.
 
-**Lessons.** When a task passes after a failed check, the writer builds a lesson in code from the earlier finding (its rule and message) and the fix that worked: the passing output's summary and the fields it changed against the failed version, or the auditor's suggested fix when there is no earlier version to compare. A check that failed closed teaches nothing and leaves no lesson.
+**Lessons.** When a task passes after a failed check, the writer builds a lesson in code from the earlier finding (its rule and message) and the fix that worked: the passing output's summary and the fields it changed against the failed version, or the auditor's suggested fix when there is no earlier version to compare. A check that failed closed teaches nothing and leaves no lesson. Nor does work you kept despite its check: that pass records your call, not a fix, and the finding may have been a false positive. Each memory's source names the agent whose task it came from.
+
+**Forgetting.** `agent-team memory forget <id>` deletes one memory (the ids `memory search` prints), such as a lesson learned from a rule that was wrong.
 
 **Self-improvement.** Lessons are how the system improves: a failure, the fix that worked and the rule that caught it become a lesson fetched the next time a similar task runs.
 
 **Guardrail.** Memory is advice. The current request always wins over anything remembered.
 
-Embedding model: nomic-embed-text runs locally through Ollama (under 300 MB), so embeddings are free and offline. Each memory is embedded once when it is saved. With a few thousand memories a plain numpy comparison takes milliseconds, so no vector database is needed. A vector database pays off at hundreds of thousands of vectors or many concurrent users; here it would add a service without better results. Retrieval sits behind one interface, so moving to sqlite-vec or a vector database later means swapping one class. If Ollama isn't running, search falls back to BM25 alone and the trace says so.
+Embedding model: nomic-embed-text runs locally through Ollama (under 300 MB), so embeddings are free and offline. Each memory is embedded once when it is saved. Memory texts are capped at 400 characters and search queries at 1,000, and every text is cut to what fits the embedder's window (from Ollama's /api/show, 2,048 tokens for nomic-embed-text) before it is sent, so Ollama never truncates one itself. With a few thousand memories a plain numpy comparison takes milliseconds, so no vector database is needed. A vector database pays off at hundreds of thousands of vectors or many concurrent users; here it would add a service without better results. Retrieval sits behind one interface, so moving to sqlite-vec or a vector database later means swapping one class. If Ollama isn't running, search falls back to BM25 alone and the trace says so.
 
 ## Hooks
 
@@ -339,7 +347,7 @@ All model calls go through one small interface with three providers, and a confi
 **Providers:**
 
 - **Anthropic:** the official anthropic SDK, with claude-haiku-5-5 by default and claude-sonnet-5-5 where an agent needs more. We don't send temperature, since newer API versions reject it. Thinking is adaptive, and each agent's effort (low to max) comes from the routing file. Thinking blocks are kept in the history and sent back unchanged, which a tool loop needs; the API drops any block the current model can't read.
-- **Ollama:** its OpenAI-compatible endpoint on localhost:11434, with the context window raised to 16k to 32k tokens. Ollama silently cuts the start of a prompt that overflows the window, so the reply's max\_tokens is cut to what's left, a prompt that leaves less than a minimum reply is refused and the call falls back, and the config is checked at load so an agent routed to Ollama has a prompt budget that leaves that room. As a fallback for an agent with a bigger budget, Ollama takes only the prompts that fit. The agent's effort goes out as reasoning\_effort (low, medium or high), which gpt-oss uses. Claude's thinking blocks are left out, since Ollama can't read them and thinks afresh on each call.
+- **Ollama:** its native /api/chat on localhost:11434, with `options.num_ctx` set to the window we want (32k). We don't use its OpenAI-compatible endpoint: it ignores num\_ctx and runs every model at the server's default, 4,096 tokens unless `OLLAMA_CONTEXT_LENGTH` is set, and Ollama then silently keeps only the end of a longer prompt. A demo run hit exactly that: the Researcher never saw its own question. The other fix, requiring the server to run with `OLLAMA_CONTEXT_LENGTH=32768`, would leave a stock install broken, and the harness still couldn't tell the window before the model loaded. The harness also learns the window the model really has: the model's own limit from /api/show, and the context it is loaded with from /api/ps after the first call (and again after a prompt that nearly filled it). It plans for the smallest of those and num\_ctx. Truncation and context shift are off, so a prompt that overflows is an error, not a cut. The reply's num\_predict is cut to what's left, a prompt that leaves less than a minimum reply (4,096 tokens, since gpt-oss reasons before it writes the JSON and both count) is refused and the call falls back, and the config is checked at load so an agent routed to Ollama has a prompt budget that leaves that room. As a fallback for an agent with a bigger budget, Ollama takes only the prompts that fit. Every message goes out with string content, since Ollama rejects null. A tool call the model garbled (Ollama's "error parsing tool call" 500) is retried once, then falls back. The agent's effort goes out as `think` (low, medium or high), which gpt-oss uses. Its reasoning comes back apart from the answer and isn't kept, and Claude's thinking blocks are left out, since Ollama can't read them and thinks afresh on each call.
 - **Fake:** scripted responses for tests, with fault injection for bad JSON, timeouts and rate limits.
 
 **Long replies.** A call that may write a long reply must not hit a timeout meant for short ones. Anthropic calls whose max\_tokens is over `stream_above_tokens` (4096 by default) are streamed, so the timeout applies to each read instead of the whole call. Ollama's timeout grows with max\_tokens, at the slowest generation speed planned for (`min_tokens_per_s`).
@@ -354,14 +362,16 @@ agents:
   engineer: {provider: anthropic, model: claude-sonnet-5-5, effort: medium}
   researcher: {provider: ollama, model: gpt-oss:20b}
 fallbacks: [anthropic, ollama]
-budget: {max_usd_per_run: 1.00, max_minutes_per_run: 30}
+budget: {max_usd_per_run: 1.00, max_minutes_per_run: 60}
 ```
+
+The time cap is 60 minutes because the Researcher runs locally, one Ollama call at a time. In the demo runs a gpt-oss call took a median of 26 seconds, and the longest took 308. A build with four research questions, at about six calls each, needs 10 to 15 minutes of research, and the requested-research cap can add up to 6 more tasks (another 15 minutes or so). The rest of a build took 22 minutes on Haiku in the first demo. That comes to 35 to 50 minutes, so 30 minutes stopped the second demo in planning. With every agent on Claude, 30 minutes is enough.
 
 **Gateway.** Every model call and every tool call passes through one gateway, the single place to control traffic:
 
 - **Routing and fallback:** picks the provider and model for each agent from the config, and switches to the next provider when one fails. A provider that refuses the connection, such as Ollama not running, is marked down for `retry.provider_down_s` (60 s): calls skip it until then, unless every provider is down, with one provider\_down event when it goes down and one provider\_up event when a call to it works again.
 - **Rate limits:** caps concurrent calls and requests per minute for each provider, and queues the rest.
-- **Budgets:** tracks tokens, cost and time per run and per agent, and blocks any call past a cap.
+- **Budgets:** tracks tokens, cost and time per run and per agent, and blocks any call past a cap. The cap is checked before every try, so no retry or fallback starts after it trips, and the tool loop checks before running a reply's tool calls: a reply that arrives after the stop is dropped, and the resumed attempt asks again.
 - **Tool checks:** every tool call passes the auditor's pre-check before it runs.
 - **Kill switch:** `agent-team stop <run_id>` halts a run cleanly at its next call and saves its state. The session holds a lock on a run while the team works on it and lets go while it waits on you, so `stop` knows whether a session will see the flag at its next model call. If none will, `stop` marks the run stopped itself. Either way the reason goes to the decision log, and resuming lifts the stop.
 - **Usage report:** `agent-team gateway status` shows calls, tokens, cost and blocked calls for a run.
@@ -379,7 +389,7 @@ Generated code runs only inside a Docker container, and you drive everything fro
 - Containers carry labels naming the run and task. Each is removed when its command ends, any left over when the task or run ends, and those of a crashed process at the next start.
 - Each Engineer version that passes its check is committed to a git repository in the workspace and tagged with its version, such as code\_change-v2, so a change request can show the diff between versions. The .gitignore keeps .deps and caches out.
 - File tools reject any path outside the workspace, except folders you pass with --context, which agents can read but never write.
-- File tools refuse secrets files (.env, .env.\*, \*.env and .envrc, but not templates such as .env.example) in --context folders, so a project's secrets never reach a model. Containers get only a fixed environment (HOME, PATH, PYTHONPATH and pip settings), never the harness's own, so the API key stays outside the sandbox.
+- File tools refuse secrets files (.env, .env followed by ".", "-" or "_" and more, such as .env.local, .env-local or .env\_production, \*.env and .envrc, but not templates such as .env.example) in --context folders, so a project's secrets never reach a model. Containers get only a fixed environment (HOME, PATH, PYTHONPATH and pip settings), never the harness's own, so the API key stays outside the sandbox.
 - Without Docker, the run fails at start with a clear error. The subprocess fallback was trimmed.
 
 **Research and the network.** Research never runs in the sandbox. The Researcher's web tools run in the harness with normal network access. web\_fetch reaches only public addresses: it checks the address it connects to on every redirect hop, so neither a redirect nor a changed DNS answer can reach an internal host. Fetched text comes back marked as untrusted content. Only model-written code runs in the container, which is why its network is off. If a generated app truly needs the internet, the spec lists the hosts it needs and the sandbox allows only those through a small proxy. That is built only if a task needs it, since neither demo task does.
