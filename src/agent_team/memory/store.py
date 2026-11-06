@@ -264,6 +264,21 @@ class SqliteMemoryIndex:
             (_blob(vector), memory_id),
         )
 
+    async def forget(self, memory_id: str) -> Memory | None:
+        """Delete one memory and its keyword entry in one transaction; returns what was
+        deleted, or None when there is no such memory."""
+
+        def run(conn: sqlite3.Connection) -> Memory | None:
+            """Read the row, then delete it from both tables."""
+            row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            if row is None:
+                return None
+            conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            conn.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
+            return _memory(row)
+
+        return await self.db.transaction(run)
+
     async def record_fetch(
         self, run_id: str, task_id: str, attempt: int, query: str, ids: Sequence[str]
     ) -> None:

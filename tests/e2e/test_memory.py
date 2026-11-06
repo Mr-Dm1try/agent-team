@@ -133,6 +133,24 @@ def test_memory_search_on_the_command_line(tmp_path: Path, monkeypatch: pytest.M
     assert nothing.exit_code == 1 and "No memory matched" in nothing.output
 
 
+def test_memory_forget_on_the_command_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_file = tmp_path / "config.yaml"
+    _seed(config_file, tmp_path)
+    monkeypatch.setattr(cli, "_embedder", FakeEmbedder())
+    runner = CliRunner()
+    search = ["memory", "search", "test run for the books API", "-c", str(config_file)]
+    found = runner.invoke(cli.app, [*search, "--kind", "lesson"])
+    lesson_id = found.output.split()[1]
+    assert lesson_id.startswith("mem_")
+    forgot = runner.invoke(cli.app, ["memory", "forget", lesson_id, "-c", str(config_file)])
+    assert forgot.exit_code == 0, forgot.output
+    assert f"Forgot {lesson_id}" in forgot.output and "books API needs a test run" in forgot.output
+    again = runner.invoke(cli.app, [*search, "--kind", "lesson"])
+    assert again.exit_code == 1 and "No memory matched" in again.output
+    missing = runner.invoke(cli.app, ["memory", "forget", lesson_id, "-c", str(config_file)])
+    assert missing.exit_code == 1 and f"No memory {lesson_id}" in missing.output
+
+
 async def test_memory_off_in_the_config_builds_no_memory(tmp_path: Path) -> None:
     app = await e2e_app(tmp_path, memory={"enabled": False})
     with app:

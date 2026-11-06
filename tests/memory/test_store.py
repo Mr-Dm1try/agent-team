@@ -161,3 +161,15 @@ async def test_a_tiny_store_still_matches_by_keywords(tmp_path: Path) -> None:
     }
     assert found["mem_a"].bm25 < 0.001  # every term is in half the memories
     assert found["mem_a"].words > found["mem_b"].words > 0
+
+
+async def test_forget_removes_a_memory_from_both_searches(tmp_path: Path) -> None:
+    idx = await index(tmp_path)
+    bad, _ = await idx.save(mem("rule S1 caught a credential in web_fetch"), None, merge_at=0.92)
+    keep, _ = await idx.save(mem("pytest needs httpx"), None, merge_at=0.92)
+    gone = await idx.forget(bad.id)
+    assert gone is not None and gone.text == bad.text
+    assert [m.id for m in await idx.memories()] == [keep.id]
+    found = await idx.search("credential web_fetch", None, list(MemoryKind), limit=10)
+    assert found == []
+    assert await idx.forget(bad.id) is None

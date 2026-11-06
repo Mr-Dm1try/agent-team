@@ -159,6 +159,7 @@ class OrchestratorBase:
                     "scope": verdict.scope.value,
                     "phase": verdict.phase.value if verdict.phase else None,
                     "passed": verdict.passed,
+                    "model": verdict.model,
                     "findings": [f.model_dump(mode="json") for f in verdict.findings],
                 },
             )

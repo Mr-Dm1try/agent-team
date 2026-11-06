@@ -177,6 +177,8 @@ class RuleScope(StrEnum):
 
 #: The rule id of the finding a check fails closed with, when it can't be completed.
 AUDIT_RULE = "AUDIT"
+#: The ``model`` of a passing verdict that records the user keeping failed work.
+USER_ACCEPTED = "user"
 #: Rules about agent actions that already happened, which stop the run.
 DANGEROUS_ACTION_RULES = frozenset({"S5", "S6", "S7"})
 
@@ -487,6 +489,8 @@ class MemorySource(Contract):
     run_id: str
     task_id: str | None = None
     ref: str | None = None
+    #: The agent whose task it came from; a lesson is given to that agent only.
+    agent: AgentName | None = None
 
 
 class Memory(Contract):

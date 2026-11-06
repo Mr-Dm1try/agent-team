@@ -16,7 +16,7 @@ from agent_team.core.models import (
     Phase,
     Task,
 )
-from agent_team.memory.rank import build_query, fit, line, rank
+from agent_team.memory.rank import build_query, fit, lesson_agent, line, rank
 
 NOW = datetime(2026, 11, 4, tzinfo=UTC)
 RUN = "run_now"
@@ -153,3 +153,36 @@ def test_a_line_names_two_sources_at_most() -> None:
     refs = [MemorySource(run_id=f"run_{i}", ref=f"https://s{i}.dev") for i in range(5)]
     fact = Memory(kind=K.RESEARCH_FACT, text="a fact", sources=refs)
     assert line(fact, None).endswith("source https://s0.dev, https://s1.dev and 3 more)")
+
+
+def test_a_lesson_goes_only_to_the_agent_that_learned_it() -> None:
+    def lesson(id: str, text: str, agent: AgentName | None) -> MemoryMatch:
+        """A strong lesson match with the given source agent."""
+        memory = Memory(
+            id=id,
+            kind=K.LESSON,
+            text=text,
+            sources=[MemorySource(run_id=RUN, agent=agent)],
+            created_at=NOW,
+        )
+        return MemoryMatch(memory=memory, cosine=0.9, bm25=3.0)
+
+    matches = [
+        lesson("mem_eng", "Engineer, implementation: rule R6 caught ...", AgentName.ENGINEER),
+        lesson("mem_res", "Researcher, planning: rule R2 caught ...", AgentName.RESEARCHER),
+        # Saved before sources named the agent: the text says who learned it.
+        lesson("mem_old", "Engineer, implementation: rule R6 caught ...", None),
+        lesson("mem_any", "no agent named here", None),
+    ]
+    assert lesson_agent(matches[2].memory) is AgentName.ENGINEER
+    assert lesson_agent(matches[3].memory) is None
+
+    def ids(agent: AgentName | None) -> list[str]:
+        """What ``agent`` is given."""
+        return sorted(
+            r.memory.id for r in rank(matches, MemoryConfig(), now=NOW, run_id=RUN, agent=agent)
+        )
+
+    assert ids(AgentName.RESEARCHER) == ["mem_any", "mem_res"]
+    assert ids(AgentName.ENGINEER) == ["mem_any", "mem_eng", "mem_old"]
+    assert len(ids(None)) == 4

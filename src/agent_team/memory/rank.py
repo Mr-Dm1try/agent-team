@@ -23,7 +23,7 @@ from typing import Literal
 
 from agent_team.core.artifacts import PRD, Artifact
 from agent_team.core.config import MemoryConfig
-from agent_team.core.models import SESSION, Memory, MemoryKind, MemoryMatch, Task
+from agent_team.core.models import SESSION, AgentName, Memory, MemoryKind, MemoryMatch, Task
 from agent_team.llm.tokens import estimate_tokens
 
 #: Kinds that hold for one project, so a match from another run must be strong.
@@ -104,18 +104,34 @@ def score(match: MemoryMatch, rel: float, config: MemoryConfig, now: datetime) -
     )
 
 
+def lesson_agent(memory: Memory) -> AgentName | None:
+    """The agent a lesson came from: its source's agent, or for a lesson saved before
+    sources named one, the agent its text starts with ("Engineer, implementation: ...")."""
+    if memory.origin.agent is not None:
+        return memory.origin.agent
+    head = memory.text.split(",", 1)[0].strip().lower()
+    return AgentName(head) if head in {a.value for a in AgentName} else None
+
+
 def rank(
     matches: list[MemoryMatch],
     config: MemoryConfig,
     *,
     now: datetime,
     run_id: str | None,
+    agent: AgentName | None = None,
 ) -> list[Ranked]:
     """Matches that are strong enough, best first. A weak text match is dropped, and a
     decision or research fact from another run than ``run_id`` needs a strong one
-    (None keeps every run's alike). Ties go to the newer memory, then the lower id."""
+    (None keeps every run's alike). A lesson goes only to the ``agent`` whose task
+    taught it (None gives every agent's). Ties go to the newer memory, then the lower
+    id."""
     out: list[Ranked] = []
     for match in matches:
+        if agent is not None and match.memory.kind is MemoryKind.LESSON:
+            taught = lesson_agent(match.memory)
+            if taught is not None and taught is not agent:
+                continue
         rel = relevance(match, config)
         if rel < config.min_relevance:
             continue

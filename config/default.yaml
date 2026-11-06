@@ -50,7 +50,7 @@ memory:
   max_items: 10
   max_tokens: 500
   # Text match (0 to 1) a memory needs to be given, and what a decision or research
-  # fact from another run needs.
+  # fact from another run needs. A lesson goes only to the agent whose task taught it.
   min_relevance: 0.3
   strong_match: 0.6
   # A new memory this close (cosine) to one of the same kind is merged into it.

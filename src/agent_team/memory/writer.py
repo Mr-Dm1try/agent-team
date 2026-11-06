@@ -37,6 +37,7 @@ from agent_team.core.interfaces import (
 )
 from agent_team.core.models import (
     AUDIT_RULE,
+    USER_ACCEPTED,
     AgentName,
     DecisionKind,
     Event,
@@ -194,11 +195,21 @@ class MemoryWriter:
 
         The pass fixes a failure when the check before it, on this task or the tasks it
         was reopened from, failed; a check that failed closed judged nothing and is
-        skipped. So a revision of work that already passed is no fix."""
+        skipped. So a revision of work that already passed is no fix. A pass that only
+        records the user keeping failed work saves nothing."""
         data = event.data
         if not data.get("passed") or data.get("scope") != RuleScope.TASK.value:
             return
         if event.task_id is None:
+            return
+        if data.get("model") == USER_ACCEPTED:
+            # The user kept work that failed its check; nothing passed, so nothing it
+            # says (no lesson, no proposal) has been checked.
+            await self._emit(
+                event.run_id,
+                MemorySource(run_id=event.run_id, task_id=event.task_id),
+                {"skipped": ["accepted by the user, not passed"]},
+            )
             return
         task = await self.tasks.get_task(event.task_id)
         if task.status is TaskStatus.SUPERSEDED or task.output is None:
@@ -248,7 +259,7 @@ class MemoryWriter:
         """The output's decisions and the research facts whose source the output
         cites (so R2 checked it was opened)."""
         out: list[tuple[MemoryKind, str, MemorySource]] = []
-        here = MemorySource(run_id=task.run_id, task_id=task.id)
+        here = MemorySource(run_id=task.run_id, task_id=task.id, agent=task.agent)
         if isinstance(artifact, Spec):
             out += [(MemoryKind.DECISION, d, here) for d in artifact.decisions]
         cited = cited_sources(artifact, workspace)
@@ -275,7 +286,7 @@ class MemoryWriter:
             for f in failed.blockers
             if f.rule_id != AUDIT_RULE and (f.artifact is None or f.artifact.kind == artifact.kind)
         ][:MAX_LESSONS]
-        here = MemorySource(run_id=task.run_id, task_id=task.id)
+        here = MemorySource(run_id=task.run_id, task_id=task.id, agent=task.agent)
         out: list[tuple[MemoryKind, str, MemorySource]] = []
         chain = [t.id for t in ancestry(task, await self.tasks.list_tasks(task.run_id))]
         before: list[Artifact | None] = []  # the version before this one, loaded once

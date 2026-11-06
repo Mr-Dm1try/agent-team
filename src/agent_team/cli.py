@@ -201,6 +201,27 @@ async def _search(config: Config, query: str, kinds: list[MemoryKind], limit: in
     return 0
 
 
+@memory_app.command("forget")
+def memory_forget(memory_id: str, config: ConfigOption = None) -> None:
+    """Delete the memory MEMORY_ID (an id ``memory search`` prints), such as a lesson
+    learned from a false positive, so no later run is given it."""
+    raise typer.Exit(asyncio.run(_forget(load_config(config), memory_id)))
+
+
+async def _forget(config: Config, memory_id: str) -> int:
+    """Delete one memory and say what it was; returns 1 when there was none."""
+    parts = await open_search(config, embedder=_embedder)
+    try:
+        gone = await parts.index.forget(memory_id)
+    finally:
+        parts.close()
+    if gone is None:
+        typer.echo(f"No memory {memory_id}.", err=True)
+        return 1
+    typer.echo(f"Forgot {gone.id}: {line(gone, None)}")
+    return 0
+
+
 def _config(path: Path | None, chaos: str | None) -> Config:
     """The config file, with ``--chaos`` in place of its chaos settings."""
     config = load_config(path)

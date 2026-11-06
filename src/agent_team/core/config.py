@@ -129,9 +129,10 @@ class OllamaConfig(_Cfg):
     #: rejects it for models that can't think, so others get no effort at all.
     reasoning_models: list[str] = Field(default_factory=lambda: ["gpt-oss"])
     #: Least room left for the reply. A route's prompt budget plus this must fit
-    #: ``num_ctx``, and a call whose prompt leaves less is refused, because Ollama
-    #: would otherwise drop the start of the prompt without saying so.
-    min_output_tokens: int = 1024
+    #: ``num_ctx``, and a call whose prompt leaves less is refused rather than sent. A
+    #: thinking model such as gpt-oss reasons before it writes the JSON, and both count
+    #: against the reply, so a smaller room ends in "the reply hit the token limit".
+    min_output_tokens: int = 4096
     #: Characters per token when estimating a prompt. Low on purpose: running over
     #: the window is silent truncation, while a high estimate only costs a fallback.
     chars_per_token: int = 3

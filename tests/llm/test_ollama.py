@@ -361,7 +361,7 @@ async def test_a_stream_http_error_is_mapped() -> None:
 async def test_a_prompt_over_the_real_window_is_refused_not_cut() -> None:
     """Ollama reports a 4,096-token window although 32,768 is configured: the cap and
     the guard use 4,096, so a prompt that won't fit raises instead of being cut."""
-    provider, fake = ollama(trained=4_096)
+    provider, fake = ollama(trained=4_096, config=OllamaConfig(min_output_tokens=1_000))
     assert await provider.window("gpt-oss:20b") == 4_096
     long = request(messages=[Message.user("x" * 12_000)])
     with pytest.raises(ContextTooLong, match="4096-token window"):

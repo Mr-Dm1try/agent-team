@@ -15,6 +15,7 @@ from agent_team.core.artifacts import plain_kind
 from agent_team.core.errors import BudgetExceeded
 from agent_team.core.models import (
     SESSION,
+    USER_ACCEPTED,
     AgentName,
     Decision,
     DecisionKind,
@@ -366,7 +367,7 @@ class ConversationMixin(OrchestratorBase):
                 phase=parent.phase,
                 passed=True,
                 summary=f"Accepted by the user despite: {blockers}"[:1000],
-                model="user",
+                model=USER_ACCEPTED,
             )
         )
         await self._record(
