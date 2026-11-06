@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from agent_team.audit.auditor import render_prompt
 from agent_team.audit.catalog import load_catalog
 from agent_team.audit.evidence import HELPERS, AuditContext, HelperResult
 from agent_team.core.artifacts import (
@@ -912,3 +913,40 @@ def test_r8_process_trail(run: Run) -> None:
     assert "no audit verdict" in messages
     assert "over its limit" in messages
     assert "has no reason" in messages
+
+
+def test_r8_accepts_the_stronger_model_attempt_and_says_so(run: Run) -> None:
+    # Three attempts failed; the policy sent the task to the stronger model, which
+    # raised its limit to 4, and attempt 4 passed.
+    t = make_task(
+        run,
+        AgentName.RESEARCHER,
+        Phase.PLANNING,
+        "research_brief",
+        status=TaskStatus.DONE,
+        attempt=4,
+        max_attempts=4,
+        started_at=utcnow(),
+        finished_at=utcnow(),
+    )
+    v = Verdict(run_id=run.id, scope=RuleScope.TASK, task_id=t.id, passed=True)
+    d = Decision(
+        run_id=run.id,
+        task_id=t.id,
+        kind=DecisionKind.STRONGER_MODEL,
+        choice="one last attempt on claude-sonnet-5-5",
+        reason="the fault is in the task's own output",
+        made_by="code",
+    )
+    ctx = AuditContext(run=run, scope=RuleScope.RUN, tasks=[t], decisions=[d], verdicts={t.id: [v]})
+    res = run_helper("R8", ctx)
+    assert res.findings == []
+    assert any(f"{t.id}: attempt 4 (stronger model)" in n for n in res.notes)
+    prompt = render_prompt(ctx, [RULES["R8"]], {"R8": res})
+    assert "attempt 4 (stronger model)" in prompt and "4/4" not in prompt
+    assert "(stronger model)" in RULES["R8"].statement
+    # Without the decision, the same task reads against its limit as before.
+    plain = AuditContext(
+        run=run, scope=RuleScope.RUN, tasks=[t], decisions=[], verdicts={t.id: [v]}
+    )
+    assert "attempt 4/4" in render_prompt(plain, [RULES["R8"]], {})

@@ -25,6 +25,7 @@ from agent_team.audit.evidence import (
     HelperResult,
     gather,
     ref_of,
+    stronger_model_tasks,
 )
 from agent_team.audit.llmjson import ask_json
 from agent_team.audit.precheck import ToolPrecheck
@@ -57,6 +58,7 @@ from agent_team.core.models import (
     Task,
     TaskStatus,
     Verdict,
+    attempt_text,
 )
 from agent_team.llm.types import LLMClient
 from agent_team.orchestrator.lineage import ancestry, previous_version
@@ -520,11 +522,13 @@ def render_prompt(ctx: AuditContext, rules: list[Rule], helpers: dict[str, Helpe
         ]
         parts.append("## Tool calls\n" + "\n".join(lines))
     if ctx.scope is RuleScope.RUN:
+        stronger = stronger_model_tasks(ctx.decisions)
         parts.append(
             "## Tasks\n"
             + "\n".join(
-                f"- {t.id} {t.agent.value} {t.phase.value} {t.status.value} attempt "
-                f"{t.attempt}/{t.max_attempts} verdicts {len(ctx.verdicts.get(t.id, []))}"
+                f"- {t.id} {t.agent.value} {t.phase.value} {t.status.value} "
+                f"{attempt_text(t.attempt, t.max_attempts, stronger=t.id in stronger)} "
+                f"verdicts {len(ctx.verdicts.get(t.id, []))}"
                 for t in ctx.tasks
             )
         )

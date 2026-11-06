@@ -241,6 +241,19 @@ def checked_attempt(reason: str | None) -> int | None:
     return int(found.group(1)) if found else None
 
 
+#: How an attempt on the stronger model is marked: the policy grants it past the
+#: attempt limit by design, so it isn't shown against that limit.
+STRONGER_MARK = "stronger model"
+
+
+def attempt_text(attempt: int, max_attempts: int = 0, *, stronger: bool = False) -> str:
+    """An attempt as people and the auditor read it: "attempt 2/3", "attempt 2" when
+    the limit isn't known, or "attempt 4 (stronger model)"."""
+    if stronger:
+        return f"attempt {attempt} ({STRONGER_MARK})"
+    return f"attempt {attempt}/{max_attempts}" if max_attempts else f"attempt {attempt}"
+
+
 class Task(Contract):
     """One unit of delegated work: an agent, an objective, inputs and the artifact
     kind it must produce. Tracks its attempts, output, last error and lineage."""

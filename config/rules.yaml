@@ -108,7 +108,8 @@ rules:
     helper: process_trail
     statement: >-
       Every task has start and end times, a verdict and attempts within the limit, and
-      every decision has a reason.
+      every decision has a reason. An attempt on the stronger model is granted past the
+      limit by design, so a task marked "(stronger model)" is within it.
 
   - id: R9
     title: Coverage and scope
