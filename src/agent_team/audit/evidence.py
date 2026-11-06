@@ -31,6 +31,7 @@ from agent_team.core.artifacts import (
     ResearchAnswer,
     ResearchBrief,
     Spec,
+    TestRun,
 )
 from agent_team.core.models import (
     AgentName,
@@ -72,6 +73,10 @@ READ_TOOLS = frozenset(
     {"read_file", "list_dir", "grep", "web_fetch", "fetch", "open_url", "memory_search"}
 )
 OUTGOING_TOOLS = frozenset({"web_fetch", "web_search", "fetch", "http_request", "open_url"})
+#: Tools whose results are text from outside, such as a web page. S1 doesn't scan
+#: those results, since a tutorial's sample token isn't ours to leak and S6 already
+#: checks them for planted instructions; it still scans their args.
+UNTRUSTED_RESULT_TOOLS = frozenset({"web_fetch", "web_search", "fetch", "http_request", "open_url"})
 
 
 _KIND_OF_TYPE: dict[type[ArtifactBase], str] = {cls: kind for kind, cls in ARTIFACT_TYPES.items()}
@@ -186,6 +191,7 @@ def hit(
     evidence: str | None = None,
     fix: str | None = None,
     severity: Severity | None = None,
+    already_happened: bool = False,
 ) -> Finding:
     """A helper finding for ``rule``, marked ``from_helper``; severity defaults to the rule's."""
     ref = ref_of(artifact) if isinstance(artifact, ArtifactBase) else artifact
@@ -198,6 +204,7 @@ def hit(
         evidence=evidence,
         suggested_fix=fix,
         from_helper=True,
+        already_happened=already_happened,
     )
 
 
@@ -313,16 +320,23 @@ def _texts(model: BaseModel) -> str:
 
 @helper("secrets")
 def secrets(ctx: AuditContext, rule: Rule) -> HelperResult:
-    """S1: secret-like strings in the outputs, the code files and the tool calls."""
+    """S1: secret-like strings in the outputs, the code files and the tool calls. The
+    results of tools that bring outside text in are left out (see
+    ``UNTRUSTED_RESULT_TOOLS``). A hit in a tool call is marked ``already_happened``:
+    the call is in the log, so a retry can't clear it."""
     res = HelperResult()
-    sources: list[tuple[str, str, ArtifactBase | None]] = []
+    # (where, text, artifact at fault, whether it is a logged tool call)
+    sources: list[tuple[str, str, ArtifactBase | None, bool]] = []
     for _, artifact in ctx.outputs:
-        sources.append((str(ref_of(artifact)), _texts(artifact), artifact))
+        sources.append((str(ref_of(artifact)), _texts(artifact), artifact, False))
     for _, change, path, text in ctx.code_files():
-        sources.append((path, text, change))
+        sources.append((path, text, change, False))
     for call in ctx.ran():
-        sources.append((f"tool call {call.tool}", str(call.args) + "\n" + call.result, None))
-    for where, text, source in sources:
+        text = str(call.args)
+        if call.tool not in UNTRUSTED_RESULT_TOOLS:
+            text += "\n" + call.result
+        sources.append((f"tool call {call.tool}", text, None, True))
+    for where, text, source, logged in sources:
         for h in patterns.find_secrets(text):
             res.findings.append(
                 hit(
@@ -331,8 +345,11 @@ def secrets(ctx: AuditContext, rule: Rule) -> HelperResult:
                     item=f"{where}:{h.line}",
                     artifact=source,
                     evidence=f"{h.redacted} (line {h.line})",
-                    fix="read it from an environment variable or a secrets file outside the "
+                    fix="the call already ran, so tell the user where the secret came from"
+                    if logged
+                    else "read it from an environment variable or a secrets file outside the "
                     "workspace",
+                    already_happened=logged,
                 )
             )
     res.notes.append(f"scanned {len(sources)} artifacts, files and tool calls for secrets")
@@ -751,7 +768,13 @@ def files_exist(ctx: AuditContext, rule: Rule) -> HelperResult:
 
 @helper("tests_ran")
 def tests_ran(ctx: AuditContext, rule: Rule) -> HelperResult:
-    """R6: each code change reports a passing test run that the tool log backs up."""
+    """R6: each code change reports a passing test run that the tool log backs up.
+
+    The reported command matches a logged run after both are normalised: an
+    ``sh -c``/``bash -c`` wrapper unwrapped, leading ``VAR=value`` assignments and
+    redirections dropped, whitespace collapsed. The logged exit code is evidence only
+    when nothing after the tests can mask it (see ``patterns.exit_code_masked``);
+    otherwise the last pytest summary line in the output decides."""
     res = HelperResult()
     changes = ctx.of_type(CodeChange)
     if not changes:
@@ -774,49 +797,106 @@ def tests_ran(ctx: AuditContext, rule: Rule) -> HelperResult:
                     evidence=tests.output_tail[-500:],
                 )
             )
-        ran = [
-            c
-            for c in ctx.ran()
-            if c.task_id == task.id
-            and tests.command.strip()
-            and tests.command.strip() in patterns.command_text(c.args)
-        ]
-        if not ran:
-            res.findings.append(
-                hit(
-                    rule,
-                    f"the tool log has no run of '{tests.command}' for this task",
-                    item=task.id,
-                    artifact=change,
-                    fix="run the tests with run_command and report that result",
-                )
-            )
-            continue
-        # The run the report describes: the last one of exactly that command, else the
-        # last that contains it. A later narrower run (one file, -k) doesn't replace it.
-        reported = " ".join(tests.command.split())
-        exact = [c for c in ran if " ".join(patterns.command_text(c.args).split()) == reported]
-        last = (exact or ran)[-1]
-        res.notes.append(
-            f"runs of '{tests.command}' in the tool log: "
-            + "; ".join(
-                f"{patterns.command_text(c.args)} -> {c.data.get('exit_code')}" for c in ran
-            )
-        )
-        logged = last.data.get("exit_code")
-        if isinstance(logged, int) and logged != tests.exit_code:
-            res.findings.append(
-                hit(
-                    rule,
-                    f"the last run of '{tests.command}' in the tool log exited {logged}, "
-                    f"but the change reports exit {tests.exit_code}",
-                    item=task.id,
-                    artifact=change,
-                    evidence=last.result[-500:],
-                    fix="fix the code until the tests pass, run them again and report that run",
-                )
-            )
+        finding = _test_run_evidence(ctx, rule, task, change, tests, res.notes)
+        if finding is not None:
+            res.findings.append(finding)
     return res
+
+
+def _commands_of(ctx: AuditContext, task: Task) -> list[tuple[ToolCall, patterns.CommandShape]]:
+    """The task's commands that ran, each with its normalised shape."""
+    out: list[tuple[ToolCall, patterns.CommandShape]] = []
+    for call in ctx.ran():
+        if call.task_id != task.id:
+            continue
+        argv = call.data.get("argv") or call.args.get("argv")
+        if isinstance(argv, list) and argv:
+            out.append((call, patterns.command_shape([str(a) for a in argv])))
+        elif patterns.command_text(call.args):
+            out.append((call, patterns.command_shape(patterns.command_text(call.args))))
+    return out
+
+
+def _test_run_evidence(
+    ctx: AuditContext,
+    rule: Rule,
+    task: Task,
+    change: CodeChange,
+    tests: TestRun,
+    notes: list[str],
+) -> Finding | None:
+    """The R6 finding on whether the log backs up the reported test run, or None."""
+    declared = patterns.command_shape(tests.command)
+    commands = _commands_of(ctx, task)
+    ran = [
+        (c, shape) for c, shape in commands if patterns.contains_command(shape.text, declared.text)
+    ]
+    if not ran:
+        seen = list(dict.fromkeys(patterns.command_text(c.args) for c, _ in commands))[-5:]
+        listed = "; ".join(f"`{cmd[:160]}`" for cmd in seen) or "none"
+        return hit(
+            rule,
+            f"tests.command '{tests.command[:200]}' matches no command this task ran "
+            f"(commands that ran: {listed})",
+            item=task.id,
+            artifact=change,
+            fix="set tests.command to the exact argv of the test run you report, joined by "
+            "spaces, such as `python -m pytest -q`, with no notes; run the tests as plain "
+            'argv, such as ["python", "-m", "pytest", "-q"]',
+        )
+    # The run the report describes: the last one of exactly that command, else the last
+    # that contains it. A later narrower run (one file, -k) doesn't replace it.
+    exact = [(c, shape) for c, shape in ran if shape.text == declared.text]
+    last, shape = (exact or ran)[-1]
+    notes.append(
+        f"runs of '{tests.command}' in the tool log: "
+        + "; ".join(f"{patterns.command_text(c.args)} -> {c.data.get('exit_code')}" for c, _ in ran)
+    )
+    target = declared.steps[-1].text if declared.steps else declared.text
+    index = max(
+        (i for i, step in enumerate(shape.steps) if patterns.contains_command(step.text, target)),
+        default=len(shape.steps) - 1,
+    )
+    masked = patterns.exit_code_masked(shape, index)
+    logged = last.data.get("exit_code")
+    if masked is None:
+        if isinstance(logged, int) and logged != tests.exit_code:
+            return hit(
+                rule,
+                f"the last run of '{tests.command}' in the tool log exited {logged}, "
+                f"but the change reports exit {tests.exit_code}",
+                item=task.id,
+                artifact=change,
+                evidence=last.result[-500:],
+                fix="fix the code until the tests pass, run them again and report that run",
+            )
+        return None
+    summary = patterns.pytest_summary(last.result)
+    plain = 'run the tests as plain argv, such as ["python", "-m", "pytest", "-q"]'
+    if summary is None:
+        return hit(
+            rule,
+            f"the exit code of the last run of '{tests.command}' says nothing: {masked}, "
+            "and its output has no pytest summary line",
+            item=task.id,
+            artifact=change,
+            evidence=last.result[-500:],
+            fix=f"{plain}, so its exit code is the tests' own",
+        )
+    failed = summary.get("failed", 0) + summary.get("errors", 0)
+    notes.append(f"exit code masked ({masked}); pytest summary: {summary}")
+    if failed or not summary.get("passed"):
+        return hit(
+            rule,
+            f"the last run of '{tests.command}' shows {summary.get('passed', 0)} passed, "
+            f"{summary.get('failed', 0)} failed and {summary.get('errors', 0)} errors in its "
+            f"pytest summary, whatever its exit code ({masked})",
+            item=task.id,
+            artifact=change,
+            evidence=last.result[-500:],
+            fix=f"fix the code until the tests pass, then {plain}",
+        )
+    return None
 
 
 @helper("qa_clean")

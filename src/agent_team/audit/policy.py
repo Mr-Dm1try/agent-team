@@ -23,7 +23,9 @@ Two more come from the auditor section: a dangerous agent action (S5, S6, S7) ST
 the run and asks the user, since it already happened, and this wins over everything
 else, including a fail-closed verdict that still carries such a helper hit; and a
 fail-closed verdict (an ``AUDIT`` finding) escalates and asks, since the expert isn't
-at fault.
+at fault. A helper finding marked ``already_happened`` (such as a secret in a tool
+call that already ran) escalates and asks at once too, since no retry can clear it;
+the user may keep the work.
 
 Extra ``inputs`` keys beyond the contract's: ``finding_ids`` on most kinds,
 ``previous_output`` on RETRY, ``phase``/``producer_task_id`` on UPSTREAM_RERUN and
@@ -277,6 +279,29 @@ def decide_task(
                 f"The check of the {_who(task)}'s work couldn't be completed: "
                 f"{_summary(blockers)}. Re-run the check, or how should I proceed?",
                 "policy.fail_closed",
+                fids,
+            ),
+        ]
+
+    logged = [f for f in blockers if f.already_happened]
+    if logged:
+        reason = "a finding is about a tool call that already ran, so a retry can't clear it"
+        return [
+            _decision(
+                run,
+                DecisionKind.ESCALATE,
+                task_id=task.id,
+                choice="escalate",
+                reason=f"{reason}: {_summary(logged)}",
+                rule="policy.already_happened",
+                finding_ids=fids,
+            ),
+            _ask(
+                run,
+                task.id,
+                f"The {_who(task)}'s check found something in what it already did, which "
+                f"a retry can't undo: {_summary(blockers)}. How should I proceed?",
+                "policy.already_happened",
                 fids,
             ),
         ]

@@ -188,6 +188,15 @@ def test_dangerous_action_stops_the_run(run: Run) -> None:
     assert kinds(decisions) == [DecisionKind.STOP, DecisionKind.ASK_USER]
 
 
+def test_a_finding_on_a_call_that_already_ran_asks_instead_of_retrying(run: Run) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief", attempt=1)
+    logged = blocker("S1", "tool call read_file:3").model_copy(update={"already_happened": True})
+    decisions = decide_task(run, task, verdict(run, logged, task=task), [], [], LIMITS)
+    assert kinds(decisions) == [DecisionKind.ESCALATE, DecisionKind.ASK_USER]
+    assert decisions[1].rule == "policy.already_happened"
+    assert "can't undo" in str(decisions[1].inputs["question"])
+
+
 def test_fail_closed_verdict_escalates_and_asks(run: Run) -> None:
     task = spec_task(run)
     v = verdict(run, blocker(AUDIT_RULE), task=task)

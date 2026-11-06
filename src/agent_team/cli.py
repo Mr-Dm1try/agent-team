@@ -41,7 +41,7 @@ from agent_team.memory import open_search
 from agent_team.memory.rank import line
 from agent_team.orchestrator.base import mark_stopped
 from agent_team.ui.session import Session
-from agent_team.ui.stats import HEADER, overview_table, run_stats, run_table
+from agent_team.ui.stats import FOOTNOTE, HEADER, heading, overview_table, run_stats, run_table
 
 app = typer.Typer(help="Multi-agent harness: Planning, PRD, Spec and Implementation.")
 memory_app = typer.Typer(help="Long-term memory from earlier runs.")
@@ -163,7 +163,7 @@ def logs(
         return
     events = read_events(runs_dir, run_id, agent=agent, task_id=task)
     if not events:
-        typer.echo(f"No events for run {run_id}.", err=True)
+        typer.echo(f"No events for run {run_id} in {Path(runs_dir).resolve()}.", err=True)
         raise typer.Exit(1)
     for event in events:
         typer.echo(format_event(event))
@@ -257,7 +257,7 @@ async def _stop(config: Config, run_id: str, reason: str) -> int:
         try:
             run = await tasks.get_run(run_id)
         except KeyError:
-            typer.echo(f"No run {run_id}.", err=True)
+            typer.echo(_no_run(config, run_id), err=True)
             return 1
         if run.status is RunStatus.DONE:
             typer.echo(f"Run {run_id} is already done.")
@@ -274,30 +274,42 @@ async def _stop(config: Config, run_id: str, reason: str) -> int:
 async def _stats(config: Config, run_id: str | None) -> int:
     """Print the stats of one run, or of every run; see ``stats``."""
     runs_dir = config.paths.runs_dir
+    console = _console()
     with _stores(config) as (tasks, _):
         if run_id is not None:
             try:
-                rows = run_table(await run_stats(run_id, tasks, runs_dir))
+                one = await run_stats(run_id, tasks, runs_dir)
             except KeyError:
-                typer.echo(f"No run {run_id}.", err=True)
+                typer.echo(_no_run(config, run_id), err=True)
                 return 1
+            console.print(heading(one), highlight=False, markup=False)
+            rows = run_table(one)
+            extra: tuple[str, ...] = ()
         else:
             runs = await tasks.list_runs()
             if not runs:
-                typer.echo("No runs yet.")
+                typer.echo(f"No runs yet in {config.paths.db_file()}.")
                 return 0
             rows = overview_table([await run_stats(r.id, tasks, runs_dir) for r in runs])
+            extra = ("title",)
     name, *numbers = HEADER
-    # Numbers never wrap; on a narrow terminal the names fold instead.
+    # Ids, names and numbers never wrap; on a narrow terminal only a title is cut.
     columns = [
-        Column(name, overflow="fold"),
+        Column(name, no_wrap=True),
         *(Column(h, justify="right", no_wrap=True) for h in numbers),
+        *(Column(h, no_wrap=True, overflow="ellipsis") for h in extra),
     ]
-    table = Table(*columns, box=None, pad_edge=False)
+    table = Table(*columns, box=None, pad_edge=False, collapse_padding=True)
     for r in rows:
         table.add_row(*r)
-    _console().print(table)
+    console.print(table)
+    console.print(FOOTNOTE, style="dim", highlight=False, markup=False)
     return 0
+
+
+def _no_run(config: Config, run_id: str) -> str:
+    """The message for a run id the database doesn't have, naming where it looked."""
+    return f"No run {run_id} in {config.paths.db_file()}."
 
 
 def format_event(event: Event) -> str:

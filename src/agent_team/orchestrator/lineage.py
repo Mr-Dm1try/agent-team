@@ -8,7 +8,10 @@ new spec rebuilds the Engineer and QA tasks from its work packages.
 
 from __future__ import annotations
 
-from agent_team.core.interfaces import DecisionLog, TaskStore
+from collections.abc import Iterable
+
+from agent_team.core.artifacts import Artifact, ArtifactRef
+from agent_team.core.interfaces import ArtifactStore, DecisionLog, TaskStore
 from agent_team.core.models import (
     AgentName,
     Decision,
@@ -54,6 +57,24 @@ def ancestry(task: Task, tasks: list[Task]) -> list[Task]:
         seen.add(parent.id)
         parent = by_id.get(parent.parent_task_id or "")
     return chain[::-1]
+
+
+async def previous_version(
+    artifacts: ArtifactStore, run_id: str, artifact: Artifact, chain: Iterable[str]
+) -> Artifact | None:
+    """The newest earlier version of ``artifact``'s kind that one of the ``chain`` tasks
+    wrote (a task and the tasks it was reopened from, see ``ancestry``). Versions are
+    numbered per kind across the run, so the version just before may be a sibling's,
+    such as another research question's brief."""
+    ids = set(chain)
+    for version in range(artifact.version - 1, 0, -1):
+        try:
+            older = await artifacts.load(run_id, ArtifactRef(kind=artifact.kind, version=version))
+        except KeyError:
+            continue
+        if older.task_id in ids:
+            return older
+    return None
 
 
 def _rebuilt_by_pipeline(root: Task, task: Task) -> bool:

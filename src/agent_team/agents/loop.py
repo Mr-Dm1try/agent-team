@@ -275,7 +275,7 @@ class ToolLoop[M: BaseModel]:
 
     async def _maybe_compact(self, messages: list[Message]) -> list[Message]:
         """Compact the history when it nears the budget, and checkpoint the compacted version."""
-        budget = self.llm.context_budget(self.agent)
+        budget = self.llm.context_budget(self.agent, self.task_id)
         specs = self._specs()
         # The lowest ratio over the models seen: after a fallback the next call may go
         # to either, so estimate for the one that counts more tokens.

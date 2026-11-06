@@ -313,7 +313,7 @@ class FakeLLM:
         response = await self.complete(request)
         yield StreamChunk(text=response.text, done=True, response=response)
 
-    def context_budget(self, agent: AgentName) -> int:
+    def context_budget(self, agent: AgentName, task_id: str | None = None) -> int:
         return self.budget
 
     def providers_for(self, agent: AgentName, task_id: str | None) -> list[str]:

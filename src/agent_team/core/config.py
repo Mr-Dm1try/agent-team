@@ -66,6 +66,8 @@ class RetryConfig(_Cfg):
     """Backoff for transient model errors."""
 
     delays_s: list[float] = Field(default_factory=lambda: [1.0, 2.0, 4.0])
+    #: How long a provider that refused a connection is skipped before it is tried again.
+    provider_down_s: float = 60.0
 
 
 class ProviderLimit(_Cfg):
@@ -252,6 +254,11 @@ class PathsConfig(_Cfg):
     runs_dir: str = "runs"
     db: str = "runs/agent_team.db"
 
+    def db_file(self) -> Path:
+        """The database as an absolute path; a relative one is read from the current
+        folder, so messages name this to show where a command looked."""
+        return Path(self.db).resolve()
+
 
 class Config(_Cfg):
     """The whole routing and limits file."""
@@ -316,6 +323,16 @@ class Config(_Cfg):
     def context_budget(self, agent: AgentName) -> int:
         """Max prompt tokens for the agent's model."""
         return self.route_for(agent).context_budget or self.defaults.context_budget
+
+    def fallback_budget(self, provider: str) -> int:
+        """Max prompt tokens when ``provider`` stands in for an agent's own route: the
+        defaults' budget, cut for Ollama to what leaves reply room in its window."""
+        budget = self.defaults.context_budget
+        if provider == "ollama":
+            ollama = self.providers.ollama
+            room = ollama.num_ctx - ollama.min_output_tokens
+            budget = min(budget, room * ollama.chars_per_token // CHARS_PER_TOKEN)
+        return budget
 
 
 def deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:

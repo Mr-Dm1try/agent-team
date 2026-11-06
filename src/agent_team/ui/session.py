@@ -98,7 +98,7 @@ class Session:
         try:
             await self.team.stores.tasks.get_run(run_id)
         except KeyError:
-            self.say(f"No run {run_id}.")
+            self.say(f"No run {run_id} in {self.team.config.paths.db_file()}.")
             return 1
         if not self.lock.acquire(run_id):
             self.say(f"Run {run_id} is being driven by another session.")

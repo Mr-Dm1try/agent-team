@@ -108,6 +108,22 @@ def _short(value: Any, limit: int = 60) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _tag(state: RunState, row: TaskRow) -> str:
+    """A short objective after a task's plain lines when a sibling (another live task of
+    the same phase, agent and output) would print the same label, such as two research
+    questions running at once; empty otherwise."""
+    siblings = [
+        t
+        for t in state.tasks.values()
+        if t.id != row.id
+        and (t.phase, t.agent, t.kind) == (row.phase, row.agent, row.kind)
+        and t.status != "superseded"
+    ]
+    if not siblings or row.agent in ("user", "auditor") or not row.objective:
+        return ""
+    return f" [{_short(row.objective, 40)}]"
+
+
 def tool_summary(tool: str, args: Any) -> str:
     """A tool call as a few words: the tool and its main argument."""
     if not isinstance(args, dict):
@@ -247,6 +263,13 @@ class RunView:
             ticker.output_tokens += int(data.get("output_tokens") or 0)
             ticker.cost_usd += float(data.get("cost_usd") or 0.0)
             return None
+        if name is EventName.PROVIDER_DOWN:
+            return (
+                f"  {data.get('provider')} is unreachable; calls go to the fallback for "
+                f"{data.get('retry_after_s')}s"
+            )
+        if name is EventName.PROVIDER_UP:
+            return f"  {data.get('provider')} is reachable again"
         if name is EventName.RUN_FINISHED:
             state.finished = True
             return f"run {event.run_id} finished · {state.ticker.text()}"
@@ -277,7 +300,7 @@ class RunView:
             if row.status not in PLAIN_STATES:
                 return None
             attempt = f" (attempt {row.attempt})" if row.attempt > 1 else ""
-            return f"  {row.phase}: {row.label} {row.status}{attempt}"
+            return f"  {row.phase}: {row.label}{_tag(state, row)} {row.status}{attempt}"
         if row is None:
             return None
         if name is EventName.TASK_STARTED:
@@ -285,18 +308,21 @@ class RunView:
             return None
         if name is EventName.TOOL_CALL_BEFORE:
             row.tool = tool_summary(str(data.get("tool", "")), data.get("args"))
-            return f"    {row.agent} → {row.tool}"
+            return f"    {row.agent}{_tag(state, row)} → {row.tool}"
         if name is EventName.TOOL_CALL_AFTER:
             row.tool = None
             if data.get("blocked"):
-                return f"    {row.agent} ✗ {data.get('tool')} blocked by {data.get('rule_id')}"
+                return (
+                    f"    {row.agent}{_tag(state, row)} ✗ {data.get('tool')} blocked by "
+                    f"{data.get('rule_id')}"
+                )
             return None
         if name is EventName.AUDIT_VERDICT:
             findings = data.get("findings") or []
             blockers = [f for f in findings if f.get("severity") == "blocker"]
             if data.get("passed"):
-                return f"    audit passed: {row.label}"
-            return f"    audit failed: {row.label} ({len(blockers)} blockers)"
+                return f"    audit passed: {row.label}{_tag(state, row)}"
+            return f"    audit failed: {row.label}{_tag(state, row)} ({len(blockers)} blockers)"
         return None
 
     # --- drawing ---------------------------------------------------------------------

@@ -118,7 +118,11 @@ def parse_arguments(raw: str | None) -> dict[str, Any]:
 def translate_error(exc: Exception, provider: str) -> Exception:
     """Map openai SDK errors; transient ones become TransientLLMError."""
     if isinstance(exc, openai.APIConnectionError):  # includes APITimeoutError
-        return TransientLLMError(f"{type(exc).__name__}: {exc}", provider=provider)
+        return TransientLLMError(
+            f"{type(exc).__name__}: {exc}",
+            provider=provider,
+            unreachable=not isinstance(exc, openai.APITimeoutError),
+        )
     if isinstance(exc, openai.APIStatusError) and (
         exc.status_code in (408, 409, 429) or exc.status_code >= 500
     ):

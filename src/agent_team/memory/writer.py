@@ -24,7 +24,7 @@ from collections.abc import Awaitable, Callable, Sequence
 
 from agent_team.agents.prompts import RUN_SUMMARY
 from agent_team.audit import patterns
-from agent_team.core.artifacts import Artifact, ArtifactRef, ResearchAnswer, ResearchBrief, Spec
+from agent_team.core.artifacts import Artifact, ResearchAnswer, ResearchBrief, Spec
 from agent_team.core.base import Contract
 from agent_team.core.config import MemoryConfig
 from agent_team.core.interfaces import (
@@ -54,7 +54,7 @@ from agent_team.core.tracing import Tracer
 from agent_team.llm.structured import parse_output
 from agent_team.llm.types import LLMClient, LLMRequest, Message
 from agent_team.memory.embed import Embeddings
-from agent_team.orchestrator.lineage import ancestry
+from agent_team.orchestrator.lineage import ancestry, previous_version
 
 log = logging.getLogger(__name__)
 
@@ -286,12 +286,11 @@ class MemoryWriter:
         self, task: Task, failed: Verdict, finding: Finding, artifact: Artifact
     ) -> Artifact | None:
         """The output the failed check judged: the finding's artifact when it is the
-        same kind, else the version before the passing one."""
+        same kind, else the version before the passing one in this line of work."""
         ref = finding.artifact
         if ref is None or ref.kind != artifact.kind or ref.version >= artifact.version:
-            if artifact.version <= 1:
-                return None
-            ref = ArtifactRef(kind=artifact.kind, version=artifact.version - 1)
+            chain = [t.id for t in ancestry(task, await self.tasks.list_tasks(task.run_id))]
+            return await previous_version(self.artifacts, task.run_id, artifact, chain)
         try:
             return await self.artifacts.load(task.run_id, ref)
         except KeyError:

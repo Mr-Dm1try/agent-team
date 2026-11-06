@@ -20,11 +20,20 @@ class TransientLLMError(AgentTeamError):
 
     retryable = True
 
-    def __init__(self, message: str, *, provider: str, status: int | None = None) -> None:
-        """Keep which provider failed and its HTTP status, if any."""
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        status: int | None = None,
+        unreachable: bool = False,
+    ) -> None:
+        """Keep which provider failed, its HTTP status, if any, and whether the
+        connection itself failed (the provider is down, not busy)."""
         super().__init__(message)
         self.provider = provider
         self.status = status
+        self.unreachable = unreachable
 
 
 class ContextTooLong(AgentTeamError):

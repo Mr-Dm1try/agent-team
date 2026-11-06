@@ -103,7 +103,7 @@ Context is gathered up front, but not only once. If the Architect or Engineer hi
 
 Every expert also reads the feedback on its own work: your answers to its questions, your comments on its last version and the auditor's findings. See Questions and feedback below.
 
-**Context compaction.** Each task starts with a fresh context built from its envelope, so agents never inherit another agent's history and most tasks stay small. Two places can still grow: a long attempt, such as the Engineer working through many files, and your conversation with the orchestrator. Each model gets a context budget in the routing file, set below its window: about 20k tokens for a 32k local model, and under 100K for Haiku, where its listed price applies. When an attempt nears its budget, these steps run in order and stop once it fits:
+**Context compaction.** Each task starts with a fresh context built from its envelope, so agents never inherit another agent's history and most tasks stay small. Two places can still grow: a long attempt, such as the Engineer working through many files, and your conversation with the orchestrator. Each model gets a context budget in the routing file, set below its window: about 20k tokens for a 32k local model, and under 100K for Haiku, where its listed price applies. While an agent's own provider is down and a fallback stands in, the fallback's budget applies: the defaults' budget, cut for Ollama to what its window holds. When an attempt nears its budget, these steps run in order and stop once it fits:
 
 1. Trim large tool results. Long outputs are already saved to files, so the message keeps a short preview and the path, and the agent can read a range again if it needs to.
 2. Stub old tool results. Results older than the last few steps become one-line notes, such as "read src/models.py, 120 lines", since the files are still in the workspace.
@@ -149,7 +149,7 @@ A retry goes back to Ready with the audit findings attached, and a task with no 
 
 **Delegation.** The orchestrator never calls an agent directly. It gives the dispatcher a task envelope with the objective, input artifacts, output schema, constraints, fetched memories and trace context. The dispatcher runs the agent with a timeout, catches errors, logs every step, and returns a result with a status, the artifact, token usage and any errors. Independent tasks run in parallel with asyncio, for example several research questions at once. Within a run, Engineer tasks run one at a time, since they share the run's workspace. Experts never call each other or create tasks: they return an artifact plus any questions or research requests, and only the orchestrator turns those into new tasks.
 
-**Artifacts and lineage.** Artifacts are versioned files under runs/\<run\_id>/artifacts, such as plan.v1.json and prd.v2.json. Each one records the versions it was built from. When a change request produces a new PRD, everything built from the old one is marked stale and its tasks are queued again as updates, while unaffected work is kept.
+**Artifacts and lineage.** Artifacts are versioned files under runs/\<run\_id>/artifacts, such as plan.v1.json and prd.v2.json. Each one records the versions it was built from and the task that wrote it. Versions are numbered per kind across the run, so two research questions share one counter; a revision's previous version is the latest one its own line of work wrote (the task and the tasks it was reopened from), never a sibling's. When a change request produces a new PRD, everything built from the old one is marked stale and its tasks are queued again as updates, while unaffected work is kept.
 
 **Updates, not rebuilds.** A stale task re-runs as a revision, never from scratch. The agent gets its previous output, a diff of what changed upstream and the reason, such as a change request or your comment, and is asked to change only what that diff requires.
 
@@ -192,7 +192,7 @@ Every agent action leaves a structured log line tied to a trace, and every error
 
 | Error | Example | Handling |
 | --- | --- | --- |
-| TransientLLMError | Rate limit, timeout, server error | Retry after 1, 2 and 4 seconds, then fall back to the next provider |
+| TransientLLMError | Rate limit, timeout, server error, refused connection | Retry after 1, 2 and 4 seconds, then fall back to the next provider. A refused connection isn't retried: the provider is marked down for a minute and calls go straight to the fallback |
 | ContextTooLong | A prompt too big for a local model's window, found before sending | Fall back to the next provider at once; if none is left, compact and retry the attempt |
 | OutputValidationError | JSON that doesn't match the schema | Send the validation errors back to the model, up to 2 times |
 | ToolError | File not found, command exits non-zero | Returned to the agent as a tool result so it can adapt |
@@ -222,14 +222,14 @@ Each rule has an id, a scope (task or run), the agents whose tasks it applies to
 | R3 Testable PRD | Product's task | Every requirement has at least one acceptance criterion | Requirements without criteria | Blocker |
 | R4 Spec coverage | The Architect's task | Every requirement maps to a component, and every acceptance criterion to a planned check | Unmapped ids | Blocker |
 | R5 Files exist | QA's task, over every code change | Every planned file exists, and nothing was written outside the workspace | File list | Blocker |
-| R6 Tests ran | Each Engineer task | The Engineer's unit tests ran and passed, according to the run log | Test result in the log | Blocker |
+| R6 Tests ran | Each Engineer task | The Engineer's unit tests ran and passed, according to the run log | The logged run of the reported command, matched after unwrapping `sh -c` and dropping `VAR=` prefixes; its exit code, or its pytest summary when a `;`, `\|\|` or pipe after the tests can mask the exit code | Blocker |
 | R7 QA clean | QA's task | QA's review has no blocking issues | QA report | Blocker |
 | R8 Process trail | Whole run | Every task has start and end events, a verdict and attempts within the limit, and every decision has a reason | Task store | Blocker |
 | R9 Coverage and scope | Product's and the Architect's tasks | Every ask maps to a requirement, and nothing was added that the request didn't ask for | Asks without requirements | Blocker for a missed ask, warning for additions |
 | R10 Consistency | QA's task, over every code change | The code matches the spec's interfaces | Function and route names | Warning |
 | R11 Questions resolved | Every task, on its final output | Every question the task's output raises is answered or recorded as an assumption | Open questions | Blocker |
 | R12 Minimal revision | Revisions | Only what the upstream diff requires was changed | Changed sections against the diff | Warning |
-| S1 Secrets | Every task | No keys, tokens or passwords in code, logs or artifacts | Secret pattern scan | Blocker |
+| S1 Secrets | Every task | No keys, tokens or passwords in code, logs or artifacts | Secret pattern scan of outputs, code and tool calls; web results are left out, since a tutorial's sample token is outside text that S6 already checks | Blocker |
 | S2 Dangerous code | QA's task, over every code change | No eval or exec on input, no shell commands or SQL built from input, no unsafe deserialization, no disabled TLS checks | Pattern scan of the diff | Blocker |
 | S3 Unexpected reach | QA's task, over every code change | Code only uses the network hosts and file paths the spec allows | Hosts and paths found in the code | Blocker |
 | S4 Risky dependencies | Pre-check before any install, and QA's task | Dependencies are known packages with pinned versions, not lookalike names | Dependency list | Warning |
@@ -237,7 +237,7 @@ Each rule has an id, a scope (task or run), the agents whose tasks it applies to
 | S6 Injected instructions | Every task | No agent acted on instructions found inside fetched pages or files | Fetched text next to the actions that followed | Blocker |
 | S7 Data leaving | Every task | No tool call sent workspace content or secrets to an outside address | Outgoing requests in the log | Blocker |
 
-**Keeping the judge steady.** A blocker the model raises without helper evidence gets a second, independent check before it fails a step, so one flaky judgment can't trap the run in a loop.
+**Keeping the judge steady.** A blocker the model raises without helper evidence gets a second, independent check before it fails a step, so one flaky judgment can't trap the run in a loop. A helper finding about a tool call that already ran, such as a secret in a file an agent read, can't be cleared by a retry either, so it is marked as such and goes to you at once (see below). The other helpers that read the tool log are S5, S6 and S7, which already stop the run and ask you, and R2 and R6, which a retry can satisfy by opening the source or running the tests.
 
 **The auditor itself.** Each sweep runs as an auditor task through the dispatcher, with its own log trail, timeout and retries. An auditor that crashes, times out or returns no valid verdict uses the check's attempts (3 by default), never the attempts of the work it checks. It fails closed: once the check's attempts run out, the work stays unpassed and you are asked, and work that was never checked can't be kept as it is. A verdict lists each finding with its rule id, severity, the artifact and item at fault, the evidence and a suggested fix. Warnings don't block, but they show in the phase review and the final report.
 
@@ -247,10 +247,11 @@ Each rule has an id, a scope (task or run), the agents whose tasks it applies to
 
 1. **Pass:** the task is done and the tasks that depend on it become ready.
 2. **Fail with attempts left:** the task goes back to Ready as a revision of its last output, with the findings added. If a retry or fix fails the same rules on the same items as the one before, counting the tasks it was reopened from, it counts as no progress and goes straight to escalation.
-3. **Fail with no attempts left:** the task is escalated. If a finding blames an upstream artifact, the orchestrator reopens the earliest one at fault, marks everything built on it stale and updates it from there; a spec gap found during implementation reopens the Spec, for example. If the fault is in the task's own output, it gets one last attempt on the stronger model before you're asked.
+3. **Fail with no attempts left:** the task is escalated. If a finding blames an upstream artifact, the orchestrator reopens the earliest one at fault as a fix, marks everything built on it stale and updates it from there; a spec gap found during implementation reopens the Spec, for example. If the fault is in the task's own output, it gets one last attempt on the stronger model before you're asked.
 4. **A check finds a fault in other work of the same phase:** the finding goes to the task that produced the item at fault, which re-runs as a fix, and the tasks after it re-run too. QA's blocking issues, for example, become Engineer fixes for the files named, followed by a fresh QA review. A finding on an earlier phase's artifact reopens its producer right away, as in step 3.
-5. **The user keeps work as it is:** when you are asked about work that failed its check, 'approve' keeps it, and a passing verdict records that you accepted it despite the findings. The plan can't be kept this way, since the pipeline is built from it.
-6. **Still failing after an upstream re-run:** the orchestrator stops and asks you, showing the findings.
+5. **A finding no retry can clear:** a helper finding about a tool call that already ran escalates at once and asks you; 'approve' keeps the work.
+6. **The user keeps work as it is:** when you are asked about work that failed its check, 'approve' keeps it, and a passing verdict records that you accepted it despite the findings. The plan can't be kept this way, since the pipeline is built from it.
+7. **Still failing after an upstream re-run:** the orchestrator stops and asks you, showing the findings.
 
 Each run is capped at 3 attempts per task and 2 upstream re-runs, plus token, cost and time budgets, so it always ends.
 
@@ -314,7 +315,7 @@ Embedding model: nomic-embed-text runs locally through Ollama (under 300 MB), so
 
 Logging, auditing, memory and the live terminal view are all hooks on one event bus, so new behavior never means editing the core loop.
 
-**Events:** run\_started, phase\_started, phase\_finished, task\_started, task\_finished, llm\_call\_before, llm\_call\_after, tool\_call\_before, tool\_call\_after, audit\_verdict, decision, task\_state\_changed, task\_retried, task\_escalated, question\_asked, review\_requested, user\_message, memory\_fetched, memory\_saved, checkpoint\_saved, context\_compacted, run\_finished.
+**Events:** run\_started, phase\_started, phase\_finished, task\_started, task\_finished, llm\_call\_before, llm\_call\_after, tool\_call\_before, tool\_call\_after, audit\_verdict, decision, task\_state\_changed, task\_retried, task\_escalated, question\_asked, review\_requested, user\_message, memory\_fetched, memory\_saved, checkpoint\_saved, context\_compacted, provider\_down, provider\_up, run\_finished.
 
 **Two kinds of hook.** A before hook can change or block what is about to happen, such as denying a shell command or stopping a call that would pass the budget. An after hook only observes.
 
@@ -358,7 +359,7 @@ budget: {max_usd_per_run: 1.00, max_minutes_per_run: 30}
 
 **Gateway.** Every model call and every tool call passes through one gateway, the single place to control traffic:
 
-- **Routing and fallback:** picks the provider and model for each agent from the config, and switches to the next provider when one fails.
+- **Routing and fallback:** picks the provider and model for each agent from the config, and switches to the next provider when one fails. A provider that refuses the connection, such as Ollama not running, is marked down for `retry.provider_down_s` (60 s): calls skip it until then, unless every provider is down, with one provider\_down event when it goes down and one provider\_up event when a call to it works again.
 - **Rate limits:** caps concurrent calls and requests per minute for each provider, and queues the rest.
 - **Budgets:** tracks tokens, cost and time per run and per agent, and blocks any call past a cap.
 - **Tool checks:** every tool call passes the auditor's pre-check before it runs.
@@ -385,12 +386,12 @@ Generated code runs only inside a Docker container, and you drive everything fro
 
 **CLI:**
 
-- `agent-team run "<task>"` starts a run and shows it live: a tree of phases and tasks, each with its agent, status, attempt and current tool call, under a token and cost ticker. The view only listens to the event bus, and if drawing fails it logs once and falls back to plain lines, so a UI bug never fails a run. `--plain` prints one line per event instead, for CI and logs.
+- `agent-team run "<task>"` starts a run and shows it live: a tree of phases and tasks, each with its agent, status, attempt and current tool call, under a token and cost ticker. The view only listens to the event bus, and if drawing fails it logs once and falls back to plain lines, so a UI bug never fails a run. `--plain` prints one line per event instead, for CI and logs; lines of sibling tasks, such as two research questions, carry a short objective so you can tell them apart.
 - The orchestrator's replies print under the view. While the run waits on you, each line you type is sent as a message: an answer, a comment, a question or a change. Ending the input (Ctrl-D) leaves the run waiting, and `agent-team resume <run_id>` picks it up, after a crash too. `--chaos` injects model faults, and `--context <folder>` gives the Researcher files to read but never write.
-- At the end you get a summary, the run audit's findings, QA's evidence for each acceptance criterion, the test results and every assumption. You type accept or describe a change, and the session stays open. After a change re-runs, the next review starts with what changed: a section diff of each artifact that got a new version, with list items matched by id, and the git diff between the code versions' tags.
+- At the end you get a summary, the run audit's findings, QA's evidence for each acceptance criterion, the test results and every assumption. You type accept or describe a change, and the session stays open. After a change re-runs, the next review starts with what changed: the git diff between the code versions' tags first, then a section diff of each artifact that got a new version, with list items matched by id. Each part is cut to its own length and says how much it cut, so a long artifact diff never hides the code.
 - You can then ask things like "show the PRD", "list the files" or "why did the spec retry?", or ask for a change in plain words.
 - `agent-team logs <run_id>` prints the run's events, filtered with `--agent` or `--task`, and `--spans` prints its trace tree. `agent-team memory search "<query>"` prints the best memories with their scores, filtered with `--kind`.
-- `agent-team stats [run_id]` shows tokens, cost, time, retries and the first-pass audit rate per run and per agent, for the performance part of the demo. A run's time counts only while tasks were working, not while it waited on you. The first-pass rate counts planned work whose first audit passed; retries, revisions and fixes don't count toward it.
+- `agent-team stats [run_id]` shows tokens, cost, time, retries and the first-pass audit rate per run and per agent, for the performance part of the demo. An agent's time is the time inside its attempt spans (checks, for the auditor), and a run's time is the time any attempt was running, so waiting on you doesn't count. The first-pass rate is the share of tasks whose first check passed; fixes, which exist because a check failed on that work, are left out, while a revision for a change request counts as new work. A message that can't find a run names the database it looked in, since a relative path depends on the folder.
 - The workflow itself is driven only through the orchestrator's streaming session, as the brief requires. The other commands only read the store, apart from resume and stop, which the session also offers.
 
 **Change requests.** The orchestrator works out which artifact the change touches first. A new endpoint changes the PRD, while a renamed function changes only the code. It creates a new version from that point, asks each later agent to update its own artifact, and shows you a diff of what changed. Before anything re-runs, it tells you which artifact it will reopen and which tasks will re-run, and waits for your go-ahead.

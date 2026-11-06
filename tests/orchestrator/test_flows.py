@@ -179,6 +179,9 @@ async def test_upstream_rerun_supersedes_and_rebuilds_downstream(tmp_path: Path)
         tasks = await _tasks(team.tasks, run.id, kind)
         assert [t.status for t in tasks] == [TaskStatus.SUPERSEDED, TaskStatus.DONE], kind
         assert tasks[1].parent_task_id == tasks[0].id
+    # The producer at fault re-runs as a fix; what was built on it re-runs as revisions.
+    origins = {k: (await _tasks(team.tasks, run.id, k))[1].origin for k in ("spec", "qa_report")}
+    assert origins == {"spec": TaskOrigin.FIX, "qa_report": TaskOrigin.REVISION}
     # PRD wasn't touched.
     assert len(await _tasks(team.tasks, run.id, "prd")) == 1
     kinds = [d.kind for d in team.decisions.items]

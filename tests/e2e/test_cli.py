@@ -169,7 +169,8 @@ def test_stop_or_resume_of_an_unknown_or_finished_run(config_file: Path) -> None
     runner = CliRunner()
     for command in ("stop", "resume"):
         unknown = runner.invoke(cli.app, [command, "run_nope", "-c", str(config_file)])
-        assert unknown.exit_code == 1 and "No run run_nope." in unknown.output
+        assert unknown.exit_code == 1 and "No run run_nope in " in unknown.output
+        assert str(config_file.parent) in _plain(unknown)  # where it looked
     assert not (config_file.parent / "runs" / "run_nope").exists()
     done = runner.invoke(
         cli.app, ["run", "Build a books API", "-c", str(config_file)], input="20\naccept\n"
@@ -184,13 +185,14 @@ def test_stop_or_resume_of_an_unknown_or_finished_run(config_file: Path) -> None
 def test_stats_of_one_run_and_of_all_runs(config_file: Path) -> None:
     runner = CliRunner()
     empty = runner.invoke(cli.app, ["stats", "-c", str(config_file)])
-    assert empty.exit_code == 0 and "No runs yet." in empty.output
+    assert empty.exit_code == 0 and "No runs yet in " in empty.output
     run_id = _left_waiting(config_file)
     wide = {"COLUMNS": "140"}
     one = runner.invoke(cli.app, ["stats", run_id, "-c", str(config_file)], env=wide)
     assert one.exit_code == 0, one.output
     lines = _plain(one).splitlines()
-    assert lines[0].split() == [
+    assert lines[0].startswith(f"run {run_id} (waiting): ")
+    assert lines[1].split() == [
         "calls",
         "tokens",
         "in",
@@ -200,15 +202,23 @@ def test_stats_of_one_run_and_of_all_runs(config_file: Path) -> None:
         "time",
         "tasks",
         "retries",
-        "first",
+        "1st",
         "pass",
     ]
-    assert lines[1].startswith(f"run {run_id} (waiting)")
+    assert lines[2].startswith("total ")
     assert any(line.startswith("  product ") for line in lines), one.output
+    assert lines[-1].startswith("time: inside each agent's attempts")
+    # At the default width the run id and agent names stay whole.
+    narrow = runner.invoke(
+        cli.app, ["stats", run_id, "-c", str(config_file)], env={"COLUMNS": "80"}
+    )
+    narrow_lines = _plain(narrow).splitlines()
+    assert run_id in narrow_lines[0]
+    assert any(line.startswith("  orchestrator ") for line in narrow_lines), narrow.output
     every = runner.invoke(cli.app, ["stats", "-c", str(config_file)], env=wide)
     assert any(line.startswith("all runs") for line in _plain(every).splitlines())
     unknown = runner.invoke(cli.app, ["stats", "run_nope", "-c", str(config_file)])
-    assert unknown.exit_code == 1 and "No run run_nope." in unknown.output
+    assert unknown.exit_code == 1 and "No run run_nope in " in unknown.output
 
 
 def test_context_folders_reach_the_run_read_only(config_file: Path, tmp_path: Path) -> None:

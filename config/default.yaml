@@ -17,7 +17,8 @@ limits: {max_attempts: 3, max_upstream_reruns: 2, max_concurrent_calls: 4}
 review: auto_assumptions
 
 # Gateway details.
-retry: {delays_s: [1, 2, 4]}
+# A provider that refuses a connection is skipped for provider_down_s seconds.
+retry: {delays_s: [1, 2, 4], provider_down_s: 60}
 rate_limits:
   anthropic: {max_concurrent: 4, requests_per_minute: 50}
   ollama: {max_concurrent: 1}

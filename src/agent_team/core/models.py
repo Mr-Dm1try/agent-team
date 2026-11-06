@@ -351,6 +351,8 @@ class Finding(Contract):
     evidence: str | None = None
     suggested_fix: str | None = None
     from_helper: bool = False  # True when an evidence helper produced or confirmed it
+    #: About a tool call that already ran, so no retry can clear it; the user is asked.
+    already_happened: bool = False
 
 
 class Verdict(Contract):
@@ -539,6 +541,8 @@ class EventName(StrEnum):
     SPAN_STARTED = "span_started"
     SPAN_FINISHED = "span_finished"
     ERROR = "error"
+    PROVIDER_DOWN = "provider_down"
+    PROVIDER_UP = "provider_up"
     RUN_FINISHED = "run_finished"
 
 

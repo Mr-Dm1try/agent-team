@@ -596,3 +596,20 @@ async def test_ollama_does_not_warn_about_a_full_prompt_the_cap_left_room_for(
     with caplog.at_level("WARNING", logger=op.__name__):
         await provider.complete(request(), model="gpt-oss:20b")
     assert not caplog.text
+
+
+def test_only_a_failed_connection_counts_as_a_provider_being_down() -> None:
+    from agent_team.llm import anthropic_provider, ollama_provider
+
+    req = httpx2.Request("POST", "http://l")
+    down = ollama_provider.translate_error(openai.APIConnectionError(request=req), "ollama")
+    slow = ollama_provider.translate_error(openai.APITimeoutError(request=req), "ollama")
+    assert isinstance(down, TransientLLMError) and down.unreachable
+    assert isinstance(slow, TransientLLMError) and not slow.unreachable
+
+    refused = anthropic.APIConnectionError(request=req)
+    refused.__cause__ = httpx2.ConnectError("refused")
+    blip = anthropic.APIConnectionError(request=req)
+    blip.__cause__ = httpx2.ReadError("reset")
+    assert anthropic_provider.translate_error(refused, "anthropic").unreachable  # type: ignore[attr-defined]
+    assert not anthropic_provider.translate_error(blip, "anthropic").unreachable  # type: ignore[attr-defined]

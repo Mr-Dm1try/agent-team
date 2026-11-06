@@ -132,3 +132,12 @@ def test_memory_settings_load_and_reject_weights_with_no_text_match() -> None:
     assert MemoryKind.LESSON in config.memory.kinds[AgentName.ENGINEER]
     with pytest.raises(ValidationError, match="cosine \\+ bm25"):
         load_config(overrides={"memory": {"weights": {"cosine": 0, "bm25": 0}}})
+
+
+def test_a_fallback_gets_the_defaults_budget_cut_to_fit_ollama() -> None:
+    cfg = load_config()
+    assert cfg.fallback_budget("anthropic") == cfg.defaults.context_budget
+    ollama = cfg.providers.ollama
+    fits = (ollama.num_ctx - ollama.min_output_tokens) * ollama.chars_per_token // 3
+    assert cfg.fallback_budget("ollama") == min(cfg.defaults.context_budget, fits)
+    assert cfg.fallback_budget("ollama") < cfg.defaults.context_budget

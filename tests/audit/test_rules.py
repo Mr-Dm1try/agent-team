@@ -534,7 +534,7 @@ def test_r6_tests_ran(run: Run) -> None:
     assert len(blockers(run_helper("R6", failing))) == 1
     not_logged = code_ctx(run)
     not_logged.tool_calls = []  # claims a result the tool log can't back up
-    assert "no run of 'pytest -q'" in run_helper("R6", not_logged).findings[0].message
+    assert "matches no command this task ran" in run_helper("R6", not_logged).findings[0].message
     untested = code_ctx(run, tests=None)
     assert len(blockers(run_helper("R6", untested))) == 1
 
@@ -567,6 +567,89 @@ def test_r6_a_passing_subset_does_not_hide_a_failing_full_run(run: Run) -> None:
         subset.model_copy(update={"data": {"exit_code": 0}}),
     ]
     assert len(blockers(run_helper("R6", ctx))) == 1
+
+
+def _logged(run: Run, ctx: AuditContext, result: str, argv: list[str], exit_code: int) -> None:
+    """Replace the context's tool log with one run_command call."""
+    [eng] = [t for t, _ in ctx.outputs]
+    logged = call(run, eng, "run_command", result, argv=argv)
+    ctx.tool_calls = [logged.model_copy(update={"data": {"argv": argv, "exit_code": exit_code}})]
+
+
+def test_r6_prose_in_the_command_names_the_runs_and_the_fix(run: Run) -> None:
+    prose = "PYTHONPATH=.deps python -m pytest -q  (dependencies installed with install_deps)"
+    ctx = code_ctx(
+        run,
+        tests=UnitTestRun(command=prose, passed=3, failed=0, exit_code=0, output_tail="ok"),
+    )
+    _logged(run, ctx, "3 passed in 1s", ["python", "-m", "pytest", "-q"], 0)
+    [finding] = run_helper("R6", ctx).findings
+    assert "`python -m pytest -q`" in finding.message  # the command that did run
+    assert "exact argv" in (finding.suggested_fix or "")
+
+
+def test_r6_matches_after_assignments_and_whitespace(run: Run) -> None:
+    ctx = code_ctx(
+        run,
+        tests=UnitTestRun(
+            command="PYTHONPATH=.deps  python -m pytest -q", passed=3, failed=0, exit_code=0,
+            output_tail="ok",
+        ),
+    )  # fmt: skip
+    _logged(run, ctx, "3 passed in 1s", ["python", "-m", "pytest", "-q"], 0)
+    assert blockers(run_helper("R6", ctx)) == []
+
+
+@pytest.mark.parametrize(
+    ("script", "masked"),
+    [
+        ("python -m pytest -q; echo EXIT=$?", True),
+        ("python -m pytest -q || true", True),
+        ("python -m pytest -q | tail -20", True),
+        ("set -o pipefail; python -m pytest -q | tail -20", False),
+        ("cd /workspace && python -m pytest -q", False),
+        ("python -m pytest -q && echo ok", False),
+    ],
+)
+def test_r6_trusts_an_exit_code_only_when_nothing_masks_it(
+    run: Run, script: str, masked: bool
+) -> None:
+    ctx = code_ctx(run)  # reports "pytest -q", 3 passed, exit 0
+    # Exit 0 but no summary: fine only when the exit code is the tests' own.
+    _logged(run, ctx, "done", ["sh", "-c", script.replace("python -m pytest", "pytest")], 0)
+    found = run_helper("R6", ctx).findings
+    assert bool(found) is masked, [f.message for f in found]
+    if masked:
+        assert "no pytest summary" in found[0].message
+
+
+def test_r6_a_masked_run_uses_the_pytest_summary(run: Run) -> None:
+    ctx = code_ctx(run)
+    argv = ["bash", "-c", "pytest -q 2>&1; echo EXIT=$?"]
+    _logged(run, ctx, "...\n3 passed in 0.5s\nEXIT=0", argv, 0)
+    assert blockers(run_helper("R6", ctx)) == []
+    _logged(run, ctx, "...\n= 1 failed, 2 passed in 0.5s =\nEXIT=1", argv, 0)
+    [finding] = run_helper("R6", ctx).findings
+    assert "1 failed" in finding.message
+    _logged(run, ctx, "...\n1 error in 0.5s\nEXIT=2", argv, 0)
+    assert "1 errors" in run_helper("R6", ctx).findings[0].message
+
+
+def test_s1_skips_untrusted_results_but_not_their_args(run: Run) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    page = call(run, task, "web_fetch", '"X-Token": "coneofsilence"', url="https://a.dev/t")
+    ctx = AuditContext(run=run, scope=RuleScope.TASK, task=task, tool_calls=[page])
+    assert run_helper("S1", ctx).findings == []
+    # A file the agent read is ours, so the same text there is still a hit, and the
+    # call already ran, so it is marked as such.
+    read = call(run, task, "read_file", 'token = "coneofsilence"', path="conf.py")
+    ctx.tool_calls = [read]
+    [finding] = run_helper("S1", ctx).findings
+    assert finding.already_happened
+    key = "sk-ant-" + "a1B2c3D4e5F6g7H8i9J0kLmN"
+    sent = call(run, task, "web_fetch", "ok", url=f"https://a.dev/?k={key}")
+    ctx.tool_calls = [sent]
+    assert len(blockers(run_helper("S1", ctx))) == 1
 
 
 def test_r7_qa_clean(run: Run) -> None:

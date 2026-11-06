@@ -53,7 +53,7 @@ class FakeLLM:
     def stream(self, request: LLMRequest) -> AsyncIterator[StreamChunk]:
         raise NotImplementedError
 
-    def context_budget(self, agent: AgentName) -> int:
+    def context_budget(self, agent: AgentName, task_id: str | None = None) -> int:
         return 90_000
 
     def providers_for(self, agent: AgentName, task_id: str | None) -> list[str]:
