@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from agent_team.core.errors import ToolError
 from agent_team.core.interfaces import ToolContext
 from agent_team.core.models import AgentName, Phase, Run, Task
 from agent_team.tools import web_tools
-from agent_team.tools.web import is_public, untrusted
+from agent_team.tools.web import is_public, readable_json, untrusted
 from agents.fakes import FakeBus
 
 CONFIG = WebConfig(timeout_s=2, max_bytes=5_000, max_chars=2_000, max_results=3)
@@ -172,6 +173,48 @@ async def test_fetch_caps_bytes_and_chars(ctx: ToolContext) -> None:
     assert out.data is not None and out.data["truncated"] and out.data["bytes"] == 5_000
     assert out.content.count("x") <= CONFIG.max_chars + 10
     assert "cut at 2000 chars" in out.content
+
+
+PYPI = {
+    "info": {
+        "name": "mcp",
+        "version": "1.30.0",
+        "requires_python": ">=3.10",
+        "summary": "Model Context Protocol SDK",
+        "description": "README " * 20_000,
+        "requires_dist": ["pydantic>=2", "pyjwt[crypto]>=2.10"],
+    },
+    "releases": {
+        "1.30.0": [{"upload_time_iso_8601": "2026-09-01T00:00:00Z", "yanked": False}],
+        "1.2.0": [{"upload_time_iso_8601": "2025-01-01T00:00:00Z", "yanked": False}],
+        "1.3.0": [{"upload_time_iso_8601": "2025-02-01T00:00:00Z", "yanked": True}],
+        "0.0.1": [],
+    },
+}
+
+
+async def test_a_pypi_project_reads_as_its_versions(ctx: ToolContext) -> None:
+    doc = httpx.Response(200, json=PYPI)
+    web = Web({"pypi.org": [PUBLIC]}, {"pypi.org/pypi/mcp/json": doc})
+    tools = web_tools(
+        CONFIG.model_copy(update={"max_bytes": 1_000_000}),
+        transport=httpx.MockTransport(web.handle),
+        resolver=web.resolve,
+    )
+    out = await tools["web_fetch"]({"url": "https://pypi.org/pypi/mcp/json"}, ctx)
+    assert not out.is_error
+    assert "PyPI project mcp: latest version 1.30.0 (requires Python >=3.10)" in out.content
+    assert "Released versions, oldest first (3): 1.2.0, 1.3.0 (yanked), 1.30.0" in out.content
+    assert "pyjwt[crypto]>=2.10" in out.content and "README" not in out.content
+
+
+def test_json_keeps_its_shape_and_a_cut_pypi_document_keeps_its_versions() -> None:
+    other = readable_json(json.dumps({"a": "x" * 1000, "b": [1, 2]}))
+    assert json.loads(other)["b"] == [1, 2] and "700 chars cut" in other
+    cut = json.dumps(PYPI)[:-40]  # the size cap stopped it mid-document
+    assert "latest version 1.30.0" in readable_json(cut)
+    assert "1.30.0, 1.2.0, 1.3.0" in readable_json(cut)
+    assert readable_json("not json") == "not json"
 
 
 async def test_fetch_errors_reach_the_model(ctx: ToolContext) -> None:

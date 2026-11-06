@@ -47,6 +47,9 @@ can read and from the web, and return them with their sources.
   web_search and web_fetch when available and the answer isn't in the files.
 - Every finding cites at least one source you actually opened in this attempt: a file
   path you read or a URL you fetched. Never cite a source you didn't open.
+- A package version is a claim too. Before you pin one (mcp==1.2.0), fetch
+  https://pypi.org/pypi/<package>/json, which lists every released version, and cite
+  it; a version no source you opened shows fails the check.
 - Your objective is the research question. Answer it, and any sub-questions you need,
   in `answers`. If you can't, set `answer` to null and say why in `gap`.
 - For a research_answer, write a direct answer to the user's question and list the

@@ -3,8 +3,9 @@
 No contract in ``core`` reads events back, so the auditor keeps its own log, filled
 from ``tool_call_after`` events. The event's ``data`` is read leniently: ``tool`` (or
 ``name``), ``args`` (or ``arguments``), ``result`` (or ``content``), ``is_error``,
-``blocked`` (True when the pre-check refused the call, so it never ran) and ``data``
-(the tool's structured result, such as a command's ``exit_code``).
+``blocked`` (True when the pre-check refused the call, so it never ran), ``data``
+(the tool's structured result, such as a command's ``exit_code``) and ``stored_at``
+(the file holding a result too long to inline).
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ class ToolCall(Contract):
     is_error: bool = False
     blocked: bool = False  # refused by the pre-check: it never ran
     data: dict[str, Any] = Field(default_factory=dict)
+    #: Where the full result was saved when it was too long to inline.
+    stored_at: str | None = None
     ts: datetime = Field(default_factory=utcnow)
 
 
@@ -120,6 +123,7 @@ def tool_call_from_event(event: Event) -> ToolCall | None:
         is_error=bool(data.get("is_error", False)),
         blocked=bool(data.get("blocked", False)),
         data=extra if isinstance(extra, dict) else {},
+        stored_at=data["stored_at"] if isinstance(data.get("stored_at"), str) else None,
         ts=event.ts,
     )
 
