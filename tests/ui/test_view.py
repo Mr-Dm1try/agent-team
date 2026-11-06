@@ -562,3 +562,20 @@ async def test_a_reply_under_the_live_tree_leaves_one_tree_below_it() -> None:
     assert len(trees) == 1, "\n".join(shown)
     assert shown.index("The architect is writing the design.") < trees[0]
     assert hint.rstrip() not in shown
+
+
+async def test_what_is_typed_shows_after_the_hint_through_every_redraw() -> None:
+    out = io.StringIO()
+    console = Console(file=out, width=100, color_system=None, force_terminal=True)
+    view = RunView(console)
+    hint = "Type a question or a change, or stop to stop the run: "
+    view.start(hint=hint)
+    view.typed("what are you")
+    await _feed(view, STREAM[:6])  # each event redraws the tree, the hint line too
+    assert screen(out.getvalue())[-1] == hint + "what are you"
+    view.typed("what are you doing?")
+    await _feed(view, STREAM[6:8])
+    assert screen(out.getvalue())[-1] == hint + "what are you doing?"
+    view.typed("")  # Enter: the line goes to the team and the hint's line is empty again
+    assert screen(out.getvalue())[-1] == hint.rstrip()
+    view.stop()

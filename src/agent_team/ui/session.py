@@ -19,13 +19,24 @@ session will see its flag at the next model call, or must mark the run stopped i
 from __future__ import annotations
 
 import asyncio
+import atexit
+import codecs
 import contextlib
 import logging
+import os
 import re
 import sys
 import threading
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
+
+try:
+    import termios
+    import tty
+except ImportError:  # Windows: there the terminal echoes typed lines itself
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 from rich.console import Console
 
@@ -59,21 +70,121 @@ STOP_REASON = "the user typed stop while the team worked"
 LineReader = Callable[[], Awaitable[str | None]]
 
 
+#: Told what the user has typed so far on the current line, and whether Enter ended it.
+TypingListener = Callable[[str, bool], None]
+
+
+@dataclass
+class LineEditor:
+    """Line editing for keys read one at a time from a terminal that doesn't echo:
+    printable keys, Backspace, Ctrl-U (clear), Ctrl-W (delete a word), Enter, and
+    Ctrl-D on an empty line (end of input). Arrow keys and other escape sequences are
+    dropped, so they never land in a message."""
+
+    typed: list[str] = field(default_factory=list)
+    _escape: str = ""  # "" outside an escape sequence, else how far into one
+    _after_cr: bool = False  # the last key was a CR, so a LF right after it is the same Enter
+
+    def feed(self, keys: str) -> list[tuple[str, str]]:
+        """Apply ``keys`` and return what happened, in order: ("typed", the line so far)
+        after a change, ("line", the finished line) on Enter, ("end", "") on Ctrl-D."""
+        out: list[tuple[str, str]] = []
+        for key in keys:
+            after_cr, self._after_cr = self._after_cr, False
+            if self._skip_escape(key):
+                continue
+            if key == "\n" and after_cr:
+                continue
+            if key in "\r\n":
+                self._after_cr = key == "\r"
+                line = "".join(self.typed)
+                self.typed.clear()
+                out.append(("line", line))
+                continue
+            if key == "\x04":
+                if not self.typed:
+                    out.append(("end", ""))
+                    return out
+                continue
+            if not self._edit(key):
+                continue
+            if out and out[-1][0] == "typed":
+                out.pop()
+            out.append(("typed", "".join(self.typed)))
+        return out
+
+    def _skip_escape(self, key: str) -> bool:
+        """Whether ``key`` starts or belongs to an escape sequence, such as an arrow key's
+        ESC [ A, and is dropped."""
+        if self._escape == "esc":
+            self._escape = "csi" if key == "[" else "ss3" if key == "O" else ""
+            return True
+        if self._escape == "csi":
+            if "@" <= key <= "~":
+                self._escape = ""
+            return True
+        if self._escape == "ss3":
+            self._escape = ""
+            return True
+        if key == "\x1b":
+            self._escape = "esc"
+            return True
+        return False
+
+    def _edit(self, key: str) -> bool:
+        """Change the line for one key; True if it changed."""
+        if key in ("\x7f", "\b"):
+            if not self.typed:
+                return False
+            self.typed.pop()
+            return True
+        if key == "\x15":
+            had = bool(self.typed)
+            self.typed.clear()
+            return had
+        if key == "\x17":
+            had = bool(self.typed)
+            while self.typed and self.typed[-1] == " ":
+                self.typed.pop()
+            while self.typed and self.typed[-1] != " ":
+                self.typed.pop()
+            return had
+        if key == "\t":
+            key = " "
+        if key < " ":
+            return False  # other control keys
+        self.typed.append(key)
+        return True
+
+
+def can_edit_lines() -> bool:
+    """Whether the session can read keys itself: stdin is a terminal that termios
+    can switch out of line mode."""
+    return termios is not None and sys.stdin.isatty()
+
+
 class StdinLines:
     """Reads stdin on a daemon thread, so a line typed while the team works is read at
     once, and a read still waiting when the session ends doesn't keep the process
-    alive (a thread from ``asyncio.to_thread`` would)."""
+    alive (a thread from ``asyncio.to_thread`` would).
 
-    def __init__(self) -> None:
+    With ``on_typing``, stdin must be a terminal: the thread turns the terminal's echo
+    and line mode off and reads keys itself, so the session can draw what is typed
+    where a redraw of the live view won't wipe it. The terminal is set back when the
+    input ends or the process exits."""
+
+    def __init__(self, on_typing: TypingListener | None = None) -> None:
         """The thread starts on the first read, on the running loop."""
         self._lines: asyncio.Queue[str | None] | None = None
+        self.on_typing = on_typing
 
     async def __call__(self) -> str | None:
         """The next line, stripped; None at the end of input."""
         if self._lines is None:
             self._lines = asyncio.Queue()
             loop = asyncio.get_running_loop()
-            threading.Thread(target=self._pump, args=(loop, self._lines), daemon=True).start()
+            pump = self._pump_keys if self.on_typing is not None else self._pump
+            threading.Thread(target=pump, args=(loop, self._lines), daemon=True).start()
         return await self._lines.get()
 
     @staticmethod
@@ -87,6 +198,41 @@ class StdinLines:
                 return  # the loop has closed: the session is over
             if not line:
                 return
+
+    def _pump_keys(self, loop: asyncio.AbstractEventLoop, lines: asyncio.Queue[str | None]) -> None:
+        """Read keys with the terminal's echo and line mode off, and hand the loop each
+        change to the typed line and each finished line, then None at the end."""
+        assert termios is not None and tty is not None and self.on_typing is not None
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+
+        def restore() -> None:
+            """Give the terminal back its echo and line mode."""
+            with contextlib.suppress(termios.error, OSError):
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+        atexit.register(restore)
+        tty.setcbreak(fd)  # keys arrive one by one, unechoed; Ctrl-C still interrupts
+        editor = LineEditor()
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            while True:
+                data = os.read(fd, 1024)
+                events = editor.feed(decoder.decode(data)) if data else [("end", "")]
+                for kind, text in events:
+                    try:
+                        if kind == "typed":
+                            loop.call_soon_threadsafe(self.on_typing, text, False)
+                        elif kind == "line":
+                            loop.call_soon_threadsafe(self.on_typing, text, True)
+                            loop.call_soon_threadsafe(lines.put_nowait, text.strip())
+                        else:
+                            loop.call_soon_threadsafe(lines.put_nowait, None)
+                            return
+                    except RuntimeError:
+                        return  # the loop has closed: the session is over
+        finally:
+            restore()
 
 
 class Session:
@@ -106,8 +252,11 @@ class Session:
         it does when stdin is a terminal, so piped answers wait for their prompts."""
         self.team = team
         self.console = console
-        self.read_line = read_line or StdinLines()
+        #: The session draws what is typed itself, since the terminal no longer echoes it.
+        self.draws_typing = read_line is None and console.is_terminal and can_edit_lines()
+        self.read_line = read_line or StdinLines(self._typed if self.draws_typing else None)
         self.listen = sys.stdin.isatty() if listen is None else listen
+        self._at_prompt = False  # the "> " prompt is showing and waits for a line
         self.view = RunView(console, plain=plain)
         self.view.attach(team.bus)
         self.lock = DriveLock(team.runs_dir)
@@ -128,6 +277,19 @@ class Session:
         are about it."""
         self._driving = event.run_id
         self.lock.acquire(event.run_id)
+
+    def _typed(self, text: str, entered: bool) -> None:
+        """Show what the user has typed so far: after the hint under the live view, or
+        on the prompt's line. Enter ends the line there, as the terminal's echo did."""
+        if self.view.live:
+            self.view.typed("" if entered else text)
+            return
+        prompt = "> " if self._at_prompt else ""
+        try:
+            self.console.file.write(f"\r\x1b[2K{prompt}{text}" + ("\n" if entered else ""))
+            self.console.file.flush()
+        except Exception:
+            log.debug("couldn't echo a typed line", exc_info=True)
 
     def say(self, text: str) -> None:
         """Print text as it is, without Rich markup."""
@@ -176,7 +338,7 @@ class Session:
                 if work.done():
                     return work.result()
                 line = self._take()
-                if line is not None:
+                if line is not None and not self.draws_typing:
                     self.view.line_typed()
                 if line:
                     await self._guarded(line)
@@ -228,7 +390,7 @@ class Session:
     def _under_view(self, line: str, text: str) -> None:
         """Print the typed line and the reply to it under the live view: the view pauses,
         they print, and the view starts again below them, so the screen keeps one tree.
-        The line is echoed because a redraw of the live view clears what was typed."""
+        The line is echoed because the hint's line, where it was typed, is redrawn."""
         self.view.pause()
         self.say(f"> {line}")
         self.say(text)
@@ -342,7 +504,11 @@ class Session:
         self.console.print("> ", end="", markup=False, highlight=False)
         if self._reading is None:
             self._reading = asyncio.ensure_future(self.read_line())
-        await asyncio.wait({self._reading})
+        self._at_prompt = True
+        try:
+            await asyncio.wait({self._reading})
+        finally:
+            self._at_prompt = False
         return self._take()
 
     async def _review(self, run_id: str) -> str | None:

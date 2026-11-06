@@ -248,6 +248,8 @@ class RunView:
         self._live: Live | None = None
         #: A dim line under the live tree, such as how to talk to the team meanwhile.
         self._hint: str | None = None
+        #: What the user has typed so far after the hint, drawn with every frame.
+        self._typed = ""
         self._broken = False
         #: What the last printed tree showed, so an unchanged tree isn't printed again.
         self._printed: tuple[object, ...] | None = None
@@ -267,7 +269,7 @@ class RunView:
 
     def start(self, *, hint: str | None = None) -> None:
         """Start redrawing in place, with ``hint`` under the tree, unless the view
-        prints plain lines."""
+        prints plain lines. With a hint the cursor stays visible, after what is typed."""
         if self.plain or self._live is not None:
             return
         self._hint = hint
@@ -276,8 +278,26 @@ class RunView:
                 self._frame(), console=self.console, auto_refresh=False, transient=True
             )
             self._live.start()
+            if hint is not None:
+                self.console.show_cursor(True)  # Live hides it
         except Exception:
             self._fall_back("start the live view")
+
+    @property
+    def live(self) -> bool:
+        """Whether the tree is redrawing in place now."""
+        return self._live is not None
+
+    def typed(self, text: str) -> None:
+        """Show ``text`` after the hint as what the user has typed so far, redrawn with
+        every frame so a redraw never wipes it."""
+        self._typed = text
+        if self._live is None:
+            return
+        try:
+            self._live.update(self._frame(), refresh=True)
+        except Exception:
+            self._fall_back("show what was typed")
 
     def line_typed(self) -> None:
         """The user pressed Enter under the live tree, and the terminal moved the
@@ -505,10 +525,10 @@ class RunView:
     # --- drawing ---------------------------------------------------------------------
 
     def _frame(self) -> Group:
-        """What the live display draws: the tree, then the hint."""
+        """What the live display draws: the tree, then the hint and what is typed after it."""
         if self._hint is None:
             return self.render()
-        return Group(self.render(), Text(self._hint, style="dim"))
+        return Group(self.render(), Text.assemble((self._hint, "dim"), self._typed))
 
     def render(self) -> Group:
         """The tree of every run the view has seen, with its ticker."""

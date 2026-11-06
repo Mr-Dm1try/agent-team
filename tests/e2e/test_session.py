@@ -502,3 +502,24 @@ async def test_a_stop_typed_as_the_run_starts_waiting_stops_it(tmp_path: Path) -
         after = await session._settle_stop(reply)
         run = await app.stores.tasks.get_run(reply.run_id)
     assert after.kind == "stopped" and run.status is RunStatus.STOPPED
+
+
+async def test_typed_keys_show_at_the_prompt_and_under_the_live_tree(tmp_path: Path) -> None:
+    app = await e2e_app(tmp_path)
+    out = io.StringIO()
+    console = Console(file=out, width=100, color_system=None, force_terminal=True)
+    with app:
+
+        async def nothing() -> str | None:
+            """A reader that is never asked."""
+            return None
+
+        session = Session(app, console, read_line=nothing, listen=True)
+        session._at_prompt = True
+        session._typed("acc", False)
+        session._typed("accept", True)
+        assert out.getvalue().endswith("\r\x1b[2K> acc\r\x1b[2K> accept\n")
+        session.view.start(hint="Type: ")
+        session._typed("what", False)
+        assert out.getvalue().endswith("Type: what")
+        session.view.stop()
