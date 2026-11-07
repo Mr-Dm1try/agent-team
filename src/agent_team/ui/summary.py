@@ -138,8 +138,15 @@ def remembered_count(memories: list[dict[str, str]]) -> str:
     for m in memories:
         kind = m.get("kind", "memory")
         counts[kind] = counts.get(kind, 0) + 1
-    parts = [f"{n} {kind.replace('_', ' ')}{'' if n == 1 else 's'}" for kind, n in counts.items()]
+    parts = [f"{n} {_plural(kind.replace('_', ' '), n)}" for kind, n in counts.items()]
     return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def _plural(noun: str, n: int) -> str:
+    """``noun`` for ``n`` of it: "1 decision", "2 run summaries"."""
+    if n == 1:
+        return noun
+    return noun[:-1] + "ies" if noun.endswith("y") else noun + "s"
 
 
 def source_line(source: Source) -> str:

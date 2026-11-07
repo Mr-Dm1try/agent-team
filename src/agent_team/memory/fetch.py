@@ -19,6 +19,7 @@ from agent_team.core.artifacts import Artifact
 from agent_team.core.config import MemoryConfig
 from agent_team.core.interfaces import EventBus, MemoryIndex
 from agent_team.core.models import (
+    SESSION,
     AgentName,
     Event,
     EventName,
@@ -132,7 +133,11 @@ class MemoryFetch:
                 max_tokens=self.config.max_tokens,
             )
             ids = [r.memory.id for r, _ in chosen]
-            earlier = [earlier_run(r.memory) for r, _ in chosen if r.memory.origin.run_id != run.id]
+            earlier = [
+                earlier_run(r.memory)
+                for r, _ in chosen
+                if r.memory.origin.run_id not in (run.id, SESSION)
+            ]
             await self.index.record_fetch(run.id, task.id, task.attempt, query, ids)
         except Exception as exc:
             await self._emit(

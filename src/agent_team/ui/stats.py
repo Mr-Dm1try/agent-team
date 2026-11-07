@@ -239,7 +239,7 @@ def _with_titles_below(
             first.ljust(widths[0]),
             *(p.rjust(w) for p, w in zip(rest, widths[1:], strict=True)),
         ]
-        return Text(" ".join(cols).rstrip())
+        return Text(" ".join(cols).rstrip(), no_wrap=True, overflow="ignore")
 
     heads = [h.split("\n") for h in HEADER]
     out: list[Table | Text] = [
@@ -249,7 +249,7 @@ def _with_titles_below(
     for cell, title in zip(cells, titles, strict=True):
         out.append(line(cell))
         if title:
-            out.append(Text("  title: " + short(title, max(width - 9, 1))))
+            out.append(Text("  title: " + short(title, max(width - 9, 1)), no_wrap=True))
     return out
 
 

@@ -69,12 +69,13 @@ MAX_PREFERENCE_CHARS = 300
 SETTINGS = LoopSettings(max_steps=15, max_repairs=1, final_reply=True)
 
 #: A typed confirmation that agrees ("yes", "yes, go ahead", "sure, do it").
-YES = re.compile(
-    r"^\s*(yes|yep|yeah|sure|ok(ay)?|go ahead|do it|please do|approved?|lgtm|sounds good)\b",
-    re.I,
-)
+_YES_WORDS = r"(yes|yep|yeah|sure|ok(ay)?|go ahead|do it|please do|approved?|lgtm|sounds good)"
+_NO_WORDS = r"(no|nope|nah|don'?t|do not|cancel|never ?mind|skip( it)?)"
+YES = re.compile(rf"^\s*{_YES_WORDS}\b", re.I)
 #: A typed confirmation that declines ("no", "don't", "cancel that").
-NO = re.compile(r"^\s*(no|nope|don'?t|do not|cancel|never ?mind|skip( it)?)\b", re.I)
+NO = re.compile(rf"^\s*{_NO_WORDS}\b", re.I)
+#: A message that is only a yes or a no ("yes", "Nope."), with nothing else said.
+BARE_YES_NO = re.compile(rf"^\s*(y|n|{_YES_WORDS}|{_NO_WORDS})[\s.!]*$", re.I)
 #: Verbs that stop a run when named with it ("cancel the run", "end this run").
 _STOP_VERB = r"(stop|halt|abort|cancel|quit|end|kill)"
 #: A whole message that only says stop: "stop", "Stop.", "please stop it now". Not

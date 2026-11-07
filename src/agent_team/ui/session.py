@@ -43,7 +43,7 @@ from rich.console import Console
 from agent_team.app import App
 from agent_team.core.control import DriveLock
 from agent_team.core.models import Event, EventName, RunStatus
-from agent_team.orchestrator.messages import says_stop
+from agent_team.orchestrator.messages import BARE_YES_NO, says_stop
 from agent_team.orchestrator.replies import Reply
 from agent_team.ui.diffs import Snapshot, change_report, snapshot
 from agent_team.ui.summary import summarize
@@ -51,15 +51,15 @@ from agent_team.ui.view import RunView
 
 log = logging.getLogger(__name__)
 
-#: What finishes a run at its review: an accept word, never a bare yes, which answers
+#: What finishes a run at its review: an accept word, alone, after a yes ("yes,
+#: accept") or before a courtesy ("accept, thanks"). Never a bare yes, which answers
 #: nothing when nothing is waiting.
 ACCEPT = re.compile(
-    r"^\s*((looks good|lgtm|ok(ay)?|yes)[\s,.!]*)?"
-    r"(accept(ed)?|approve[ds]?|done|ship it|lgtm|looks good)[\s.!]*$",
+    r"^\s*((y|yes|yeah|yep|sure|ok(ay)?|lgtm|looks good)[\s,.!]+)?"
+    r"(accept(ed)?|approve[ds]?|done|ship it|lgtm|looks good)"
+    r"(\s+(it|this|that|to me))?([\s,.!]+(thanks|thank you|ty|please))?[\s.!]*$",
     re.I,
 )
-#: A yes or no on its own, which the review doesn't take as an accept or a change.
-YES_NO = re.compile(r"^\s*(y|yes|yeah|yep|sure|ok(ay)?|n|no|nope|nah)[\s.!]*$", re.I)
 REVIEW_PROMPT = "Type 'accept' to finish, or describe a change."
 #: The reply to a bare yes or no at the review.
 NOTHING_WAITING = "Nothing is waiting on a yes or no. " + REVIEW_PROMPT
@@ -486,7 +486,8 @@ class Session:
                 if line is None:
                     return 0
             elif run_id and reply.kind == "answer" and await self._is_done(run_id):
-                line = await self._prompt_review(run_id)
+                asked = reply.text.rstrip().endswith("?")
+                line = await self._prompt_review(run_id, asked=asked)
                 if line is None:
                     return 0
             elif reply.kind in ("stopped", "error") and not reply.pending:
@@ -560,9 +561,10 @@ class Session:
         self._seen[run_id] = await snapshot(run_id, stores.tasks)
         return await self._prompt_review(run_id)
 
-    async def _prompt_review(self, run_id: str) -> str | None:
+    async def _prompt_review(self, run_id: str, *, asked: bool = False) -> str | None:
         """Ask to accept or change. Returns the line to send, or None when the user
-        accepts or ends the input."""
+        accepts or ends the input. A bare yes or no is sent on only when the reply just
+        shown ``asked`` the user something; otherwise nothing is waiting on it."""
         self.say("")
         self.say(REVIEW_PROMPT)
         while True:
@@ -573,6 +575,6 @@ class Session:
             if ACCEPT.match(line):
                 self.say(f"Accepted. Run {run_id} is done.")
                 return None
-            if not YES_NO.match(line):
+            if asked or not BARE_YES_NO.match(line):
                 return line
             self.say(NOTHING_WAITING)

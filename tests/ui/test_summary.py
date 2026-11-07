@@ -85,6 +85,8 @@ def test_memory_from_earlier_runs_is_named_once_for_the_builders_only() -> None:
     assert [m["id"] for m in found] == ["mem_a", "mem_b"]
     assert remembered_count(found) == "2 decisions"
     assert remembered_count([a, c]) == "1 decision and 1 lesson"
+    summaries = [{"id": f"mem_{i}", "kind": "run_summary"} for i in range(2)]
+    assert remembered_count([*summaries, a]) == "2 run summaries and 1 decision"
     lines = RunSummary(remembered=found).lines()
     assert "From memory: 2 decisions from earlier runs" in lines
     assert "  - decision mem_a from run_0: 'paginate, default 50'" in lines

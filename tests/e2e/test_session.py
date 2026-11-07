@@ -28,7 +28,7 @@ from agent_team.core.models import AgentName, DecisionKind, Event, EventName, Ru
 from agent_team.core.tracing import read_events
 from agent_team.llm.types import ContentBlock, LLMRequest, ToolUseBlock
 from agent_team.orchestrator.conversation import HELD_REPLY
-from agent_team.ui.session import NOTHING_WAITING, STOPPING, Session, StdinLines
+from agent_team.ui.session import ACCEPT, NOTHING_WAITING, STOPPING, Session, StdinLines
 from e2e.team import asking_script, e2e_app, e2e_config, e2e_script, engineer_with_tests
 
 PAGED_PRD = dict(
@@ -196,6 +196,55 @@ async def test_a_bare_yes_at_the_review_doesnt_finish_the_run(tmp_path: Path) ->
     assert after.count(NOTHING_WAITING) == 2
     assert "Accepted. Run" not in after.rsplit(NOTHING_WAITING, 1)[0]
     assert "Accepted. Run" in after.rsplit(NOTHING_WAITING, 1)[1]
+
+
+async def test_a_yes_to_a_question_the_review_reply_asked_is_sent_on(tmp_path: Path) -> None:
+    script = e2e_script()
+    default = orchestrator_responder()
+    heard: list[str] = []
+
+    def message(request: LLMRequest) -> list[ContentBlock] | str:
+        """Offer pagination as a question; otherwise answer like the default."""
+        said, _ = read_message(request)
+        heard.append(said)
+        if said == "can you add pagination?":
+            return message_reply(
+                "I can add a page parameter to /books. Want me to?", "run_question"
+            )
+        return default(request)
+
+    script[AgentName.ORCHESTRATOR] = orchestrator_responder(message=message)
+    app = await e2e_app(tmp_path, script=script)
+    console, out = _console()
+    typist = Typist(app, "can you add pagination?", "yes", "accept")
+    with app:
+        code = await Session(
+            app, console, plain=True, read_line=typist.read_line, listen=False
+        ).start("Build a books API")
+    text = out.getvalue()
+    assert code == 0, text
+    assert NOTHING_WAITING not in text
+    assert "yes" in heard and "Accepted. Run" in text
+
+
+def test_only_accept_words_finish_the_review() -> None:
+    for line in (
+        "accept",
+        "Accept.",
+        "done",
+        "lgtm",
+        "looks good",
+        "looks good to me",
+        "yes, accept",
+        "yeah, accept",
+        "sure, ship it",
+        "y accept",
+        "accept, thanks",
+        "approve it",
+    ):
+        assert ACCEPT.match(line), line
+    for line in ("yes", "ok", "no", "yesdone", "okdone", "accept the PRD but add tests"):
+        assert not ACCEPT.match(line), line
 
 
 async def test_a_yes_and_input_ending_leaves_the_run_unaccepted(tmp_path: Path) -> None:

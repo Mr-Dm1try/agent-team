@@ -13,6 +13,7 @@ from agent_team.core.config import EmbedderConfig, MemoryConfig
 from agent_team.core.db import Database
 from agent_team.core.errors import EmbedderUnavailable
 from agent_team.core.models import (
+    SESSION,
     AgentName,
     EventName,
     Memory,
@@ -127,6 +128,19 @@ async def test_the_fetch_keeps_the_agents_kinds_and_logs_the_query(tmp_path: Pat
     assert earlier and all(m["run_id"] != RUN.id for m in earlier)
     assert {m["id"] for m in earlier} <= set(event.data["ids"])
     assert earlier[0]["kind"] == "lesson" and earlier[0]["run_id"] == "run_old"
+
+
+async def test_the_users_own_preferences_arent_from_other_runs(tmp_path: Path) -> None:
+    embedder = FakeEmbedder()
+    idx = await SqliteMemoryIndex.open(Database(tmp_path / "team.db"))
+    text = "Engineer, implementation: always build the books endpoints with tests"
+    vectors = await embedder.embed([text], query=False)
+    memory = Memory(kind=MemoryKind.PREFERENCE, text=text, sources=[MemorySource(run_id=SESSION)])
+    await idx.save(memory, vectors[0], merge_at=0.92)
+    fetch = _fetch(idx, embedder)
+    assert await fetch(_task(), RUN, [])
+    [event] = fetch.bus.events  # type: ignore[attr-defined]
+    assert event.data["ids"] == [memory.id] and event.data["from_other_runs"] == []
 
 
 def test_a_long_memory_is_quoted_short_in_the_event() -> None:
