@@ -192,3 +192,37 @@ async def test_a_resumed_run_shows_the_work_done_before() -> None:
     assert "✓ prd" in text and "✓ product: the requirements" in text
     assert "▶ spec" in text and "x architect: the design" in text
     assert "· implementation" in text and "· engineer: the code" in text
+
+
+async def test_plain_lines_of_sibling_tasks_say_which_task_they_are() -> None:
+    console = _console()
+    view = RunView(console, plain=True)
+    isbn = {"phase": "planning", "kind": "research_brief", "objective": "How are ISBNs checked?"}
+    tests = {"phase": "planning", "kind": "research_brief", "objective": "How to test FastAPI?"}
+    await _feed(
+        view,
+        [
+            _state("r1", AgentName.RESEARCHER, "ready", **isbn),
+            _state("r2", AgentName.RESEARCHER, "ready", **tests),
+            _state("r1", AgentName.RESEARCHER, "running", attempt=1, **isbn),
+            _event(EventName.TOOL_CALL_BEFORE, "r2", tool="web_search", args={"query": "q"}),
+            _state("r1", AgentName.RESEARCHER, "done", **isbn),
+        ],
+    )
+    lines = console.export_text().splitlines()
+    assert lines == [
+        "  planning: researcher: the research [How are ISBNs checked?] running",
+        "    researcher [How to test FastAPI?] → web_search q",
+        "  planning: researcher: the research [How are ISBNs checked?] done",
+    ]
+
+
+async def test_a_provider_going_down_and_back_gets_a_line() -> None:
+    console = _console()
+    view = RunView(console, plain=True)
+    down = _event(EventName.PROVIDER_DOWN, "r1", provider="ollama", retry_after_s=60.0)
+    await _feed(view, [down, _event(EventName.PROVIDER_UP, "r1", provider="ollama")])
+    assert console.export_text().splitlines() == [
+        "  ollama is unreachable; calls use the next provider and try it again every 60.0s",
+        "  ollama is reachable again",
+    ]

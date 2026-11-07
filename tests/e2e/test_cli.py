@@ -66,6 +66,19 @@ def test_run_answers_questions_from_stdin(config_file: Path) -> None:
     assert "'Build a books API' is done." in result.output
 
 
+def test_a_run_out_of_budget_says_paused_as_the_stats_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.yaml"
+    config = e2e_config(tmp_path, budget={"max_tokens_per_run": 200})
+    path.write_text(yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8")
+    monkeypatch.setattr(cli, "_factory", _asking_team())
+    result = CliRunner().invoke(cli.app, ["run", "Build a books API", "-c", str(path)], input="")
+    output = _plain(result)
+    assert f"[run {_run_id(output)}: paused]" in output, output
+    assert ": stopped]" not in output
+
+
 def test_a_run_left_waiting_resumes_and_its_logs_read_back(config_file: Path) -> None:
     runner = CliRunner()
     first = runner.invoke(cli.app, ["run", "Build a books API", "-c", str(config_file)], input="")
@@ -169,7 +182,8 @@ def test_stop_or_resume_of_an_unknown_or_finished_run(config_file: Path) -> None
     runner = CliRunner()
     for command in ("stop", "resume"):
         unknown = runner.invoke(cli.app, [command, "run_nope", "-c", str(config_file)])
-        assert unknown.exit_code == 1 and "No run run_nope." in unknown.output
+        assert unknown.exit_code == 1 and "No run run_nope in " in unknown.output
+        assert str(config_file.parent) in _plain(unknown)  # where it looked
     assert not (config_file.parent / "runs" / "run_nope").exists()
     done = runner.invoke(
         cli.app, ["run", "Build a books API", "-c", str(config_file)], input="20\naccept\n"
@@ -184,13 +198,14 @@ def test_stop_or_resume_of_an_unknown_or_finished_run(config_file: Path) -> None
 def test_stats_of_one_run_and_of_all_runs(config_file: Path) -> None:
     runner = CliRunner()
     empty = runner.invoke(cli.app, ["stats", "-c", str(config_file)])
-    assert empty.exit_code == 0 and "No runs yet." in empty.output
+    assert empty.exit_code == 0 and "No runs yet in " in empty.output
     run_id = _left_waiting(config_file)
     wide = {"COLUMNS": "140"}
     one = runner.invoke(cli.app, ["stats", run_id, "-c", str(config_file)], env=wide)
     assert one.exit_code == 0, one.output
     lines = _plain(one).splitlines()
-    assert lines[0].split() == [
+    assert lines[0].startswith(f"run {run_id} (waiting): ")
+    assert lines[1].split() == [
         "calls",
         "tokens",
         "in",
@@ -200,15 +215,23 @@ def test_stats_of_one_run_and_of_all_runs(config_file: Path) -> None:
         "time",
         "tasks",
         "retries",
-        "first",
+        "1st",
         "pass",
     ]
-    assert lines[1].startswith(f"run {run_id} (waiting)")
+    assert lines[2].startswith("total ")
     assert any(line.startswith("  product ") for line in lines), one.output
+    assert lines[-1].startswith("time: inside each agent's attempts")
+    # At the default width the run id and agent names stay whole.
+    narrow = runner.invoke(
+        cli.app, ["stats", run_id, "-c", str(config_file)], env={"COLUMNS": "80"}
+    )
+    narrow_lines = _plain(narrow).splitlines()
+    assert run_id in narrow_lines[0]
+    assert any(line.startswith("  orchestrator ") for line in narrow_lines), narrow.output
     every = runner.invoke(cli.app, ["stats", "-c", str(config_file)], env=wide)
     assert any(line.startswith("all runs") for line in _plain(every).splitlines())
     unknown = runner.invoke(cli.app, ["stats", "run_nope", "-c", str(config_file)])
-    assert unknown.exit_code == 1 and "No run run_nope." in unknown.output
+    assert unknown.exit_code == 1 and "No run run_nope in " in unknown.output
 
 
 def test_context_folders_reach_the_run_read_only(config_file: Path, tmp_path: Path) -> None:

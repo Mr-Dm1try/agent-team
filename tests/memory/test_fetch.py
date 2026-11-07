@@ -3,6 +3,7 @@ is down, the kinds and caps of the fetch, and its trace."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,7 @@ from agent_team.core.models import (
     Task,
 )
 from agent_team.memory.embed import Embeddings, FakeEmbedder, OllamaEmbedder
-from agent_team.memory.fetch import MemoryFetch, MemorySearch
+from agent_team.memory.fetch import MAX_QUERY, MemoryFetch, MemorySearch
 from agent_team.memory.store import SqliteMemoryIndex
 
 LESSON = "Engineer, implementation: tests for the books endpoints need httpx installed"
@@ -63,7 +64,7 @@ async def test_the_switch_skips_a_down_embedder_until_it_may_be_back() -> None:
 
 async def test_ollama_down_is_embedder_unavailable() -> None:
     config = EmbedderConfig(timeout_s=2)
-    embedder = OllamaEmbedder(config, "http://127.0.0.1:9/v1")  # nothing listens on 9
+    embedder = OllamaEmbedder(config, "http://127.0.0.1:9")  # nothing listens on 9
     with pytest.raises(EmbedderUnavailable):
         await embedder.embed(["hello"], query=True)
 
@@ -166,3 +167,24 @@ async def test_a_failing_fetch_gives_no_memory_and_logs_why(tmp_path: Path) -> N
     assert await fetch(_task(), RUN, []) == []
     [event] = fetch.bus.events  # type: ignore[attr-defined]
     assert "disk on fire" in event.data["error"] and event.level == "warning"
+
+
+async def test_a_long_query_is_cut_before_it_is_embedded(tmp_path: Path) -> None:
+    class Recording(FakeEmbedder):
+        """The fake embedder, keeping what it was asked to embed."""
+
+        def __init__(self) -> None:
+            """Start with nothing seen."""
+            super().__init__()
+            self.seen: list[str] = []
+
+        async def embed(self, texts: Sequence[str], *, query: bool) -> list[list[float]]:
+            """Record, then embed as the fake does."""
+            self.seen += list(texts)
+            return await super().embed(texts, query=query)
+
+    embedder = Recording()
+    idx = await SqliteMemoryIndex.open(Database(tmp_path / "team.db"))
+    search = MemorySearch(idx, Embeddings(embedder, retry_after_s=60), MemoryConfig())
+    await search.search("books " * 5_000, [MemoryKind.LESSON], run_id=None)
+    assert len(embedder.seen[0]) == MAX_QUERY

@@ -2,12 +2,15 @@
 audit rate, per run and per agent.
 
 Tokens and cost come from each run's ``llm_call_after`` events, retries from
-``task_retried`` events, and audits from ``audit_verdict`` events; time and the agent
-behind each task come from the task store. A run's time is the time any task was
-working, so hours spent waiting on the user, or stopped, don't count. A task passes
-first time when the first verdict on it passed. Only planned work counts toward that
-rate: retries, revisions and fixes are follow-ups of a task that already had its
-first verdict.
+``task_retried`` events, audits from ``audit_verdict`` events, and time from the
+attempt spans (``span_started``/``span_finished`` of kind ``attempt``); the agent
+behind each task comes from the task store. An agent's time is the time inside its
+attempts, checks included for the auditor. A run's time is the time any attempt was
+running, so hours spent waiting on the user, or stopped, don't count. A task passes
+first time when the first verdict on it passed. Every task counts toward that rate
+except fixes, which exist because a check failed on that work: a retry is another
+attempt of the same task, so only its first verdict counts, and a revision for a
+change request is new work with a first verdict of its own.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from pathlib import Path
 
 from agent_team.core.interfaces import TaskStore
 from agent_team.core.models import AgentName, Event, EventName, Run, Task, TaskOrigin
-from agent_team.core.tracing import read_events
+from agent_team.core.tracing import SpanRecord, read_events, spans_from_events
 
 #: Agents whose tasks are audited work, not checks or questions.
 WORK_AGENTS = frozenset(a for a in AgentName if a not in (AgentName.AUDITOR, AgentName.USER))
@@ -71,12 +74,12 @@ def compute(run: Run, tasks: list[Task], events: list[Event]) -> RunStats:
     out = RunStats(run)
     by_id = {t.id: t for t in tasks}
     for task in tasks:
-        if task.agent not in WORK_AGENTS:
-            continue
-        agent = out.agents[task.agent.value]
-        agent.tasks += 1
-        if task.started_at and task.finished_at:
-            agent.seconds += (task.finished_at - task.started_at).total_seconds()
+        if task.agent in WORK_AGENTS:
+            out.agents[task.agent.value].tasks += 1
+    attempts = attempt_spans(events)
+    for span in attempts:
+        if span.agent is not None and span.duration_ms is not None:
+            out.agents[span.agent.value].seconds += span.duration_ms / 1000
     first_verdict: dict[str, bool] = {}
     for event in events:
         who = event.agent.value if event.agent else "orchestrator"
@@ -97,21 +100,26 @@ def compute(run: Run, tasks: list[Task], events: list[Event]) -> RunStats:
             first_verdict[event.task_id] = bool(event.data.get("passed"))
     for task_id, passed in first_verdict.items():
         task = by_id[task_id]
-        if task.origin is not TaskOrigin.PLAN or task.agent not in WORK_AGENTS:
+        if task.origin is TaskOrigin.FIX or task.agent not in WORK_AGENTS:
             continue
         stats = out.agents[task.agent.value]
         stats.audited += 1
         stats.first_pass += int(passed)
     for stats in out.agents.values():
         out.total.add(stats)
-    # Tasks run in parallel, so the run's time is not the sum of theirs.
-    out.total.seconds = busy_seconds([t for t in tasks if t.agent is not AgentName.USER])
+    # Attempts run in parallel, so the run's time is not the sum of theirs.
+    out.total.seconds = busy_seconds(attempts)
     return out
 
 
-def busy_seconds(tasks: list[Task]) -> float:
-    """How long at least one of the tasks was working: their time spans merged."""
-    spans = sorted((t.started_at, t.finished_at) for t in tasks if t.started_at and t.finished_at)
+def attempt_spans(events: list[Event]) -> list[SpanRecord]:
+    """The finished attempt spans in the events: one per attempt of a task or a check."""
+    return [s for s in spans_from_events(events) if s.kind == "attempt" and s.end is not None]
+
+
+def busy_seconds(attempts: list[SpanRecord]) -> float:
+    """How long at least one attempt was running: their time spans merged."""
+    spans = sorted((s.start, s.end) for s in attempts if s.end is not None)
     total = 0.0
     end = None
     for start, finish in spans:
@@ -143,7 +151,12 @@ def _time(seconds: float) -> str:
     return f"{minutes}m{secs:02d}s"
 
 
-HEADER = ("", "calls", "tokens in", "tokens out", "cost", "time", "tasks", "retries", "first pass")
+HEADER = ("", "calls", "tokens in", "tokens out", "cost", "time", "tasks", "retries", "1st pass")
+#: Printed under the table, so the time column can't be misread.
+FOOTNOTE = (
+    "time: inside each agent's attempts (checks for the auditor); for a run, while any "
+    "attempt ran. 1st pass: share of tasks, fixes left out, whose first check passed."
+)
 
 
 def row(name: str, stats: Stats) -> tuple[str, ...]:
@@ -161,22 +174,29 @@ def row(name: str, stats: Stats) -> tuple[str, ...]:
     )
 
 
+def heading(stats: RunStats) -> str:
+    """The line above one run's table: its id, status and title."""
+    return f"run {stats.run.id} ({stats.run.status.value}): {stats.run.title}"
+
+
 def run_table(stats: RunStats) -> list[tuple[str, ...]]:
-    """Rows for one run: its total, then one per agent."""
-    rows = [row(f"run {stats.run.id} ({stats.run.status.value})", stats.total)]
+    """Rows for one run: its total, then one per agent. The run's id goes in the
+    ``heading``, so the name column stays narrow."""
+    rows = [row("total", stats.total)]
     rows += [row(f"  {name}", s) for name, s in sorted(stats.agents.items())]
     return rows
 
 
 def overview_table(all_stats: list[RunStats]) -> list[tuple[str, ...]]:
-    """Rows for many runs: one per run, then the totals per agent across them."""
-    rows = [row(f"{s.run.id} {s.run.title[:30]!r}", s.total) for s in all_stats]
+    """Rows for many runs: one per run (its id), then the totals per agent across them.
+    Each row ends with the run's title (empty on the totals)."""
+    rows = [(*row(s.run.id, s.total), s.run.title) for s in all_stats]
     agents: dict[str, Stats] = defaultdict(Stats)
     total = Stats()
     for s in all_stats:
         total.add(s.total)
         for name, a in s.agents.items():
             agents[name].add(a)
-    rows.append(row("all runs", total))
-    rows += [row(f"  {name}", a) for name, a in sorted(agents.items())]
+    rows.append((*row("all runs", total), ""))
+    rows += [(*row(f"  {name}", a), "") for name, a in sorted(agents.items())]
     return rows

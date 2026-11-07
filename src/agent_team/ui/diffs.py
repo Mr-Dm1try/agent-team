@@ -3,9 +3,10 @@ version, and the git diff of the workspace between the code versions' tags.
 
 A snapshot is taken of the latest version of every artifact kind when a run reaches
 done; after a change re-runs and the run is done again, ``change_report`` compares
-the two, and names the kinds that are new since. Artifacts are compared field by
-field, and list items that carry an ``id`` or ``name`` (requirements, components,
-checks) are matched by it, so a reordered list doesn't read as a rewrite.
+the two, and names the kinds that are new since. The code diff comes first.
+Artifacts are compared field by field, and list items that carry an ``id`` or
+``name`` (requirements, components, checks) are matched by it, so a reordered list
+doesn't read as a rewrite.
 """
 
 from __future__ import annotations
@@ -24,7 +25,9 @@ from agent_team.sandbox.git import WorkspaceGit
 META_FIELDS = frozenset({"run_id", "task_id", "version", "built_from"})
 #: Artifact kinds shown as a section diff; code changes show the workspace diff.
 SECTION_KINDS = ("plan", "prd", "spec", "qa_report", "research_answer")
-MAX_DIFF_LINES = 400
+#: Lines shown of the code diff, and of each artifact's section diff.
+MAX_CODE_DIFF_LINES = 300
+MAX_SECTION_LINES = 80
 
 Snapshot = dict[str, int]
 
@@ -103,10 +106,18 @@ def section_diff(old: Artifact, new: Artifact) -> list[str]:
 async def change_report(
     run: Run, before: Snapshot, artifacts: ArtifactStore, tasks: TaskStore
 ) -> list[str]:
-    """Lines that show what changed since ``before``: each artifact with a newer
-    version, then the code diff between the code versions' tags."""
+    """Lines that show what changed since ``before``: the code diff between the code
+    versions' tags first, then each artifact with a newer version. Each section is cut
+    on its own (``MAX_CODE_DIFF_LINES``, ``MAX_SECTION_LINES``), so a long artifact
+    diff never hides the code, and says how many lines it cut."""
     after = await snapshot(run.id, tasks)
     out: list[str] = []
+    old_code, new_code = before.get("code_change"), after.get("code_change")
+    if new_code is not None and old_code is None:
+        out.append(f"code: code_change v{new_code}: new")
+    elif old_code is not None and new_code is not None and new_code > old_code:
+        out.append(f"code: code_change v{old_code} → v{new_code}:")
+        out += _cap(await code_diff(run, old_code, new_code), MAX_CODE_DIFF_LINES, "code")
     for kind in SECTION_KINDS:
         old_v, new_v = before.get(kind), after.get(kind)
         if new_v is None or (old_v is not None and new_v <= old_v):
@@ -118,19 +129,17 @@ async def change_report(
         new = await artifacts.load(run.id, ArtifactRef(kind=kind, version=new_v))
         changed = section_diff(old, new)
         out.append(f"{kind} v{old_v} → v{new_v}:")
-        out += changed or ["  (no change in content)"]
-    old_code, new_code = before.get("code_change"), after.get("code_change")
-    if new_code is not None and old_code is None:
-        out.append(f"code: code_change v{new_code}: new")
-    elif old_code is not None and new_code is not None and new_code > old_code:
-        out.append(f"code: code_change v{old_code} → v{new_code}:")
-        out += await code_diff(run, old_code, new_code)
+        out += _cap(changed, MAX_SECTION_LINES, kind) if changed else ["  (no change in content)"]
     if not out:
         return ["Nothing changed since the last version you saw."]
-    if len(out) > MAX_DIFF_LINES:
-        cut = len(out) - MAX_DIFF_LINES
-        out = [*out[:MAX_DIFF_LINES], f"[... {cut} more lines]"]
     return out
+
+
+def _cap(lines: list[str], limit: int, section: str) -> list[str]:
+    """At most ``limit`` lines of one section, with a note of how many were cut."""
+    if len(lines) <= limit:
+        return lines
+    return [*lines[:limit], f"[... {len(lines) - limit} more lines of the {section} diff]"]
 
 
 async def code_diff(run: Run, old: int, new: int) -> list[str]:

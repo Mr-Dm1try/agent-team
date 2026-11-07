@@ -11,10 +11,16 @@ from agent_team.audit.toollog import InMemoryToolCallLog
 from agent_team.core.artifacts import (
     PRD,
     AcceptanceCriterion,
+    AnsweredQuestion,
     Ask,
     CodeChange,
     Plan,
     Requirement,
+    ResearchBrief,
+    Source,
+)
+from agent_team.core.artifacts import (
+    TestRun as UnitTestRun,
 )
 from agent_team.core.errors import BudgetExceeded, TransientLLMError
 from agent_team.core.models import (
@@ -24,6 +30,7 @@ from agent_team.core.models import (
     RuleScope,
     Run,
     Severity,
+    TaskOrigin,
     TaskStatus,
 )
 from agent_team.llm.types import TextBlock
@@ -184,7 +191,7 @@ async def test_budget_exceeded_propagates(rig: Rig, run: Run) -> None:
 
 async def test_revision_brings_in_r12_and_previous_version(rig: Rig, run: Run) -> None:
     task = make_task(run, AgentName.PRODUCT, Phase.PRD, "prd", attempt=2)
-    await rig.artifacts.save(good_prd(run_id=run.id, version=1))
+    await rig.artifacts.save(good_prd(run_id=run.id, version=1, task_id=task.id))
     rig.llm.push(PASS)
     verdict = await rig.auditor.audit_task(task, good_prd(run_id=run.id, version=2), run)
     assert "R12" in verdict.rules_checked
@@ -282,3 +289,148 @@ def test_second_check_material_keeps_the_start_and_the_end() -> None:
     text = "REQUEST" + "x" * 50_000 + "TOOLLOG"
     cut = _head_and_tail(text, 24_000)
     assert cut.startswith("REQUEST") and cut.endswith("TOOLLOG") and len(cut) < 24_100
+
+
+# --- web pages, sibling versions and wrapped test runs ---------------------------
+
+TUTORIAL = "https://fastapi.tiangolo.com/tutorial/testing/"
+SAMPLE_PAGE = 'client.get("/items/foo", headers={"X-Token": "coneofsilence"})\n'
+
+
+def brief(run: Run, task_id: str, question: str, version: int = 1) -> ResearchBrief:
+    """A research brief that cites the tutorial page."""
+    return ResearchBrief(
+        summary="s",
+        run_id=run.id,
+        task_id=task_id,
+        version=version,
+        answers=[AnsweredQuestion(question=question, answer="a", sources=[Source(ref=TUTORIAL)])],
+    )
+
+
+async def test_a_sample_token_in_a_fetched_page_does_not_block(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    rig.tool_log.record(call(run, task, "web_fetch", SAMPLE_PAGE, url=TUTORIAL))
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_task(task, brief(run, task.id, "How to test?"), run)
+    assert verdict.passed, verdict.findings
+
+
+async def test_a_secret_in_web_fetch_args_blocks_and_already_happened(rig: Rig, run: Run) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    key = "sk-ant-" + "a1B2c3D4e5F6g7H8i9J0kLmN"
+    rig.tool_log.record(call(run, task, "web_fetch", "page", url=f"{TUTORIAL}?key={key}"))
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_task(task, brief(run, task.id, "How to test?"), run)
+    [s1] = [f for f in verdict.blockers if f.rule_id == "S1"]
+    assert s1.already_happened and s1.item == "tool call web_fetch:1"
+
+
+async def test_sibling_briefs_are_not_each_others_previous_version(rig: Rig, run: Run) -> None:
+    isbn = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    fastapi = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief", attempt=2)
+    for t in (isbn, fastapi):
+        await rig.tasks.create_task(t)
+    await rig.artifacts.save(brief(run, isbn.id, "ISBN rules?", version=1))
+    await rig.artifacts.save(brief(run, fastapi.id, "FastAPI testing?", version=2))
+    rig.llm.push(PASS)
+    # The FastAPI task's retry: v2 is its own last version; v1 is the ISBN sibling's.
+    retry = brief(run, fastapi.id, "FastAPI testing?", version=3)
+    await rig.auditor.audit_task(fastapi, retry, run)
+    prompt = str(rig.llm.requests[0].messages[0].content[0])
+    assert "Previous version research_brief@v2" in prompt
+    assert "research_brief@v1" not in prompt
+    # Its first attempt had no version of its own before it, so R12 doesn't apply.
+    rig.llm.push(PASS)
+    first = await rig.auditor.audit_task(fastapi, brief(run, fastapi.id, "FastAPI?", 2), run)
+    assert "R12" not in first.rules_checked
+
+
+async def test_a_revision_diffs_against_the_task_it_was_reopened_from(rig: Rig, run: Run) -> None:
+    old = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    sibling = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    new = make_task(
+        run,
+        AgentName.RESEARCHER,
+        Phase.PLANNING,
+        "research_brief",
+        origin=TaskOrigin.REVISION,
+        parent_task_id=old.id,
+    )
+    for t in (old, sibling, new):
+        await rig.tasks.create_task(t)
+    await rig.artifacts.save(brief(run, old.id, "FastAPI?", version=1))
+    await rig.artifacts.save(brief(run, sibling.id, "ISBN?", version=2))
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_task(new, brief(run, new.id, "FastAPI?", version=3), run)
+    assert "R12" in verdict.rules_checked
+    assert "Previous version research_brief@v1" in str(rig.llm.requests[0].messages[0].content[0])
+
+
+async def test_r12_never_compares_across_task_lines_including_requested_research(
+    rig: Rig, run: Run
+) -> None:
+    """Parallel briefs and the research a brief asked for each have their own line: a
+    child's first brief has no previous version, even though its parent is a
+    Researcher task that wrote a brief, and a revision of the child diffs only against
+    the child's own brief."""
+    mcp = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    vault = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    child = make_task(
+        run,
+        AgentName.RESEARCHER,
+        Phase.PLANNING,
+        "research_brief",
+        origin=TaskOrigin.RESEARCH_REQUEST,
+        parent_task_id=mcp.id,
+    )
+    child_fix = make_task(
+        run,
+        AgentName.RESEARCHER,
+        Phase.PLANNING,
+        "research_brief",
+        origin=TaskOrigin.REVISION,
+        parent_task_id=child.id,
+    )
+    for t in (mcp, vault, child, child_fix):
+        await rig.tasks.create_task(t)
+    await rig.artifacts.save(brief(run, mcp.id, "mcp SDK import path?", version=1))
+    await rig.artifacts.save(brief(run, vault.id, "Obsidian links?", version=2))
+    await rig.artifacts.save(brief(run, mcp.id, "mcp SDK import path?", version=3))
+    rig.llm.push(PASS, PASS)
+    first = await rig.auditor.audit_task(child, brief(run, child.id, "FastMCP?", version=4), run)
+    assert "R12" not in first.rules_checked
+    assert "Previous version" not in str(rig.llm.requests[0].messages[0].content[0])
+    await rig.artifacts.save(brief(run, child.id, "FastMCP?", version=4))
+    await rig.artifacts.save(brief(run, vault.id, "Obsidian links?", version=5))
+    later = await rig.auditor.audit_task(
+        child_fix, brief(run, child_fix.id, "FastMCP?", version=6), run
+    )
+    assert "R12" in later.rules_checked
+    prompt = str(rig.llm.requests[1].messages[0].content[0])
+    assert "Previous version research_brief@v4" in prompt
+    assert "Previous version research_brief@v3" not in prompt
+    assert "Previous version research_brief@v5" not in prompt
+
+
+async def test_r6_passes_a_wrapped_run_and_fails_a_masked_failure(rig: Rig, run: Run) -> None:
+    eng = make_task(run, AgentName.ENGINEER, Phase.IMPLEMENTATION, "code_change")
+    Path(run.workspace, "app.py").write_text("x = 1\n")  # noqa: ASYNC240
+    wrapped = ["sh", "-c", "PYTHONPATH=/workspace/.deps:. python -m pytest -q 2>&1; echo EXIT=$?"]
+    tests = UnitTestRun(
+        command="python -m pytest -q", passed=73, failed=0, exit_code=0, output_tail="73 passed"
+    )
+    change = CodeChange(summary="s", run_id=run.id, files_written=["app.py"], tests=tests)
+    passed = call(run, eng, "run_command", "73 passed in 2.10s\nEXIT=0", argv=wrapped)
+    rig.tool_log.record(passed.model_copy(update={"data": {"argv": wrapped, "exit_code": 0}}))
+    rig.llm.push(PASS)
+    assert "R6" not in {
+        f.rule_id for f in (await rig.auditor.audit_task(eng, change, run)).blockers
+    }
+
+    failed = call(run, eng, "run_command", "2 failed, 71 passed in 2.3s\nEXIT=1", argv=wrapped)
+    rig.tool_log.record(failed.model_copy(update={"data": {"argv": wrapped, "exit_code": 0}}))
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_task(eng, change, run)
+    [r6] = [f for f in verdict.blockers if f.rule_id == "R6"]
+    assert "2 failed" in r6.message and "echo EXIT" in r6.message

@@ -231,7 +231,10 @@ class Spec(ArtifactBase):
 class TestRun(Contract):
     """The result of one test command in the sandbox."""
 
-    command: str
+    command: str = Field(
+        description="The exact argv of the run_command call you report, joined by spaces, "
+        "such as 'python -m pytest -q'. Only the command: no notes."
+    )
     passed: int
     failed: int
     exit_code: int

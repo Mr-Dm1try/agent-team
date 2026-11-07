@@ -124,7 +124,8 @@ class DecisionsMixin(OrchestratorBase):
         run = await self.tasks.update_run(
             run.model_copy(update={"upstream_reruns": run.upstream_reruns + 1})
         )
-        await self.reopen(run, producer, origin=TaskOrigin.REVISION, reason=d.reason)
+        # A check blamed this producer's output, so the re-run is a fix of it.
+        await self.reopen(run, producer, origin=TaskOrigin.FIX, reason=d.reason)
 
     async def _rerun_after(self, run: Run, root: Task | None, ids: list[str]) -> None:
         """Tasks the policy wants re-run once a fix passes, such as a fresh QA review

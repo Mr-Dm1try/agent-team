@@ -20,8 +20,31 @@ class TransientLLMError(AgentTeamError):
 
     retryable = True
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        status: int | None = None,
+        unreachable: bool = False,
+        max_retries: int | None = None,
+    ) -> None:
+        """Keep which provider failed, its HTTP status, if any, whether the connection
+        itself failed (the provider is down, not busy) and, for a failure that rarely
+        clears, how many retries it is worth before falling back (None: the usual)."""
+        super().__init__(message)
+        self.provider = provider
+        self.status = status
+        self.unreachable = unreachable
+        self.max_retries = max_retries
+
+
+class ProviderError(AgentTeamError):
+    """A provider refused a call as sent (a 4xx other than a rate limit). Not retried;
+    the gateway moves to the next route."""
+
     def __init__(self, message: str, *, provider: str, status: int | None = None) -> None:
-        """Keep which provider failed and its HTTP status, if any."""
+        """Keep which provider refused the call and its HTTP status."""
         super().__init__(message)
         self.provider = provider
         self.status = status

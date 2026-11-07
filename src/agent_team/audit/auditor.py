@@ -53,6 +53,7 @@ from agent_team.core.models import (
     Verdict,
 )
 from agent_team.llm.types import LLMClient
+from agent_team.orchestrator.lineage import ancestry, previous_version
 
 _REQUEST_CHARS = 12_000  # P1 judges the asks against the full request
 _ARTIFACT_CHARS = 16_000
@@ -159,10 +160,10 @@ class LLMAuditor:
             ctx = AuditContext(
                 run=run, scope=RuleScope.TASK, phase=task.phase, task=task, artifact=artifact
             )
+            ctx.tasks = await self.tasks.list_tasks(run.id)
             if artifact is not None:
                 ctx.outputs = [(task, artifact)]
-                ctx.previous = await self._previous(run.id, artifact)
-            ctx.tasks = await self.tasks.list_tasks(run.id)
+                ctx.previous = await self._previous(run.id, artifact, task, ctx.tasks)
             ctx.latest = await self._latest(run.id)
             ctx.tool_calls = await self.tool_log.for_task(run.id, task.id)
             if task.agent is AgentName.QA:
@@ -261,6 +262,7 @@ class LLMAuditor:
             support = _helper_support(finding, helpers)
             if support is not None:
                 finding.from_helper = True
+                finding.already_happened = support.already_happened
                 finding.severity = support.severity
                 finding.evidence = finding.evidence or support.evidence
                 finding.artifact = finding.artifact or support.artifact
@@ -314,15 +316,15 @@ class LLMAuditor:
                 out[kind] = artifact
         return out
 
-    async def _previous(self, run_id: str, artifact: Artifact) -> Artifact | None:
-        """The version before this artifact, for revision checks; None if unreadable."""
-        if artifact.version <= 1:
-            return None
-        ref = ref_of(artifact)
+    async def _previous(
+        self, run_id: str, artifact: Artifact, task: Task, tasks: list[Task]
+    ) -> Artifact | None:
+        """The version before this artifact in the task's own line of work (the task and
+        the tasks it was reopened from), for revision checks; None if there is none or it
+        is unreadable. A sibling's version of the same kind never counts."""
+        chain = [t.id for t in ancestry(task, tasks)]
         try:
-            return await self.artifacts.load(
-                run_id, ArtifactRef(kind=ref.kind, version=ref.version - 1)
-            )
+            return await previous_version(self.artifacts, run_id, artifact, chain)
         except Exception:
             return None
 

@@ -287,6 +287,8 @@ class FakeLLM:
         self.overrides: dict[str, Any] = {}
         #: The route the next call may take, as the gateway reports it.
         self.providers = ["fake"]
+        #: Raised by ``check_run`` once set, as the gateway does after a stop.
+        self.stop_tools: Exception | None = None
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         self.requests.append(request)
@@ -313,7 +315,7 @@ class FakeLLM:
         response = await self.complete(request)
         yield StreamChunk(text=response.text, done=True, response=response)
 
-    def context_budget(self, agent: AgentName) -> int:
+    def context_budget(self, agent: AgentName, task_id: str | None = None) -> int:
         return self.budget
 
     def providers_for(self, agent: AgentName, task_id: str | None) -> list[str]:
@@ -328,6 +330,10 @@ class FakeLLM:
             self.overrides.pop(task_id, None)
         else:
             self.overrides[task_id] = route
+
+    def check_run(self, run_id: str) -> None:
+        if self.stop_tools is not None:
+            raise self.stop_tools
 
 
 def as_json(data: dict[str, Any]) -> str:

@@ -5,8 +5,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_team.core.artifacts import PRD, ArtifactRef, Spec
+import pytest
+
+from agent_team.core.artifacts import PRD, ArtifactRef, CriterionResult, QAReport, Spec
 from agent_team.core.models import AgentName, Phase, Run, Task
+from agent_team.ui import diffs
 from agent_team.ui.diffs import change_report, section_diff
 
 
@@ -97,7 +100,64 @@ async def test_kinds_first_written_since_the_last_review_are_named() -> None:
     tasks = _Tasks([_output("qa_report", 1), _output("code_change", 1)])
     # Nothing is loaded: there is no earlier version to compare with.
     lines = await change_report(run, {}, None, tasks)  # type: ignore[arg-type]
-    assert lines == ["qa_report v1: new", "code: code_change v1: new"]
+    assert lines == ["code: code_change v1: new", "qa_report v1: new"]
     seen = {"qa_report": 1, "code_change": 1}
     same = await change_report(run, seen, None, tasks)  # type: ignore[arg-type]
     assert same == ["Nothing changed since the last version you saw."]
+
+
+class _Artifacts:
+    """Just enough of an artifact store: load by ref."""
+
+    def __init__(self, *items: Any) -> None:
+        """Hold the artifacts by their ref."""
+        self.items = {str(ArtifactRef(kind=a.kind, version=a.version)): a for a in items}
+
+    async def load(self, run_id: str, ref: ArtifactRef) -> Any:
+        """One artifact version."""
+        return self.items[str(ref)]
+
+
+def _qa(version: int, evidence: str) -> QAReport:
+    """A QA report with 300 criteria, each with ``evidence``."""
+    results = [
+        CriterionResult(criterion=f"AC-{i}", result="pass", evidence=f"{evidence} {i}")
+        for i in range(300)
+    ]
+    return QAReport(version=version, summary="s", results=results, ran_end_to_end=True)
+
+
+async def test_the_code_diff_comes_first_and_survives_a_long_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = Run(id="run_1", title="t", request="r", workspace="/w")
+    code = [f"+line {i}" for i in range(119)]
+
+    async def fake_code_diff(run: Run, old: int, new: int) -> list[str]:
+        """The workspace diff between two code versions."""
+        return code
+
+    monkeypatch.setattr(diffs, "code_diff", fake_code_diff)
+    tasks = _Tasks([_output("qa_report", 2), _output("code_change", 2)])
+    store = _Artifacts(_qa(1, "ran curl"), _qa(2, "called the endpoint"))
+    before = {"qa_report": 1, "code_change": 1}
+    lines = await change_report(run, before, store, tasks)  # type: ignore[arg-type]
+    assert lines[0] == "code: code_change v1 → v2:"
+    assert lines[1 : 1 + len(code)] == code  # every code line, before any artifact
+    rest = lines[1 + len(code) :]
+    assert rest[0] == "qa_report v1 → v2:"
+    assert len(rest) == 1 + diffs.MAX_SECTION_LINES + 1
+    assert rest[-1].startswith("[... ") and rest[-1].endswith(" more lines of the qa_report diff]")
+
+
+async def test_a_long_code_diff_is_cut_on_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = Run(id="run_1", title="t", request="r", workspace="/w")
+
+    async def fake_code_diff(run: Run, old: int, new: int) -> list[str]:
+        """A code diff longer than the cap."""
+        return [f"+line {i}" for i in range(diffs.MAX_CODE_DIFF_LINES + 5)]
+
+    monkeypatch.setattr(diffs, "code_diff", fake_code_diff)
+    tasks = _Tasks([_output("code_change", 2)])
+    lines = await change_report(run, {"code_change": 1}, None, tasks)  # type: ignore[arg-type]
+    assert lines[-1] == "[... 5 more lines of the code diff]"

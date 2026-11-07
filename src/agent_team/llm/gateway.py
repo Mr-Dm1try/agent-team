@@ -11,7 +11,12 @@ Per call, in order:
    stronger model), then each fallback provider with its fallback model.
 4. Per route: rate limit slot, chaos, provider call. Transient errors retry after the
    configured delays (1, 2, 4 s), then move to the next route. Other provider errors
-   move to the next route at once.
+   move to the next route at once. A provider that refuses the connection is marked
+   down for ``retry.provider_down_s``: the call moves to the next route without
+   retrying, and later calls skip it until then, unless every route is down. With no
+   other route left, a refused connection retries like any transient error.
+   ``provider_down`` is emitted when it goes down and ``provider_up`` once a call to it
+   succeeds again.
 5. Cost from the price table (by the requested model, then the model the provider
    reports), usage recorded in memory and, when a task store is given, added to
    ``Run.usage``. ``llm_call_after`` is emitted. A run's first call in a process
@@ -77,6 +82,9 @@ class Gateway:
         self._run_locks: dict[str, asyncio.Lock] = {}
         self.chaos = chaos or Chaos(config.chaos)
         self.sleep = sleep
+        self.clock = clock
+        #: Providers that refused a connection, with the clock time to try them again.
+        self._down: dict[str, float] = {}
         self.budget = BudgetTracker(config.budget, clock=clock)
         self.bus.on_before(EventName.LLM_CALL_BEFORE, BudgetGuard(self.budget))
         self._global = asyncio.Semaphore(config.limits.max_concurrent_calls)
@@ -93,8 +101,14 @@ class Gateway:
 
     # --- routing -----------------------------------------------------------------------
 
-    def context_budget(self, agent: AgentName) -> int:
-        """Max prompt tokens for the agent's model, from the routing file."""
+    def context_budget(self, agent: AgentName, task_id: str | None = None) -> int:
+        """Max prompt tokens for the route the agent's next call tries first: its own
+        budget on its own route, else the budget of the fallback standing in for it
+        (when its provider is down)."""
+        primary = self._route(agent, task_id)
+        chain = self._chain(agent, task_id)
+        if chain and chain[0] != (primary.provider, primary.model):
+            return self.config.fallback_budget(chain[0][0])
         return self.config.context_budget(agent)
 
     def providers_for(self, agent: AgentName, task_id: str | None) -> list[str]:
@@ -150,7 +164,33 @@ class Gateway:
                 model = self.config.defaults.model
             if model is not None:
                 chain.append((name, model))
-        return [(p, m) for p, m in chain if p in self.providers]
+        known = [(p, m) for p, m in chain if p in self.providers]
+        now = self.clock()
+        up = [(p, m) for p, m in known if self._down.get(p, now) <= now]
+        return up or known
+
+    async def _mark_down(self, request: LLMRequest, provider: str, exc: Exception) -> None:
+        """Skip ``provider`` for a while after it refused a connection; the first time,
+        emit ``provider_down``."""
+        was_down = provider in self._down
+        retry_s = self.config.retry.provider_down_s
+        self._down[provider] = self.clock() + retry_s
+        if not was_down:
+            await self.bus.emit(
+                self._event(
+                    EventName.PROVIDER_DOWN,
+                    request,
+                    "warning",
+                    provider=provider,
+                    error=str(exc),
+                    retry_after_s=retry_s,
+                )
+            )
+
+    async def _mark_up(self, request: LLMRequest, provider: str) -> None:
+        """A call to a provider marked down succeeded: emit ``provider_up``."""
+        if self._down.pop(provider, None) is not None:
+            await self.bus.emit(self._event(EventName.PROVIDER_UP, request, provider=provider))
 
     def status(self, run_id: str) -> RunUsage:
         """Calls, tokens, cost, retries, fallbacks and blocked calls for one run."""
@@ -200,6 +240,18 @@ class Gateway:
             level=level,
             data=data,
         )
+
+    def check_run(self, run_id: str) -> None:
+        """Raise RunStopped when the run has a stop flag, or BudgetExceeded once it has
+        reached a cap. Checked before every try, so a retry or fallback never starts
+        after the stop, and by the tool loop before it runs a reply's tool calls."""
+        if self.kill_switch is not None:
+            self.kill_switch.check(run_id)
+        hit = self.budget.exceeded(run_id)
+        if hit is not None:
+            self.budget.usage(run_id).blocked += 1
+            limit, reason = hit
+            raise BudgetExceeded(reason, limit=limit)
 
     async def _preflight(self, request: LLMRequest) -> list[tuple[str, str]]:
         """Check the kill switch, seed the run's spend, run before hooks; return the routes."""
@@ -274,12 +326,28 @@ class Gateway:
         return response
 
     async def _on_error(
-        self, request: LLMRequest, provider: str, model: str, exc: Exception, try_no: int
+        self,
+        request: LLMRequest,
+        provider: str,
+        model: str,
+        exc: Exception,
+        try_no: int,
+        *,
+        last_route: bool,
     ) -> bool:
-        """Log one failed try. Returns True when the same route should retry."""
+        """Log one failed try. Returns True when the same route should retry. A refused
+        connection marks the provider down, and retries only on the ``last_route``,
+        since no other provider can take the call."""
         usage = self.budget.usage(request.run_id)
         transient = isinstance(exc, TransientLLMError)
-        will_retry = transient and try_no < len(self.config.retry.delays_s)
+        unreachable = isinstance(exc, TransientLLMError) and exc.unreachable
+        cap = exc.max_retries if isinstance(exc, TransientLLMError) else None
+        will_retry = (
+            transient
+            and not (unreachable and not last_route)
+            and try_no < len(self.config.retry.delays_s)
+            and (cap is None or try_no < cap)
+        )
         await self.bus.emit(
             self._event(
                 EventName.ERROR,
@@ -293,7 +361,10 @@ class Gateway:
                 retry=will_retry,
             )
         )
+        if unreachable:
+            await self._mark_down(request, provider, exc)
         if will_retry:
+            self.check_run(request.run_id)  # no wait for a retry the stop would block
             usage.retries += 1
             await self.sleep(self.config.retry.delays_s[try_no])
         return will_retry
@@ -356,13 +427,13 @@ class Gateway:
             effort = self._effort(request, primary)
             started = time.monotonic()
             last: Exception | None = None
-            for name, model in routes:
+            for i, (name, model) in enumerate(routes):
                 fallback = (name, model) != (primary.provider, primary.model)
+                last_route = i == len(routes) - 1
                 provider = self.providers[name]
                 try_no = 0
                 while True:
-                    if self.kill_switch is not None:
-                        self.kill_switch.check(request.run_id)
+                    self.check_run(request.run_id)
                     try:
                         async with self._global, self._slot(name):
                             fault = self._inject(request.run_id, name)
@@ -372,10 +443,13 @@ class Gateway:
                     except Exception as exc:
                         last = exc
                         self.budget.usage(request.run_id).failed_calls += 1
-                        if await self._on_error(request, name, model, exc, try_no):
+                        if await self._on_error(
+                            request, name, model, exc, try_no, last_route=last_route
+                        ):
                             try_no += 1
                             continue
                         break
+                    await self._mark_up(request, name)
                     response = self._finish(request, model, response, fault)
                     await self._after(request, response, started, fallback, fault)
                     return response
@@ -392,19 +466,20 @@ class Gateway:
             effort = self._effort(request, primary)
             started = time.monotonic()
             last: Exception | None = None
-            for name, model in routes:
+            for i, (name, model) in enumerate(routes):
                 fallback = (name, model) != (primary.provider, primary.model)
+                last_route = i == len(routes) - 1
                 provider = self.providers[name]
                 try_no = 0
                 while True:
-                    if self.kill_switch is not None:
-                        self.kill_switch.check(request.run_id)
+                    self.check_run(request.run_id)
                     sent = False
                     try:
                         async with self._global, self._slot(name):
                             fault = self._inject(request.run_id, name)
                             async for chunk in provider.stream(request, model=model, effort=effort):
                                 if chunk.done and chunk.response is not None:
+                                    await self._mark_up(request, name)
                                     response = self._finish(request, model, chunk.response, fault)
                                     await self._after(request, response, started, fallback, fault)
                                     yield StreamChunk(done=True, response=response)
@@ -421,7 +496,9 @@ class Gateway:
                             raise
                         last = exc
                         self.budget.usage(request.run_id).failed_calls += 1
-                        if await self._on_error(request, name, model, exc, try_no):
+                        if await self._on_error(
+                            request, name, model, exc, try_no, last_route=last_route
+                        ):
                             try_no += 1
                             continue
                         break

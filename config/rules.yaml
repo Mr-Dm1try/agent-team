@@ -86,7 +86,8 @@ rules:
     helper: tests_ran
     statement: >-
       The Engineer's unit tests ran and passed, and the run log shows the test command
-      that produced the reported result.
+      that produced the reported result. An exit code that a wrapper such as "; echo"
+      or "|| true" can mask proves nothing; then the test runner's own summary decides.
 
   - id: R7
     title: QA clean
@@ -147,7 +148,10 @@ rules:
     severity: blocker
     helper: secrets
     precheck: true
-    statement: No keys, tokens or passwords appear in code, logs, tool calls or artifacts.
+    statement: >-
+      No keys, tokens or passwords appear in code, logs, tool calls or artifacts. Sample
+      values inside fetched web pages are outside text, not a leak; a secret an agent
+      sends out, such as one in a URL, is.
 
   - id: S2
     title: Dangerous code

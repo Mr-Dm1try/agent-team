@@ -120,7 +120,13 @@ def translate_error(exc: Exception, provider: str) -> Exception:
     TransientLLMError; everything else is returned unchanged. A stream that stalls or
     drops mid-reply raises the HTTP client's own error, which is transient too."""
     if isinstance(exc, anthropic.APIConnectionError | httpx2.TransportError):
-        return TransientLLMError(f"{type(exc).__name__}: {exc}", provider=provider)
+        # Down, not a blip: the connection itself was refused or the host not found.
+        unreachable = isinstance(exc, httpx2.ConnectError) or isinstance(
+            exc.__cause__, httpx2.ConnectError
+        )
+        return TransientLLMError(
+            f"{type(exc).__name__}: {exc}", provider=provider, unreachable=unreachable
+        )
     if isinstance(exc, anthropic.APIStatusError) and (
         exc.status_code in (408, 409, 429) or exc.status_code >= 500
     ):

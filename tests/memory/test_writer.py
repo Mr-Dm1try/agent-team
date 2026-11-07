@@ -33,6 +33,7 @@ from agent_team.core.errors import BudgetExceeded
 from agent_team.core.events import InMemoryEventBus
 from agent_team.core.models import (
     SESSION,
+    USER_ACCEPTED,
     AgentName,
     Decision,
     DecisionKind,
@@ -110,15 +111,16 @@ class World:
         )
         return await self.stores.tasks.update_task(task.model_copy(update={"output": ref}))
 
-    async def check(self, task: Task, *findings: Finding) -> Verdict:
+    async def check(self, task: Task, *findings: Finding, model: str | None = None) -> Verdict:
         """Record a task check (failing when it has findings) and emit audit_verdict
-        as the orchestrator does."""
+        as the orchestrator does; ``model`` is who judged it."""
         verdict = Verdict(
             run_id=task.run_id,
             scope=RuleScope.TASK,
             task_id=task.id,
             passed=not findings,
             findings=list(findings),
+            model=model,
         )
         await self.stores.verdicts.save(verdict)
         await self.bus.emit(
@@ -126,7 +128,12 @@ class World:
                 name=EventName.AUDIT_VERDICT,
                 run_id=task.run_id,
                 task_id=task.id,
-                data={"verdict_id": verdict.id, "scope": "task", "passed": verdict.passed},
+                data={
+                    "verdict_id": verdict.id,
+                    "scope": "task",
+                    "passed": verdict.passed,
+                    "model": verdict.model,
+                },
             )
         )
         return verdict
@@ -244,6 +251,29 @@ async def test_a_pass_after_a_fail_records_the_lesson_and_the_fix(tmp_path: Path
         "What fixed it: Installed httpx and ran pytest (changed tests)."
     )
     assert lesson.origin.task_id == engineer.id
+    assert lesson.origin.agent is AgentName.ENGINEER
+
+
+async def test_work_the_user_kept_despite_its_check_teaches_nothing(tmp_path: Path) -> None:
+    """A false positive the user overrode is no lesson, and the unchecked output's
+    proposals aren't saved either."""
+    w = await world(tmp_path)
+    run = await w.run()
+    researcher = await w.task(run, AgentName.RESEARCHER, "research_brief", attempt=1)
+    brief = ResearchBrief(
+        summary="Found the docs.",
+        answers=[AnsweredQuestion(question="q", answer="a", sources=[Source(ref=URL)])],
+        memory_proposals=[MemoryProposal(kind="research_fact", text="a fact", source=URL)],
+    )
+    researcher = await w.output(researcher, brief)
+    s1 = Finding(
+        rule_id="S1",
+        severity=Severity.BLOCKER,
+        message="hard-coded credential in tool call web_fetch",
+    )
+    await w.check(researcher, s1)
+    await w.check(researcher, model=USER_ACCEPTED)
+    assert await w.memories() == []
 
 
 async def test_a_lesson_from_a_revision_uses_the_suggested_fix_without_an_old_output(

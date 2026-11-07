@@ -26,7 +26,7 @@ class _Cfg(BaseModel):
 
 class Route(_Cfg):
     """A provider and model, with an optional prompt-token budget and effort. Effort
-    sets how hard the model reasons: Claude's effort, or Ollama's reasoning_effort for
+    sets how hard the model reasons: Claude's effort, or Ollama's think level for
     the models listed in ``providers.ollama.reasoning_models``."""
 
     provider: str
@@ -59,6 +59,10 @@ class LimitsConfig(_Cfg):
     max_check_attempts: int = 3
     #: Wall-clock limit on one attempt of a task or a check.
     task_timeout_s: float = 600.0
+    #: Research tasks agents may ask for in one run, on top of the planned ones.
+    max_research_tasks: int = Field(default=6, ge=0)
+    #: How deep requests may chain: at 1, a task made from a request can't ask for more.
+    max_research_depth: int = Field(default=1, ge=0)
 
 
 class RetryConfig(_Cfg):
@@ -66,6 +70,8 @@ class RetryConfig(_Cfg):
     """Backoff for transient model errors."""
 
     delays_s: list[float] = Field(default_factory=lambda: [1.0, 2.0, 4.0])
+    #: How long a provider that refused a connection is skipped before it is tried again.
+    provider_down_s: float = 60.0
 
 
 class ProviderLimit(_Cfg):
@@ -110,19 +116,23 @@ class AnthropicConfig(_Cfg):
 class OllamaConfig(_Cfg):
     """Ollama provider settings."""
 
-    base_url: str = "http://localhost:11434/v1"
+    #: The server; a trailing OpenAI-compatible ``/v1`` is ignored.
+    base_url: str = "http://localhost:11434"
+    #: The window asked for. Ollama's native API loads the model with it; a model whose
+    #: own limit, or loaded context, is smaller gets the smaller window.
     num_ctx: int = 32_768
     timeout_s: float = 300.0
     #: The slowest generation speed planned for. A call's timeout grows past
     #: ``timeout_s`` when its ``max_tokens`` would take longer than that at this speed.
     min_tokens_per_s: float = 20.0
-    #: Models (by name before the ":" tag) that take ``reasoning_effort``. Ollama
+    #: Models (by name before the ":" tag) that take a ``think`` level. Ollama
     #: rejects it for models that can't think, so others get no effort at all.
     reasoning_models: list[str] = Field(default_factory=lambda: ["gpt-oss"])
     #: Least room left for the reply. A route's prompt budget plus this must fit
-    #: ``num_ctx``, and a call whose prompt leaves less is refused, because Ollama
-    #: would otherwise drop the start of the prompt without saying so.
-    min_output_tokens: int = 1024
+    #: ``num_ctx``, and a call whose prompt leaves less is refused rather than sent. A
+    #: thinking model such as gpt-oss reasons before it writes the JSON, and both count
+    #: against the reply, so a smaller room ends in "the reply hit the token limit".
+    min_output_tokens: int = 4096
     #: Characters per token when estimating a prompt. Low on purpose: running over
     #: the window is silent truncation, while a high estimate only costs a fallback.
     chars_per_token: int = 3
@@ -179,12 +189,16 @@ class WebConfig(_Cfg):
 
 
 class EmbedderConfig(_Cfg):
-    """The embedding model for memory: nomic-embed-text through Ollama's
-    OpenAI-compatible endpoint, called once when a memory is saved and once per search."""
+    """The embedding model for memory: nomic-embed-text through Ollama's ``/api/embed``,
+    called once when a memory is saved and once per search."""
 
     model: str = "nomic-embed-text"
     #: None uses ``providers.ollama.base_url``.
     base_url: str | None = None
+    #: The most tokens one text may take; the model's own window from ``/api/show``
+    #: wins when smaller. Longer texts are cut at a safe character count first, so
+    #: Ollama never truncates them itself.
+    max_input_tokens: int = 2_048
     timeout_s: float = 10.0
     #: After a failed call, search uses BM25 alone for this long before trying again.
     retry_after_s: float = 60.0
@@ -252,6 +266,11 @@ class PathsConfig(_Cfg):
     runs_dir: str = "runs"
     db: str = "runs/agent_team.db"
 
+    def db_file(self) -> Path:
+        """The database as an absolute path; a relative one is read from the current
+        folder, so messages name this to show where a command looked."""
+        return Path(self.db).resolve()
+
 
 class Config(_Cfg):
     """The whole routing and limits file."""
@@ -316,6 +335,16 @@ class Config(_Cfg):
     def context_budget(self, agent: AgentName) -> int:
         """Max prompt tokens for the agent's model."""
         return self.route_for(agent).context_budget or self.defaults.context_budget
+
+    def fallback_budget(self, provider: str) -> int:
+        """Max prompt tokens when ``provider`` stands in for an agent's own route: the
+        defaults' budget, cut for Ollama to what leaves reply room in its window."""
+        budget = self.defaults.context_budget
+        if provider == "ollama":
+            ollama = self.providers.ollama
+            room = ollama.num_ctx - ollama.min_output_tokens
+            budget = min(budget, room * ollama.chars_per_token // CHARS_PER_TOKEN)
+        return budget
 
 
 def deep_merge(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:

@@ -1,6 +1,6 @@
-"""Embeddings for memory: nomic-embed-text through Ollama's OpenAI-compatible
-endpoint, a deterministic fake for tests, and the switch that falls back to BM25 alone
-while the model is down (docs/DESIGN.md, "Memory")."""
+"""Embeddings for memory: nomic-embed-text through Ollama's ``/api/embed``, a
+deterministic fake for tests, and the switch that falls back to BM25 alone while the
+model is down (docs/DESIGN.md, "Memory")."""
 
 from __future__ import annotations
 
@@ -10,43 +10,79 @@ import math
 import time
 from collections.abc import Callable, Sequence
 
-import openai
+import httpx
 
 from agent_team.core.config import EmbedderConfig
 from agent_team.core.errors import EmbedderUnavailable
 from agent_team.core.interfaces import Embedder
-from agent_team.memory.store import STOPWORDS, WORD
+from agent_team.core.words import STOPWORDS, WORD
+from agent_team.llm.ollama_api import api_root, error_text, model_context
+
+#: Characters per token planned for when cutting a text to the embedder's window. Lower
+#: than for chat prompts, since memories hold paths, URLs and code that pack tokens.
+EMBED_CHARS_PER_TOKEN = 2.2
 
 
 class OllamaEmbedder:
-    """Implements ``Embedder`` with Ollama's ``/v1/embeddings``. The SDK's own retries
-    are off: a failure falls back to BM25 at once instead of holding up a task."""
+    """Implements ``Embedder`` with Ollama's ``/api/embed``. No retries: a failure falls
+    back to BM25 at once instead of holding up a task. Each text is cut to what fits the
+    model's window, so Ollama never truncates it itself."""
 
-    def __init__(self, config: EmbedderConfig, base_url: str) -> None:
-        """Talk to the Ollama server at ``base_url`` with the configured model."""
+    def __init__(
+        self,
+        config: EmbedderConfig,
+        base_url: str,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        """Talk to the Ollama server at ``base_url`` with the configured model;
+        ``transport`` replaces the network in tests."""
         self.config = config
-        self._client = openai.AsyncOpenAI(
-            base_url=config.base_url or base_url,
-            api_key="ollama",
+        self._client = httpx.AsyncClient(
+            base_url=api_root(config.base_url or base_url),
             timeout=config.timeout_s,
-            max_retries=0,
+            transport=transport,
         )
+        self._max_chars: int | None = None
+
+    async def max_chars(self) -> int:
+        """The longest text, prefix included, sent to be embedded: the window (the
+        configured cap, or the model's own limit from ``/api/show`` when smaller) at
+        a low chars-per-token ratio, so the cut errs short."""
+        if self._max_chars is not None:
+            return self._max_chars
+        cap = self.config.max_input_tokens
+        limit = await model_context(self._client, self.config.model)
+        chars = int(min(cap, limit or cap) * EMBED_CHARS_PER_TOKEN)
+        if limit is not None:
+            self._max_chars = chars  # Ollama answered; until it does, ask again next time
+        return chars
 
     async def embed(self, texts: Sequence[str], *, query: bool) -> list[list[float]]:
         """One vector per text, with nomic's search prefix for queries or documents."""
         if not texts:
             return []
         prefix = self.config.query_prefix if query else self.config.document_prefix
+        room = max(await self.max_chars() - len(prefix), 1)
+        body = {
+            "model": self.config.model,
+            "input": [prefix + t[:room] for t in texts],
+            # A backstop for text denser than planned; the cut above is the real limit.
+            "truncate": True,
+        }
         try:
-            reply = await self._client.embeddings.create(
-                model=self.config.model, input=[prefix + t for t in texts]
-            )
-        except openai.OpenAIError as exc:
+            reply = await self._client.post("/api/embed", json=body)
+        except httpx.HTTPError as exc:
             raise EmbedderUnavailable(f"{type(exc).__name__}: {exc}") from exc
-        vectors = [d.embedding for d in sorted(reply.data, key=lambda d: d.index)]
+        if reply.status_code >= 400:
+            raise EmbedderUnavailable(f"HTTP {reply.status_code}: {error_text(reply)}")
+        try:
+            vectors = reply.json().get("embeddings") or []
+        except (ValueError, AttributeError) as exc:
+            raise EmbedderUnavailable(f"unreadable reply: {exc}") from exc
         if len(vectors) != len(texts) or any(not v for v in vectors):
             raise EmbedderUnavailable(f"{self.config.model} returned {len(vectors)} vectors")
-        return vectors
+        return [list(map(float, v)) for v in vectors]
 
 
 class FakeEmbedder:

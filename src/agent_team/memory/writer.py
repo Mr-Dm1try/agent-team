@@ -37,6 +37,7 @@ from agent_team.core.interfaces import (
 )
 from agent_team.core.models import (
     AUDIT_RULE,
+    USER_ACCEPTED,
     AgentName,
     DecisionKind,
     Event,
@@ -54,7 +55,7 @@ from agent_team.core.tracing import Tracer
 from agent_team.llm.structured import parse_output
 from agent_team.llm.types import LLMClient, LLMRequest, Message
 from agent_team.memory.embed import Embeddings
-from agent_team.orchestrator.lineage import ancestry
+from agent_team.orchestrator.lineage import ancestry, previous_version
 
 log = logging.getLogger(__name__)
 
@@ -194,11 +195,21 @@ class MemoryWriter:
 
         The pass fixes a failure when the check before it, on this task or the tasks it
         was reopened from, failed; a check that failed closed judged nothing and is
-        skipped. So a revision of work that already passed is no fix."""
+        skipped. So a revision of work that already passed is no fix. A pass that only
+        records the user keeping failed work saves nothing."""
         data = event.data
         if not data.get("passed") or data.get("scope") != RuleScope.TASK.value:
             return
         if event.task_id is None:
+            return
+        if data.get("model") == USER_ACCEPTED:
+            # The user kept work that failed its check; nothing passed, so nothing it
+            # says (no lesson, no proposal) has been checked.
+            await self._emit(
+                event.run_id,
+                MemorySource(run_id=event.run_id, task_id=event.task_id),
+                {"skipped": ["accepted by the user, not passed"]},
+            )
             return
         task = await self.tasks.get_task(event.task_id)
         if task.status is TaskStatus.SUPERSEDED or task.output is None:
@@ -248,7 +259,7 @@ class MemoryWriter:
         """The output's decisions and the research facts whose source the output
         cites (so R2 checked it was opened)."""
         out: list[tuple[MemoryKind, str, MemorySource]] = []
-        here = MemorySource(run_id=task.run_id, task_id=task.id)
+        here = MemorySource(run_id=task.run_id, task_id=task.id, agent=task.agent)
         if isinstance(artifact, Spec):
             out += [(MemoryKind.DECISION, d, here) for d in artifact.decisions]
         cited = cited_sources(artifact, workspace)
@@ -275,25 +286,30 @@ class MemoryWriter:
             for f in failed.blockers
             if f.rule_id != AUDIT_RULE and (f.artifact is None or f.artifact.kind == artifact.kind)
         ][:MAX_LESSONS]
-        here = MemorySource(run_id=task.run_id, task_id=task.id)
+        here = MemorySource(run_id=task.run_id, task_id=task.id, agent=task.agent)
         out: list[tuple[MemoryKind, str, MemorySource]] = []
+        chain = [t.id for t in ancestry(task, await self.tasks.list_tasks(task.run_id))]
+        before: list[Artifact | None] = []  # the version before this one, loaded once
+
+        async def failed_output(finding: Finding) -> Artifact | None:
+            """The output the failed check judged: the finding's artifact when it is the
+            same kind, else the version before the passing one in this line of work."""
+            ref = finding.artifact
+            if ref is not None and ref.kind == artifact.kind and ref.version < artifact.version:
+                return await self._load(task.run_id, ref)
+            if not before:
+                before.append(await previous_version(self.artifacts, task.run_id, artifact, chain))
+            return before[0]
+
         for finding in findings:
-            old = await self._failed_output(task, failed, finding, artifact)
+            old = await failed_output(finding)
             out.append((MemoryKind.LESSON, lesson_text(task, finding, old, artifact), here))
         return out
 
-    async def _failed_output(
-        self, task: Task, failed: Verdict, finding: Finding, artifact: Artifact
-    ) -> Artifact | None:
-        """The output the failed check judged: the finding's artifact when it is the
-        same kind, else the version before the passing one."""
-        ref = finding.artifact
-        if ref is None or ref.kind != artifact.kind or ref.version >= artifact.version:
-            if artifact.version <= 1:
-                return None
-            ref = ArtifactRef(kind=artifact.kind, version=artifact.version - 1)
+    async def _load(self, run_id: str, ref: ArtifactRef) -> Artifact | None:
+        """One artifact version, or None if it doesn't exist."""
         try:
-            return await self.artifacts.load(task.run_id, ref)
+            return await self.artifacts.load(run_id, ref)
         except KeyError:
             return None
 

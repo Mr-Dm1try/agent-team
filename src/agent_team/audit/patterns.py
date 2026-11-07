@@ -232,6 +232,164 @@ def rm_outside(command: str, workspace: str, _depth: int = 0) -> list[str]:
     return out
 
 
+# --- test commands (R6) ------------------------------------------------------------
+
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SHELL_FLAGS = re.compile(r"^-[A-Za-z]+$")
+#: The last pytest summary line, such as "2 failed, 71 passed in 3.10s".
+_PYTEST_SUMMARY = re.compile(r"^[=\s]*((?:\d+ [a-z]+(?:, )?)+) in [\d.]+s\b", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class ShellStep:
+    """One simple command of a shell line, without leading ``VAR=value`` assignments
+    and redirections, and the operator after it ("" for the last one)."""
+
+    words: tuple[str, ...]
+    after: str
+
+    @property
+    def text(self) -> str:
+        """The words joined by single spaces."""
+        return " ".join(self.words)
+
+
+@dataclass(frozen=True)
+class CommandShape:
+    """A command split into its simple commands, and the shell options that change
+    how its exit code works (``e`` for errexit, ``pipefail``)."""
+
+    steps: tuple[ShellStep, ...]
+    options: frozenset[str] = frozenset()
+
+    @property
+    def text(self) -> str:
+        """The simple commands joined by " ; ", for matching one command against another."""
+        return " ; ".join(s.text for s in self.steps)
+
+
+def _bare(words: list[str]) -> tuple[str, ...]:
+    """Words without the leading ``env`` and ``VAR=value`` assignments."""
+    i = 0
+    while i < len(words) and (words[i] == "env" or _ASSIGNMENT.match(words[i])):
+        i += 1
+    return tuple(words[i:])
+
+
+def shell_steps(script: str) -> list[ShellStep]:
+    """The simple commands of a shell line in order, each with the operator after it.
+    Redirections such as ``2>&1`` are dropped. Falls back to plain splitting when the
+    quoting is broken."""
+    script = script.replace("\n", " ; ")
+    try:
+        lexer = shlex.shlex(script, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        tokens = re.sub(r"([;&|<>]+)", r" \1 ", script).split()
+    steps: list[ShellStep] = []
+    words: list[str] = []
+    target = False  # the next word is a redirection's target
+    for token in tokens:
+        if token and set(token) <= set(";&|"):
+            steps.append(ShellStep(_bare(words), token))
+            words = []
+        elif token and set(token) <= set("<>&"):
+            if words and words[-1].isdigit():
+                words.pop()  # the 2 in 2>&1
+            target = True
+        elif target:
+            target = False
+        else:
+            words.append(token)
+    steps.append(ShellStep(_bare(words), ""))
+    return [s for s in steps if s.words]
+
+
+def command_shape(argv: list[str] | str) -> CommandShape:
+    """How a command runs: an ``sh -c SCRIPT`` (or bash) call is unwrapped into the
+    script's simple commands, with the options given on the command line; any other
+    argv is one simple command. A string is read as a shell line."""
+    if isinstance(argv, str):
+        try:
+            words = shlex.split(argv)
+        except ValueError:
+            words = argv.split()
+        if len(words) < 3 or posixpath.basename(words[0]) not in _SHELLS:
+            return _with_set_options(tuple(shell_steps(argv)), frozenset())
+        argv = words
+    if argv and posixpath.basename(argv[0]) in _SHELLS:
+        options: set[str] = set()
+        i = 1
+        while i < len(argv):
+            arg = argv[i]
+            if arg == "-o" and i + 1 < len(argv):
+                options.add(argv[i + 1])
+                i += 2
+                continue
+            if not _SHELL_FLAGS.match(arg):
+                break
+            options |= set(arg[1:])
+            if "c" in arg:
+                script = argv[i + 1] if i + 1 < len(argv) else ""
+                return _with_set_options(tuple(shell_steps(script)), frozenset(options))
+            i += 1
+    words = list(argv)
+    return CommandShape((ShellStep(_bare(words), ""),) if _bare(words) else ())
+
+
+def _with_set_options(steps: tuple[ShellStep, ...], options: frozenset[str]) -> CommandShape:
+    """The shape with options a leading ``set -e`` or ``set -o pipefail`` turns on."""
+    extra: set[str] = set()
+    for step in steps:
+        if step.words[:1] != ("set",):
+            break
+        for word in step.words[1:]:
+            if word.startswith("-") and word != "-o":
+                extra |= set(word[1:])
+            elif not word.startswith("-"):
+                extra.add(word)
+    return CommandShape(steps, options | frozenset(extra))
+
+
+def contains_command(haystack: str, needle: str) -> bool:
+    """Whether ``needle`` appears in ``haystack`` as whole words."""
+    return bool(needle) and re.search(rf"(?<!\S){re.escape(needle)}(?!\S)", haystack) is not None
+
+
+def exit_code_masked(shape: CommandShape, index: int) -> str | None:
+    """Why the command's exit code may not be the exit code of its simple command at
+    ``index`` (the test run), or None when it is. A ``;``, ``&`` or ``||`` after it lets a
+    later command set the exit code (``;`` is fine under ``set -e``), and so does a
+    pipe right after it unless ``pipefail`` is on. ``&&`` is fine: a failure stops the
+    chain."""
+    steps = shape.steps
+    for j in range(index, len(steps)):
+        op = steps[j].after
+        following = steps[j + 1].text[:60] if j + 1 < len(steps) else ""
+        if op in ("", "&&") or (op == ";" and "e" in shape.options):
+            continue
+        if op in ("|", "|&"):
+            if j == index and "pipefail" not in shape.options:
+                return f"the test output is piped into '{following}'"
+            continue
+        return f"'{op} {following}' runs after the tests"
+    return None
+
+
+def pytest_summary(text: str) -> dict[str, int] | None:
+    """The counts in the last pytest summary line of ``text``, such as
+    ``{"passed": 71, "failed": 2}`` (``error`` counts as ``errors``); None if there is none."""
+    matches = list(_PYTEST_SUMMARY.finditer(text))
+    if not matches:
+        return None
+    counts: dict[str, int] = {}
+    for number, word in re.findall(r"(\d+) ([a-z]+)", matches[-1].group(1)):
+        key = {"error": "errors", "warning": "warnings"}.get(word, word)
+        counts[key] = counts.get(key, 0) + int(number)
+    return counts
+
+
 # --- dangerous code (S2) and reach (S3) ----------------------------------------------
 
 _CODE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [

@@ -17,12 +17,14 @@ from datetime import datetime
 from agent_team.core.artifacts import Artifact
 from agent_team.core.config import MemoryConfig
 from agent_team.core.interfaces import EventBus, MemoryIndex
-from agent_team.core.models import Event, EventName, MemoryKind, Run, Task, utcnow
+from agent_team.core.models import AgentName, Event, EventName, MemoryKind, Run, Task, utcnow
 from agent_team.memory.embed import Embeddings
 from agent_team.memory.rank import Mode, Ranked, build_query, fit, rank
 
 #: Memories saved without a vector that one search embeds, oldest first.
 BACKFILL = 8
+#: Longest search query; a model's search_memory call can pass a whole page.
+MAX_QUERY = 1_000
 
 
 @dataclass
@@ -50,16 +52,20 @@ class MemorySearch:
         kinds: list[MemoryKind],
         *,
         run_id: str | None,
+        agent: AgentName | None = None,
         now: datetime | None = None,
     ) -> Found:
         """Memories of ``kinds`` matching ``text``, best first. ``run_id`` is the run
-        asking: decisions and facts from other runs need a strong match."""
+        asking: decisions, facts and lessons from other runs need a strong match.
+        ``agent`` is who asks: other agents' lessons are left out. A query is cut to
+        ``MAX_QUERY`` characters, since a search needs a few words, not a page."""
+        text = text[:MAX_QUERY]
         vectors, error = await self.embeddings.vectors([text], query=True)
         if vectors is not None:
             await self._backfill()
         vector = vectors[0] if vectors else None
         matches = await self.index.search(text, vector, kinds, limit=self.config.candidates)
-        ranked = rank(matches, self.config, now=now or utcnow(), run_id=run_id)
+        ranked = rank(matches, self.config, now=now or utcnow(), run_id=run_id, agent=agent)
         return Found(ranked=ranked, mode="hybrid" if vector else "bm25", embedder_error=error)
 
     async def _backfill(self) -> None:
@@ -92,7 +98,7 @@ class MemoryFetch:
             return []
         query = build_query(task, inputs)
         try:
-            found = await self.search.search(query, kinds, run_id=run.id)
+            found = await self.search.search(query, kinds, run_id=run.id, agent=task.agent)
             chosen = fit(
                 found.ranked,
                 run_id=run.id,

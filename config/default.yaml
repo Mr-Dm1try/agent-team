@@ -1,6 +1,6 @@
 # Routing, budgets and review mode. Loaded by agent_team.core.config.
 # effort (low, medium, high, xhigh, max) sets how hard the model reasons: Claude's
-# effort, or Ollama's reasoning_effort (xhigh and max become high). Cheap Claude roles
+# effort, or Ollama's think level (xhigh and max become high). Cheap Claude roles
 # start at low, engineer and architect at medium. The researcher runs locally for
 # free, so it keeps gpt-oss's own default of medium.
 defaults: {provider: anthropic, model: claude-haiku-5-5, context_budget: 90000, effort: low}
@@ -12,12 +12,20 @@ stronger_model: {provider: anthropic, model: claude-sonnet-5-5}
 fallbacks: [anthropic, ollama]
 # Model each provider uses when it stands in for another one.
 fallback_models: {anthropic: claude-haiku-5-5, ollama: "gpt-oss:20b"}
-budget: {max_usd_per_run: 1.00, max_minutes_per_run: 30}
-limits: {max_attempts: 3, max_upstream_reruns: 2, max_concurrent_calls: 4}
+# 60 minutes, because the Researcher runs locally one call at a time; docs/DESIGN.md,
+# "Routing", has the estimate. With every agent on Claude, 30 is enough.
+budget: {max_usd_per_run: 1.00, max_minutes_per_run: 60}
+# Research agents ask for mid-run: at most max_research_tasks per run, and at depth 1 a
+# task made from a request can't ask for more. Past a limit a task answers with what it
+# has and lists the rest as open gaps.
+limits:
+  {max_attempts: 3, max_upstream_reruns: 2, max_concurrent_calls: 4,
+   max_research_tasks: 6, max_research_depth: 1}
 review: auto_assumptions
 
 # Gateway details.
-retry: {delays_s: [1, 2, 4]}
+# A provider that refuses a connection is skipped for provider_down_s seconds.
+retry: {delays_s: [1, 2, 4], provider_down_s: 60}
 rate_limits:
   anthropic: {max_concurrent: 4, requests_per_minute: 50}
   ollama: {max_concurrent: 1}
@@ -31,8 +39,9 @@ providers:
     thinking: {type: adaptive}
     # A thinking block whose earlier history was edited is dropped, not a 400.
     on_history_edit: drop_block
-  # reasoning_models: models that take reasoning_effort; others get none.
-  ollama: {base_url: "http://localhost:11434/v1", num_ctx: 32768, reasoning_models: [gpt-oss]}
+  # Ollama's native API, which loads the model with num_ctx; a model whose own limit is
+  # smaller gets that. reasoning_models: models that take an effort; others get none.
+  ollama: {base_url: "http://localhost:11434", num_ctx: 32768, reasoning_models: [gpt-oss]}
 # Fault injection; the --chaos flag overrides this.
 chaos: {rate: 0.0, faults: []}
 # Custom hooks as "module:function"; each function receives the event bus.
@@ -43,7 +52,7 @@ memory:
   max_items: 10
   max_tokens: 500
   # Text match (0 to 1) a memory needs to be given, and what a decision or research
-  # fact from another run needs.
+  # fact from another run needs. A lesson goes only to the agent whose task taught it.
   min_relevance: 0.3
   strong_match: 0.6
   # A new memory this close (cosine) to one of the same kind is merged into it.

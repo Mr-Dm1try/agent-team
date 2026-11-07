@@ -259,6 +259,11 @@ class MemoryIndex(Protocol):
         """Store the vector of a memory saved without one."""
         ...
 
+    async def forget(self, memory_id: str) -> Memory | None:
+        """Delete one memory, so no later search finds it; returns what was deleted,
+        or None when there is no such memory."""
+        ...
+
     async def record_fetch(
         self, run_id: str, task_id: str, attempt: int, query: str, ids: Sequence[str]
     ) -> None:

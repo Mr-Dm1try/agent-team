@@ -4,7 +4,7 @@ decision log, run status, feedback routing and re-opening work."""
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent_team.core.artifacts import Artifact
@@ -45,6 +45,7 @@ from agent_team.llm.types import LLMClient
 from agent_team.orchestrator.lineage import reopen
 from agent_team.orchestrator.policy import SimplePolicy
 from agent_team.orchestrator.replies import Reply
+from agent_team.orchestrator.research import ResearchLimits
 
 APPROVE = re.compile(
     r"^\s*(approve[ds]?|ok(ay)?|yes|lgtm|looks good|accept(ed)?|ship it)[\s.!]*$", re.I
@@ -72,6 +73,7 @@ class OrchestratorConfig:
     #: Attempts of each check (auditor task) before it fails closed.
     max_check_attempts: int = 3
     max_upstream_reruns: int = 2
+    research: ResearchLimits = field(default_factory=ResearchLimits)
     max_loops: int = 500  # safety valve for drive()
 
 
@@ -157,6 +159,7 @@ class OrchestratorBase:
                     "scope": verdict.scope.value,
                     "phase": verdict.phase.value if verdict.phase else None,
                     "passed": verdict.passed,
+                    "model": verdict.model,
                     "findings": [f.model_dump(mode="json") for f in verdict.findings],
                 },
             )

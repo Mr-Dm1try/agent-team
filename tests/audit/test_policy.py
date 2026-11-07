@@ -17,6 +17,7 @@ from agent_team.core.models import (
     Run,
     Severity,
     Task,
+    TaskOrigin,
     TaskStatus,
     Verdict,
     utcnow,
@@ -166,6 +167,7 @@ def test_still_failing_after_an_upstream_rerun_asks_the_user(run: Run) -> None:
         Phase.IMPLEMENTATION,
         "code_change",
         attempt=3,
+        origin=TaskOrigin.REVISION,
         parent_task_id=eng.id,
     )
     assert kinds(decide_task(run, child, v, [], [earlier], LIMITS))[-1] is DecisionKind.ASK_USER
@@ -186,6 +188,15 @@ def test_dangerous_action_stops_the_run(run: Run) -> None:
     v = verdict(run, blocker("S5", "run_command"), task=task)
     decisions = decide_task(run, task, v, [], [], LIMITS)
     assert kinds(decisions) == [DecisionKind.STOP, DecisionKind.ASK_USER]
+
+
+def test_a_finding_on_a_call_that_already_ran_asks_instead_of_retrying(run: Run) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief", attempt=1)
+    logged = blocker("S1", "tool call read_file:3").model_copy(update={"already_happened": True})
+    decisions = decide_task(run, task, verdict(run, logged, task=task), [], [], LIMITS)
+    assert kinds(decisions) == [DecisionKind.ESCALATE, DecisionKind.ASK_USER]
+    assert decisions[1].rule == "policy.already_happened"
+    assert "can't undo" in str(decisions[1].inputs["question"])
 
 
 def test_fail_closed_verdict_escalates_and_asks(run: Run) -> None:

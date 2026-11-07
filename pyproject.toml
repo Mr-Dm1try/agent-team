@@ -7,7 +7,6 @@ license = "AGPL-3.0-only"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.40",
-    "openai>=1.50",
     "pydantic>=2.8",
     "pyyaml>=6.0",
     "numpy>=1.26",

@@ -69,8 +69,9 @@ class MemorySearchTool:
         limit = args.get("limit", MAX_RESULTS)
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ToolError("limit must be a positive integer", tool=NAME)
-        # Asked for by the agent, so no other-run filter: it searched on purpose.
-        found = await self.search.search(query, kinds, run_id=None)
+        # Asked for by the agent, so no other-run filter: it searched on purpose. Other
+        # agents' lessons still don't apply to it.
+        found = await self.search.search(query, kinds, run_id=None, agent=ctx.task.agent)
         chosen = fit(
             found.ranked,
             run_id=ctx.run.id,

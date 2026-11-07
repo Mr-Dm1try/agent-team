@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import sqlite3
 from collections.abc import Sequence
 from typing import Any
@@ -21,6 +20,7 @@ import numpy as np
 
 from agent_team.core.db import Database
 from agent_team.core.models import Memory, MemoryKind, MemoryMatch
+from agent_team.core.words import STOPWORDS, WORD, terms
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS memories (
@@ -46,14 +46,6 @@ SCHEMA = (
     )""",
 )
 
-#: Words too common to help a keyword match.
-_COMMON = (
-    "a an and are as at be by for from has have in into is it its of on or that the "
-    "this to was were will with"
-)
-STOPWORDS = frozenset(_COMMON.split())
-#: A word, for keyword matching and the fake embedder.
-WORD = re.compile(r"[a-z0-9]+")
 #: Terms sent to FTS5 from one query, so a long objective stays a cheap search.
 MAX_TERMS = 32
 
@@ -61,12 +53,6 @@ MAX_TERMS = 32
 def normalize(text: str) -> str:
     """The text as compared for exact duplicates: lower case, words only."""
     return " ".join(WORD.findall(text.lower()))
-
-
-def terms(text: str) -> set[str]:
-    """The text's distinct words, without the common ones and a plural ``s``."""
-    words = (w for w in WORD.findall(text.lower()) if w not in STOPWORDS and len(w) > 1)
-    return {w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in words}
 
 
 def overlap(a: set[str], b: set[str]) -> float:
@@ -263,6 +249,21 @@ class SqliteMemoryIndex:
             "UPDATE memories SET vector = COALESCE(vector, ?) WHERE id = ?",
             (_blob(vector), memory_id),
         )
+
+    async def forget(self, memory_id: str) -> Memory | None:
+        """Delete one memory and its keyword entry in one transaction; returns what was
+        deleted, or None when there is no such memory."""
+
+        def run(conn: sqlite3.Connection) -> Memory | None:
+            """Read the row, then delete it from both tables."""
+            row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            if row is None:
+                return None
+            conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            conn.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
+            return _memory(row)
+
+        return await self.db.transaction(run)
 
     async def record_fetch(
         self, run_id: str, task_id: str, attempt: int, query: str, ids: Sequence[str]

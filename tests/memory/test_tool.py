@@ -87,3 +87,15 @@ async def test_bad_arguments_are_tool_errors(tmp_path: Path, args: dict[str, obj
     tool = await _tool(tmp_path, FakeEmbedder())
     with pytest.raises(ToolError):
         await tool(args, CTX)
+
+
+async def test_another_agents_lessons_are_not_found(tmp_path: Path) -> None:
+    tool = await _tool(tmp_path, FakeEmbedder())
+    for agent in (AgentName.ENGINEER, AgentName.ARCHITECT):
+        text = f"{agent.value.capitalize()}, spec: rule R6 caught httpx tests for the books API"
+        memory = Memory(
+            kind=MemoryKind.LESSON, text=text, sources=[MemorySource(run_id="run_1", agent=agent)]
+        )
+        await tool.search.index.save(memory, None, merge_at=0.92)
+    result = await tool({"query": "rule R6 httpx tests", "kinds": ["lesson"]}, CTX)
+    assert "Architect, spec" in result.content and "Engineer, spec" not in result.content

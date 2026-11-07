@@ -111,7 +111,18 @@ async def test_walks_skip_symlinks_that_escape(ctx: ToolContext, tmp_path: Path)
 
 
 @pytest.mark.parametrize(
-    "name", [".env", ".env.local", ".ENV", ".Env.Production", "sub/.env", ".envrc", "prod.env"]
+    "name",
+    [
+        ".env",
+        ".env.local",
+        ".env-local",
+        ".env_production",
+        ".ENV",
+        ".Env.Production",
+        "sub/.env",
+        ".envrc",
+        "prod.env",
+    ],
 )
 async def test_env_files_in_context_folders_are_refused(ctx: ToolContext, name: str) -> None:
     """Secrets files in a --context folder can't be read, listed or searched."""
@@ -130,7 +141,10 @@ async def test_env_files_in_context_folders_are_refused(ctx: ToolContext, name: 
     assert found.content == "no matches"
 
 
-@pytest.mark.parametrize("name", [".env.example", ".env.sample", ".env.template", "env.md"])
+@pytest.mark.parametrize(
+    "name",
+    [".env.example", ".env-sample", ".env_template", ".environment.md", "env.md"],
+)
 async def test_env_templates_in_a_context_folder_are_readable(ctx: ToolContext, name: str) -> None:
     """Templates such as ``.env.example`` hold no secrets, so they stay readable."""
     example = Path(ctx.run.context_dirs[0]) / name

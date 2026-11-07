@@ -177,6 +177,8 @@ class RuleScope(StrEnum):
 
 #: The rule id of the finding a check fails closed with, when it can't be completed.
 AUDIT_RULE = "AUDIT"
+#: The ``model`` of a passing verdict that records the user keeping failed work.
+USER_ACCEPTED = "user"
 #: Rules about agent actions that already happened, which stop the run.
 DANGEROUS_ACTION_RULES = frozenset({"S5", "S6", "S7"})
 
@@ -239,6 +241,9 @@ class Task(Contract):
     max_attempts: int = 3
     origin: TaskOrigin = TaskOrigin.PLAN
     parent_task_id: str | None = None  # the task this one came from (retry, revision...)
+    #: False once the task may not ask for research any more: a request of its was
+    #: refused for a limit, so its next attempt answers with what it has.
+    may_request_research: bool = True
     reason: str | None = None  # why it exists, in words, for the decision log
     model: str | None = None  # the model that ran the latest attempt
     output: ArtifactRef | None = None
@@ -262,6 +267,7 @@ class FeedbackSource(StrEnum):
     USER_COMMENT = "user_comment"
     AUDITOR = "auditor"
     QA = "qa"
+    HARNESS = "harness"  # a limit the harness applied, such as on research requests
 
 
 class Feedback(Contract):
@@ -292,6 +298,9 @@ class TaskEnvelope(Contract):
     findings: list[Finding] = Field(default_factory=list)  # from the last failed verdict
     previous_output: Artifact | None = None  # set on retries and revisions
     upstream_diff: str | None = None  # set on revisions
+    #: False when the task can't ask for research (a depth or run limit); its
+    #: requests are then turned into open gaps or assumptions.
+    research_allowed: bool = True
     trace_id: str
     span_id: str
 
@@ -351,6 +360,8 @@ class Finding(Contract):
     evidence: str | None = None
     suggested_fix: str | None = None
     from_helper: bool = False  # True when an evidence helper produced or confirmed it
+    #: About a tool call that already ran, so no retry can clear it; the user is asked.
+    already_happened: bool = False
 
 
 class Verdict(Contract):
@@ -478,6 +489,8 @@ class MemorySource(Contract):
     run_id: str
     task_id: str | None = None
     ref: str | None = None
+    #: The agent whose task it came from; a lesson is given to that agent only.
+    agent: AgentName | None = None
 
 
 class Memory(Contract):
@@ -539,6 +552,8 @@ class EventName(StrEnum):
     SPAN_STARTED = "span_started"
     SPAN_FINISHED = "span_finished"
     ERROR = "error"
+    PROVIDER_DOWN = "provider_down"
+    PROVIDER_UP = "provider_up"
     RUN_FINISHED = "run_finished"
 
 

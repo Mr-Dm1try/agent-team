@@ -6,14 +6,11 @@ from typing import Any
 
 import anthropic
 import httpx2
-import openai
 import pytest
 
-from agent_team.core.config import AnthropicConfig, OllamaConfig
-from agent_team.core.errors import ContextTooLong, TransientLLMError
+from agent_team.core.config import AnthropicConfig
+from agent_team.core.errors import TransientLLMError
 from agent_team.llm import anthropic_provider as ap
-from agent_team.llm import ollama_provider as op
-from agent_team.llm.tokens import SAFETY, estimate_json_tokens, to_json
 from agent_team.llm.types import (
     Message,
     TextBlock,
@@ -23,7 +20,7 @@ from agent_team.llm.types import (
     ToolUseBlock,
 )
 
-from .conftest import Sleeps, make_config, request
+from .conftest import request
 
 HISTORY = [
     Message.user("read it"),
@@ -260,60 +257,6 @@ def test_thinking_from_another_claude_model_is_sent_another_providers_is_not() -
     assert len(wire) == 2
 
 
-async def test_ollama_drops_thinking_and_sends_reasoning_effort() -> None:
-    claude = ThinkingBlock(provider="anthropic", model="claude-haiku-5-5", raw=THINKING)
-    history = [
-        Message.user("read it"),
-        Message(role="assistant", content=[claude, TextBlock(text="ok")]),
-    ]
-    provider, comps = ollama(chat_completion())
-    await provider.complete(request(messages=history), model="gpt-oss:20b", effort="medium")
-    await provider.complete(request(), model="gpt-oss:20b", effort="max")
-    await provider.complete(request(), model="gpt-oss:20b")
-    await provider.complete(request(), model="llama3.2:3b", effort="low")
-    sent = comps.calls[0]
-    assert sent["messages"][2] == {"role": "assistant", "content": "ok"}
-    assert "sig-abc" not in str(sent["messages"])
-    assert sent["reasoning_effort"] == "medium"
-    assert comps.calls[1]["reasoning_effort"] == "high"
-    assert "reasoning_effort" not in comps.calls[2]
-    # Ollama rejects reasoning_effort for models that can't think.
-    assert "reasoning_effort" not in comps.calls[3]
-
-
-async def test_fallback_to_ollama_drops_claude_thinking(sleeps: Sleeps) -> None:
-    from agent_team.llm.gateway import Gateway
-
-    block = ThinkingBlock(provider="anthropic", model="claude-haiku-5-5", raw=THINKING)
-    history = [
-        Message.user("read it"),
-        Message(role="assistant", content=[block, TextBlock(text="ok")]),
-        Message.user("go on"),
-    ]
-    down = anthropic.InternalServerError("oops", response=_response(529), body=None)
-    claude_api = StubAnthropicMessages(down)
-    provider, comps = ollama(chat_completion())
-    config = make_config(
-        defaults={"provider": "anthropic", "model": "claude-haiku-5-5", "effort": "low"},
-        fallbacks=["anthropic", "ollama"],
-        fallback_models={"ollama": "gpt-oss:20b"},
-        retry={"delays_s": []},
-    )
-    gw = Gateway(
-        config,
-        {
-            "anthropic": ap.AnthropicProvider(client=anthropic_client(claude_api)),
-            "ollama": provider,
-        },
-        sleep=sleeps,
-    )
-    resp = await gw.complete(request(messages=history))
-    assert resp.provider == "ollama"
-    assert claude_api.calls[0]["messages"][1]["content"][0] == THINKING
-    assert "sig-abc" not in str(comps.calls[0]["messages"])
-    assert comps.calls[0]["reasoning_effort"] == "low"
-
-
 async def test_anthropic_stream() -> None:
     provider = ap.AnthropicProvider(
         client=anthropic_client(
@@ -345,180 +288,16 @@ async def test_anthropic_error_mapping(exc: Exception, transient: bool, status: 
         assert info.value.status == status  # type: ignore[attr-defined]
 
 
-# --- ollama ------------------------------------------------------------------------
+def test_only_a_failed_connection_counts_as_anthropic_being_down() -> None:
+    from agent_team.llm import anthropic_provider
 
-
-def chat_completion(**kw: Any) -> openai.types.chat.ChatCompletion:
-    data: dict[str, Any] = {
-        "id": "c",
-        "object": "chat.completion",
-        "created": 0,
-        "model": "gpt-oss:20b",
-        "choices": [
-            {
-                "index": 0,
-                "finish_reason": "tool_calls",
-                "message": {
-                    "role": "assistant",
-                    "content": "thinking aloud",
-                    "tool_calls": [
-                        {
-                            "id": "t1",
-                            "type": "function",
-                            "function": {"name": "read", "arguments": '{"p": "x"}'},
-                        },
-                        {
-                            "id": "t2",
-                            "type": "function",
-                            "function": {"name": "read", "arguments": "{broken"},
-                        },
-                    ],
-                },
-            }
-        ],
-        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
-    }
-    data.update(kw)
-    return openai.types.chat.ChatCompletion.model_validate(data)
-
-
-def stream_chunks() -> list[openai.types.chat.ChatCompletionChunk]:
-    def chunk(
-        delta: dict[str, Any], finish: str | None = None, usage: dict[str, int] | None = None
-    ) -> openai.types.chat.ChatCompletionChunk:
-        return openai.types.chat.ChatCompletionChunk.model_validate(
-            {
-                "id": "c",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "m",
-                "choices": [] if usage else [{"index": 0, "delta": delta, "finish_reason": finish}],
-                "usage": usage,
-            }
-        )
-
-    return [
-        chunk({"content": "he"}),
-        chunk({"content": "llo"}),
-        chunk(
-            {
-                "tool_calls": [
-                    {"index": 0, "id": "t1", "function": {"name": "read", "arguments": '{"p":'}}
-                ]
-            }
-        ),
-        chunk({"tool_calls": [{"index": 0, "function": {"arguments": ' "y"}'}}]}, "tool_calls"),
-        chunk({}, usage={"prompt_tokens": 2, "completion_tokens": 5, "total_tokens": 7}),
-    ]
-
-
-class StubCompletions:
-    def __init__(self, result: Any) -> None:
-        self.result = result
-        self.calls: list[dict[str, Any]] = []
-
-    async def create(self, **kw: Any) -> Any:
-        self.calls.append(kw)
-        if isinstance(self.result, Exception):
-            raise self.result
-        if kw.get("stream"):
-
-            async def gen() -> AsyncIterator[Any]:
-                for c in self.result:
-                    yield c
-
-            return gen()
-        return self.result
-
-
-def ollama(result: Any) -> tuple[op.OllamaProvider, StubCompletions]:
-    comps = StubCompletions(result)
-    client = SimpleNamespace(chat=SimpleNamespace(completions=comps))
-    return op.OllamaProvider(client=client), comps
-
-
-async def test_ollama_translates_request_and_response() -> None:
-    provider, comps = ollama(chat_completion())
-    resp = await provider.complete(request(messages=HISTORY, tools=TOOLS), model="gpt-oss:20b")
-    sent = comps.calls[0]
-    assert sent["messages"][0] == {"role": "system", "content": "be brief"}
-    assert sent["messages"][2]["tool_calls"][0]["function"]["arguments"] == '{"p": "a"}'
-    assert sent["messages"][3] == {"role": "tool", "tool_call_id": "c1", "content": "body"}
-    assert sent["extra_body"] == {"options": {"num_ctx": 32768}}
-    assert sent["tools"][0]["function"]["parameters"] == {"type": "object"}
-    assert resp.stop_reason == "tool_use" and resp.text == "thinking aloud"
-    assert resp.tool_calls[0].arguments == {"p": "x"}
-    assert resp.tool_calls[1].arguments == {"_invalid_json": "{broken"}
-    assert (resp.usage.input_tokens, resp.usage.output_tokens) == (3, 4)
-
-
-async def test_ollama_timeout_grows_with_the_reply_it_may_write() -> None:
-    provider, comps = ollama(chat_completion())
-    await provider.complete(request(max_tokens=1_000), model="gpt-oss:20b")
-    await provider.complete(request(max_tokens=16_000), model="gpt-oss:20b")
-    short, long = (c["timeout"] for c in comps.calls)
-    assert short == provider.config.timeout_s  # the plain timeout covers a short reply
-    assert long == comps.calls[1]["max_tokens"] / provider.config.min_tokens_per_s > short
-
-
-async def test_ollama_fits_prompt_and_reply_into_num_ctx() -> None:
-    # No usage reported, so nothing is anchored or learned: the plain estimate caps.
-    comps = StubCompletions(chat_completion(usage=None))
-    provider = op.OllamaProvider(
-        OllamaConfig(num_ctx=4000, min_output_tokens=500),
-        client=SimpleNamespace(chat=SimpleNamespace(completions=comps)),
-    )
-    await provider.complete(request(max_tokens=16_000), model="gpt-oss:20b")
-    sent = comps.calls[0]
-    prompt = op.prompt_tokens(sent)
-    assert sent["max_tokens"] == 4000 - prompt
-    # Non-ASCII text counts once per character, not as \\u escapes.
-    assert op.prompt_tokens({"messages": [{"content": "привет" * 100}]}) < 250
-    await provider.complete(request(max_tokens=200), model="gpt-oss:20b")
-    assert comps.calls[1]["max_tokens"] == 200
-
-    # A prompt that leaves less than the minimum reply is refused, not truncated.
-    long = request(messages=[Message.user("x" * 11_000)])
-    with pytest.raises(ContextTooLong):
-        await provider.complete(long, model="gpt-oss:20b")
-    with pytest.raises(ContextTooLong):
-        [c async for c in provider.stream(long, model="gpt-oss:20b")]
-    assert len(comps.calls) == 2
-
-
-async def test_gateway_moves_on_when_ollama_cannot_fit_the_prompt(sleeps: Sleeps) -> None:
-    from agent_team.llm.fake import FakeProvider
-    from agent_team.llm.gateway import Gateway
-
-    provider, comps = ollama(chat_completion())
-    config = make_config(
-        defaults={"provider": "ollama", "model": "gpt-oss:20b", "context_budget": 20_000},
-        fallbacks=["ollama", "fake"],
-        fallback_models={"fake": "fake-small"},
-    )
-    gw = Gateway(config, {"ollama": provider, "fake": FakeProvider(["ok"])}, sleep=sleeps)
-    resp = await gw.complete(request(messages=[Message.user("x" * 120_000)]))
-    assert resp.provider == "fake" and comps.calls == [] and sleeps.calls == []
-
-
-async def test_ollama_stream_accumulates_tool_calls() -> None:
-    provider, _ = ollama(stream_chunks())
-    chunks = [c async for c in provider.stream(request(), model="m")]
-    assert [c.text for c in chunks[:-1]] == ["he", "llo"]
-    final = chunks[-1].response
-    assert final is not None and final.text == "hello"
-    assert final.tool_calls[0].arguments == {"p": "y"} and final.stop_reason == "tool_use"
-    assert final.usage.output_tokens == 5
-
-
-async def test_ollama_error_mapping() -> None:
-    provider, _ = ollama(openai.APIConnectionError(request=httpx2.Request("POST", "http://l")))
-    with pytest.raises(TransientLLMError):
-        await provider.complete(request(), model="m")
-    bad = openai.BadRequestError("bad", response=_response(400), body=None)
-    provider, _ = ollama(bad)
-    with pytest.raises(openai.BadRequestError):
-        await provider.complete(request(), model="m")
+    req = httpx2.Request("POST", "http://l")
+    refused = anthropic.APIConnectionError(request=req)
+    refused.__cause__ = httpx2.ConnectError("refused")
+    blip = anthropic.APIConnectionError(request=req)
+    blip.__cause__ = httpx2.ReadError("reset")
+    assert anthropic_provider.translate_error(refused, "anthropic").unreachable  # type: ignore[attr-defined]
+    assert not anthropic_provider.translate_error(blip, "anthropic").unreachable  # type: ignore[attr-defined]
 
 
 def test_build_providers_needs_no_credentials() -> None:
@@ -527,72 +306,3 @@ def test_build_providers_needs_no_credentials() -> None:
 
     gw = build_gateway(load_config())
     assert set(gw.providers) == {"anthropic", "ollama"}
-
-
-def _counted(prompt_tokens: int) -> openai.types.chat.ChatCompletion:
-    """A completion whose usage reports ``prompt_tokens``."""
-    return chat_completion(
-        usage={"prompt_tokens": prompt_tokens, "completion_tokens": 4, "total_tokens": 0}
-    )
-
-
-async def test_ollama_anchors_the_cap_on_the_last_reported_prompt() -> None:
-    comps = StubCompletions(_counted(100))
-    provider = op.OllamaProvider(
-        OllamaConfig(num_ctx=8_000, min_output_tokens=500),
-        client=SimpleNamespace(chat=SimpleNamespace(completions=comps)),
-    )
-    first = [Message.user("hello " * 50)]
-    await provider.complete(request(messages=first), model="gpt-oss:20b")
-    sent = comps.calls[0]
-    chars = len(to_json(sent["messages"], sent.get("tools", [])))
-    assert provider.calibration.ratio("gpt-oss:20b") == chars / 100 * SAFETY
-
-    # The next call extends the same history: Ollama's 100 plus the new messages only.
-    later = [*first, Message(role="assistant", content=[TextBlock(text="ok")]), Message.user("go")]
-    await provider.complete(request(messages=later, max_tokens=16_000), model="gpt-oss:20b")
-    ratio = provider.calibration.ratio("gpt-oss:20b")
-    appended = estimate_json_tokens(op.to_chat_messages("", later[1:]), chars_per_token=ratio)
-    assert comps.calls[1]["max_tokens"] == 8_000 - (100 + appended)
-
-    # A rewritten history (compaction) isn't anchored on: it is estimated in full.
-    rewritten = [Message.user("summary"), *later[1:]]
-    ratio = provider.calibration.ratio("gpt-oss:20b")
-    await provider.complete(request(messages=rewritten, max_tokens=16_000), model="gpt-oss:20b")
-    full = op.prompt_tokens(comps.calls[2], ratio)
-    assert comps.calls[2]["max_tokens"] == 8_000 - full
-
-
-async def test_ollama_warns_when_the_prompt_nearly_filled_num_ctx(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    comps = StubCompletions(_counted(3_950))
-    provider = op.OllamaProvider(
-        OllamaConfig(num_ctx=4_000, min_output_tokens=500),
-        client=SimpleNamespace(chat=SimpleNamespace(completions=comps)),
-    )
-    with caplog.at_level("WARNING", logger=op.__name__):
-        await provider.complete(request(), model="gpt-oss:20b")
-    assert "within 2% of num_ctx 4000" in caplog.text
-    # A count from a prompt that was probably cut teaches nothing.
-    assert provider.calibration.ratio("gpt-oss:20b") == provider.config.chars_per_token
-    assert not provider._anchors
-    caplog.clear()
-    comps.result = _counted(3_000)
-    with caplog.at_level("WARNING", logger=op.__name__):
-        await provider.complete(request(messages=[Message.user("other")]), model="gpt-oss:20b")
-    assert not caplog.text
-
-
-async def test_ollama_does_not_warn_about_a_full_prompt_the_cap_left_room_for(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # Within 2% of num_ctx, but inside the room the cap leaves: nothing was cut.
-    comps = StubCompletions(_counted(98_500))
-    provider = op.OllamaProvider(
-        OllamaConfig(num_ctx=100_000, min_output_tokens=1_024),
-        client=SimpleNamespace(chat=SimpleNamespace(completions=comps)),
-    )
-    with caplog.at_level("WARNING", logger=op.__name__):
-        await provider.complete(request(), model="gpt-oss:20b")
-    assert not caplog.text

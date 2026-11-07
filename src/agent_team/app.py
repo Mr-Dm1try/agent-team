@@ -51,6 +51,7 @@ from agent_team.llm.factory import build_gateway
 from agent_team.llm.types import LLMClient, Provider
 from agent_team.memory import MemoryParts, build_memory
 from agent_team.orchestrator import Dispatcher, Orchestrator, OrchestratorConfig
+from agent_team.orchestrator.research import ResearchLimits
 from agent_team.sandbox import CommandRunner, DockerRunner, attach_cleanup, make_commit_hook
 from agent_team.tools import command_tools, file_tools, web_tools
 
@@ -231,6 +232,10 @@ async def build_app(
             raise
         closers.append(memory.close)
         tools.update(memory.tools)
+    research_limits = ResearchLimits(
+        max_tasks=config.limits.max_research_tasks,
+        max_depth=config.limits.max_research_depth,
+    )
     dispatcher = Dispatcher(
         tasks=stores.tasks,
         artifacts=stores.artifacts,
@@ -244,6 +249,7 @@ async def build_app(
         memory=memory.fetch if memory else None,
         timeout_s=config.limits.task_timeout_s,
         auditor=auditor,
+        research=research_limits,
     )
     if policy is None:
         stronger = config.stronger_model
@@ -274,6 +280,7 @@ async def build_app(
             max_attempts=config.limits.max_attempts,
             max_check_attempts=config.limits.max_check_attempts,
             max_upstream_reruns=config.limits.max_upstream_reruns,
+            research=research_limits,
         ),
         policy=policy,
     )

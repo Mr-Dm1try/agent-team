@@ -136,6 +136,28 @@ async def test_time_cap(sleeps: Sleeps) -> None:
     assert info.value.limit == "max_minutes_per_run"
 
 
+async def test_no_retry_or_fallback_starts_after_the_time_cap(sleeps: Sleeps) -> None:
+    """A slow call that fails after the cap has tripped is not retried or handed to
+    the fallback: the run stops instead of spending more."""
+    clock = Clock()
+    config = make_config(budget={"max_minutes_per_run": 30}, fallbacks=["fake", "backup"])
+
+    class Slow(FakeProvider):
+        """Fails after the run's 30 minutes are up, as a long Ollama call can."""
+
+        async def complete(self, request: LLMRequest, *, model: str, effort: Effort | None = None):  # type: ignore[no-untyped-def]
+            """Move the clock past the cap, then fail."""
+            clock.now = 31 * 60
+            raise TransientLLMError("ReadTimeout", provider="fake")
+
+    backup = FakeProvider(["too late"], name="backup")
+    gw = Gateway(config, {"fake": Slow([]), "backup": backup}, sleep=sleeps, clock=clock)
+    with pytest.raises(BudgetExceeded) as info:
+        await gw.complete(request())
+    assert info.value.limit == "max_minutes_per_run"
+    assert backup.remaining == 1 and sleeps.calls == []
+
+
 async def test_custom_before_hook_can_block(sleeps: Sleeps, bus: InMemoryEventBus) -> None:
     from agent_team.core.models import HookOutcome
 
@@ -434,3 +456,88 @@ async def test_after_event_reports_thinking_the_api_dropped(
     await gw.complete(request())
     after = [e.data for e in events if e.name is EventName.LLM_CALL_AFTER]
     assert after[0]["thinking_dropped"] == 2 and after[1]["thinking_dropped"] is None
+
+
+class Clock:
+    """A clock the test moves by hand."""
+
+    def __init__(self) -> None:
+        """Start at zero."""
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        """The current time."""
+        return self.now
+
+
+def refused() -> TransientLLMError:
+    """The error a provider gives when nothing listens on its port."""
+    return TransientLLMError("APIConnectionError: Connection error.", provider="fake",
+                             unreachable=True)  # fmt: skip
+
+
+async def test_a_refused_connection_marks_the_provider_down_and_skips_it(
+    sleeps: Sleeps, events: list[Event], bus: InMemoryEventBus
+) -> None:
+    clock = Clock()
+    fake = FakeProvider([refused(), "back again"])
+    backup = FakeProvider(["one", "two"], name="backup")
+    gw = gateway(fake, backup, sleeps=sleeps, bus=bus, clock=clock)
+    assert (await gw.complete(request())).text == "one"
+    assert sleeps.calls == []  # no retries on a provider that is down
+    # While it is down, calls go straight to the fallback.
+    assert (await gw.complete(request())).text == "two"
+    assert fake.remaining == 1 and gw.providers_for(AgentName.PRODUCT, "task_1") == ["backup"]
+    down = [e for e in events if e.name is EventName.PROVIDER_DOWN]
+    assert len(down) == 1 and down[0].data["provider"] == "fake"
+    # Once the wait is over it is tried again, and comes back.
+    clock.now += make_config().retry.provider_down_s
+    assert (await gw.complete(request())).text == "back again"
+    up = [e for e in events if e.name is EventName.PROVIDER_UP]
+    assert len(up) == 1 and up[0].data["provider"] == "fake"
+
+
+async def test_a_provider_still_down_after_the_wait_gives_no_second_event(
+    sleeps: Sleeps, events: list[Event], bus: InMemoryEventBus
+) -> None:
+    clock = Clock()
+    fake = FakeProvider([refused(), refused()])
+    backup = FakeProvider(["one", "two"], name="backup")
+    gw = gateway(fake, backup, sleeps=sleeps, bus=bus, clock=clock)
+    await gw.complete(request())
+    clock.now += 61
+    await gw.complete(request())
+    assert [e.name for e in events].count(EventName.PROVIDER_DOWN) == 1
+    assert EventName.PROVIDER_UP not in [e.name for e in events]
+
+
+async def test_when_every_provider_is_down_they_are_still_tried(sleeps: Sleeps) -> None:
+    fake = FakeProvider([refused(), "ok"])
+    backup = FakeProvider([refused()] * 4, name="backup")
+    gw = gateway(fake, backup, sleeps=sleeps, clock=Clock())
+    with pytest.raises(TransientLLMError):
+        await gw.complete(request())  # the last route retries before it gives up
+    assert sleeps.calls == [1, 2, 4]
+    assert (await gw.complete(request())).text == "ok"
+
+
+async def test_the_context_budget_follows_a_fallback_while_the_provider_is_down(
+    sleeps: Sleeps,
+) -> None:
+    config = make_config(
+        agents={"researcher": {"provider": "fake", "model": "fake-local", "context_budget": 200}}
+    )
+    fake = FakeProvider([refused()])
+    backup = FakeProvider(["ok"], name="backup")
+    gw = gateway(fake, backup, sleeps=sleeps, config=config, clock=Clock())
+    assert gw.context_budget(AgentName.RESEARCHER, "task_1") == 200
+    await gw.complete(request(AgentName.RESEARCHER))
+    assert gw.context_budget(AgentName.RESEARCHER, "task_1") == 1000  # the defaults'
+
+
+async def test_with_no_other_route_a_refused_connection_still_retries(sleeps: Sleeps) -> None:
+    config = make_config(fallbacks=[])
+    fake = FakeProvider([refused(), "ok"])
+    gw = gateway(fake, sleeps=sleeps, config=config, clock=Clock())
+    assert (await gw.complete(request())).text == "ok"
+    assert sleeps.calls == [1]

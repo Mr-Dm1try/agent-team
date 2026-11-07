@@ -152,8 +152,9 @@ class LLMClient(Protocol):
         """Like ``complete``, streamed. Usage is counted when the final chunk arrives."""
         ...
 
-    def context_budget(self, agent: AgentName) -> int:
-        """Max prompt tokens for this agent's model, from the routing file."""
+    def context_budget(self, agent: AgentName, task_id: str | None = None) -> int:
+        """Max prompt tokens for the model this agent's next call tries first: its own
+        route's budget from the routing file, or a fallback's while its provider is down."""
         ...
 
     def providers_for(self, agent: AgentName, task_id: str | None) -> list[str]:
@@ -168,4 +169,8 @@ class LLMClient(Protocol):
 
     def set_override(self, task_id: str, route: Any) -> None:
         """Set or, with ``None``, clear a per-task route override."""
+        ...
+
+    def check_run(self, run_id: str) -> None:
+        """Raise RunStopped or BudgetExceeded when the run must stop; else nothing."""
         ...

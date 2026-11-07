@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.fakes import FakeTaskStore
-from agents.scenario import PRD, SPEC, team_script
+from agents.scenario import BRIEF, PRD, SPEC, team_script
 
 from agent_team.core.models import (
     AgentName,
@@ -142,6 +142,91 @@ async def test_research_request_creates_a_researcher_task(tmp_path: Path) -> Non
     assert "## Input research_brief@v2" in second
 
 
+REPEATS = [
+    {"question": "Where are the PyYAML docs?", "why": "parse frontmatter"},
+    {"question": "where are the official PyYAML docs", "why": "same thing, rephrased"},
+    {"question": "What is the mcp SDK import path?", "why": "imports"},
+]
+
+
+def stubborn_researcher(prompts: list[str]) -> Any:
+    """A Researcher that asks for the same research on every attempt, even when told
+    it can't, as gpt-oss did."""
+
+    def respond(request: LLMRequest) -> str:
+        """Answer with a brief that always asks for more."""
+        text = request.messages[0].content[0].text  # type: ignore[union-attr]
+        prompts.append(text)
+        return json.dumps(dict(BRIEF, research_requests=REPEATS))
+
+    return respond
+
+
+async def test_research_requests_dedup_and_stop_at_the_depth_limit(tmp_path: Path) -> None:
+    script = team_script()
+    prompts: list[str] = []
+    script[AgentName.RESEARCHER] = stubborn_researcher(prompts)
+    team = await make_team(tmp_path, script=script)
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "done", reply.text
+    assert reply.run_id
+    briefs = await _tasks(team.tasks, reply.run_id, "research_brief")
+    children = [t for t in briefs if t.origin is TaskOrigin.RESEARCH_REQUEST]
+    # Two distinct questions, so two tasks: the rephrased PyYAML request is the same one.
+    assert sorted(t.objective for t in children) == [
+        "What is the mcp SDK import path?",
+        "Where are the PyYAML docs?",
+    ]
+    # The children may not ask for more, so their requests became open gaps.
+    for child in children:
+        assert child.output is not None
+        brief = await team.artifacts.load(reply.run_id, child.output)
+        assert brief.research_requests == []
+        assert [a.gap for a in brief.answers if a.answer is None] == [
+            f"not researched ({r['why']})" for r in REPEATS
+        ]
+    child_prompts = [p for p in prompts if "origin research_request" in p]
+    assert child_prompts and all("can't ask for more research" in p for p in child_prompts)
+    # The planned task asked again after its answers came in: refused, told to answer
+    # with what it has, and its last attempt could not ask at all.
+    [planned] = [t for t in briefs if t.origin is TaskOrigin.PLAN]
+    assert planned.status is TaskStatus.DONE and not planned.may_request_research
+    refusals = [d for d in team.decisions.items if d.choice.startswith("refuse")]
+    assert {d.choice for d in refusals} == {"refuse: already answered"}
+    last = prompts[-1]
+    assert "origin plan" in last and "attempt 3" in last
+    assert "can't ask for more research" in last and "No more research will be run" in last
+
+
+async def test_research_requests_stop_at_the_run_cap(tmp_path: Path) -> None:
+    script = team_script()
+    asks = [
+        {"question": "Which ORM is lighter?", "why": "deps"},
+        {"question": "Does SQLite support JSON columns?", "why": "schema"},
+    ]
+    calls: list[str] = []
+
+    def architect(request: LLMRequest) -> str:
+        """Ask for two things on the first attempt, then write the spec."""
+        calls.append(request.messages[0].content[0].text)  # type: ignore[union-attr]
+        return json.dumps(dict(SPEC, research_requests=asks) if len(calls) == 1 else SPEC)
+
+    script[AgentName.ARCHITECT] = architect
+    team = await make_team(tmp_path, script=script, limits={"max_research_tasks": 1})
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "done", reply.text
+    assert reply.run_id
+    briefs = await _tasks(team.tasks, reply.run_id, "research_brief")
+    assert [t.objective for t in briefs if t.origin is TaskOrigin.RESEARCH_REQUEST] == [
+        "Which ORM is lighter?"
+    ]
+    [refused] = [d for d in team.decisions.items if d.choice == "refuse: research limit"]
+    assert refused.inputs["question"] == "Does SQLite support JSON columns?"
+    second = calls[1]
+    assert "No more research will be run for this task" in second
+    assert "can't ask for more research" in second
+
+
 class UpstreamPolicy:
     """Fails QA once and blames the spec, to drive an upstream re-run."""
 
@@ -179,6 +264,9 @@ async def test_upstream_rerun_supersedes_and_rebuilds_downstream(tmp_path: Path)
         tasks = await _tasks(team.tasks, run.id, kind)
         assert [t.status for t in tasks] == [TaskStatus.SUPERSEDED, TaskStatus.DONE], kind
         assert tasks[1].parent_task_id == tasks[0].id
+    # The producer at fault re-runs as a fix; what was built on it re-runs as revisions.
+    origins = {k: (await _tasks(team.tasks, run.id, k))[1].origin for k in ("spec", "qa_report")}
+    assert origins == {"spec": TaskOrigin.FIX, "qa_report": TaskOrigin.REVISION}
     # PRD wasn't touched.
     assert len(await _tasks(team.tasks, run.id, "prd")) == 1
     kinds = [d.kind for d in team.decisions.items]

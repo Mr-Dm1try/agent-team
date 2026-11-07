@@ -275,7 +275,7 @@ class ToolLoop[M: BaseModel]:
 
     async def _maybe_compact(self, messages: list[Message]) -> list[Message]:
         """Compact the history when it nears the budget, and checkpoint the compacted version."""
-        budget = self.llm.context_budget(self.agent)
+        budget = self.llm.context_budget(self.agent, self.task_id)
         specs = self._specs()
         # The lowest ratio over the models seen: after a fallback the next call may go
         # to either, so estimate for the one that counts more tokens.
@@ -367,6 +367,11 @@ class ToolLoop[M: BaseModel]:
 
             messages = await self._maybe_compact(messages)
             response = await self._complete(messages)
+            if response.tool_calls:
+                # A reply that arrived after the run stopped or ran out of budget starts
+                # no tool turn. It isn't kept either, so the resumed attempt asks again
+                # instead of finding tool calls that look interrupted.
+                self.llm.check_run(self.run.id)
             messages.append(Message(role="assistant", content=response.content))
             await self._save(messages)
 

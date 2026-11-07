@@ -98,7 +98,7 @@ class Session:
         try:
             await self.team.stores.tasks.get_run(run_id)
         except KeyError:
-            self.say(f"No run {run_id}.")
+            self.say(f"No run {run_id} in {self.team.config.paths.db_file()}.")
             return 1
         if not self.lock.acquire(run_id):
             self.say(f"Run {run_id} is being driven by another session.")
@@ -111,18 +111,24 @@ class Session:
         finally:
             self.lock.release_all()
 
-    def _show(self, reply: Reply) -> None:
-        """Print a reply, with the run id and state."""
+    async def _show(self, reply: Reply) -> None:
+        """Print a reply, with the run id and state. A run that halted is shown as the
+        stats table shows it, paused (it can resume after the budget) or stopped."""
         self.say(reply.text)
         if reply.run_id:
-            self.say(f"[run {reply.run_id}: {reply.kind}]")
+            state: str = reply.kind
+            if reply.kind == "stopped":
+                run = await self.team.stores.tasks.get_run(reply.run_id)
+                if run.status in (RunStatus.PAUSED, RunStatus.STOPPED):
+                    state = run.status.value
+            self.say(f"[run {reply.run_id}: {state}]")
 
     async def _talk(self, reply: Reply, run_id: str | None) -> int:
         """Show each reply and pass on the user's lines. Returns the exit code: 0 once
         the run is done and reviewed or left waiting, 1 when it stopped or failed with
         nothing to answer, or another session took it over."""
         while True:
-            self._show(reply)
+            await self._show(reply)
             run_id = reply.run_id or run_id
             if run_id:
                 self.lock.release(run_id)  # nothing runs while the user types

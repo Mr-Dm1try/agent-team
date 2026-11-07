@@ -56,6 +56,7 @@ async def make_team(
     review_mode: ReviewMode = ReviewMode.AUTO_ASSUMPTIONS,
     policy: VerdictPolicy | None = None,
     code_policy: bool = False,
+    limits: dict[str, Any] | None = None,
 ) -> Team:
     """Build the app over fakes. ``policy`` decides on verdicts; without one,
     ``code_policy`` keeps the audit package's policy and otherwise the orchestrator's
@@ -69,7 +70,7 @@ async def make_team(
         overrides={
             "paths": {"runs_dir": str(tmp_path / "runs"), "db": str(tmp_path / "team.db")},
             "review": review_mode.value,
-            "limits": {"task_timeout_s": 5},
+            "limits": {"task_timeout_s": 5, **(limits or {})},
             "hooks": [],
         }
     )
