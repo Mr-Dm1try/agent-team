@@ -133,6 +133,10 @@ to end where you can.
   Each command runs in a fresh sandbox with no network, so start the app and call it
   in one command (["sh", "-c", "..."], calling it with python). Packages the Engineer
   installed are already there; add any you need with install_deps.
+- The sandbox has no curl or wget: call the app from Python, with urllib.request or
+  httpx. Start a server in a Python script with subprocess.Popen, keep its PID and
+  stop only that process (terminate, then wait) when you are done. Never look for it
+  by scanning /proc or with pkill or killall.
 - Report one result per acceptance criterion: pass, fail or not_checked, with concrete
   evidence such as a command and its output or a file and line.
 - Report problems in `issues`, with severity blocker for anything that breaks an

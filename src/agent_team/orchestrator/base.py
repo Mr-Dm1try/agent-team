@@ -23,6 +23,7 @@ from agent_team.core.interfaces import (
 from agent_team.core.models import (
     AUDIT_RULE,
     DANGEROUS_ACTION_RULES,
+    SEEN_CALLS,
     AgentName,
     Decision,
     DecisionKind,
@@ -40,6 +41,7 @@ from agent_team.core.models import (
     TaskOrigin,
     TaskStatus,
     Verdict,
+    is_safety_stop,
 )
 from agent_team.core.tracing import Tracer
 from agent_team.llm.types import LLMClient
@@ -184,9 +186,50 @@ class OrchestratorBase:
         #: (phase, newest task id) pairs already reported finished, per run.
         self._finished: dict[str, set[tuple[Phase, str]]] = {}
 
-    async def _audit(self, run: Run, task: Task, artifact: Artifact | None) -> None:
+    async def _audit(
+        self, run: Run, task: Task, artifact: Artifact | None, *, recheck: bool = False
+    ) -> None:
         """The task sweep; the mixins call it and Orchestrator implements it."""
         raise NotImplementedError  # the task sweep lives in Orchestrator
+
+    async def _note_seen_calls(self, run: Run, task: Task, question: Task) -> bool:
+        """The user answered ``question`` about ``task``'s check. If that check stopped
+        on a safety finding about a tool call that already ran, record that the user
+        has seen the calls it judged, so later checks of the task don't stop on them
+        again. Returns whether it recorded that; once per question."""
+        judged = [
+            v for v in await self.verdicts.for_task(task.id) if v.created_at <= question.created_at
+        ]
+        if not judged or judged[-1].passed:
+            return False
+        verdict = judged[-1]
+        flagged = [f for f in verdict.blockers if is_safety_stop(f)]
+        if not flagged:
+            return False
+        if any(
+            d.rule == SEEN_CALLS and d.inputs.get("user_task") == question.id
+            for d in await self.decisions.list(run.id)
+        ):
+            return False
+        await self._record(
+            Decision(
+                run_id=run.id,
+                task_id=task.id,
+                kind=DecisionKind.ASK_USER,
+                inputs={
+                    "user_task": question.id,
+                    "verdict_id": verdict.id,
+                    "finding_ids": [f.id for f in flagged],
+                    "seen_before": verdict.created_at.isoformat(),
+                },
+                choice="count the tool calls that check judged as seen",
+                reason="the user answered the check's safety finding: "
+                + "; ".join(f"{f.rule_id} {f.message}" for f in flagged)[:500],
+                made_by="code",
+                rule=SEEN_CALLS,
+            )
+        )
+        return True
 
     async def _apply(self, run: Run, d: Decision, verdict: Verdict | None = None) -> None:
         """Carry out one decision; the mixins call it and DecisionsMixin implements it."""
@@ -323,7 +366,9 @@ class OrchestratorBase:
 def can_keep(task: Task, verdict: Verdict | None) -> bool:
     """Whether the user may keep this task's output although ``verdict`` failed it: the
     output exists and isn't the plan (the pipeline is built from it), and the check
-    didn't fail closed or find a dangerous action, which are never waved through."""
+    didn't fail closed or find a dangerous action, which are never waved through. The
+    user's guidance on a dangerous action retries the work instead, and the calls that
+    check judged count as seen (``_note_seen_calls``)."""
     if task.output is None or task.output_kind == "plan":
         return False
     if verdict is None or verdict.passed:

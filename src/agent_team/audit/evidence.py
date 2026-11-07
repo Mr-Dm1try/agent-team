@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +115,9 @@ class AuditContext:
     tool_calls: list[ToolCall] = field(default_factory=list)  # in scope
     decisions: list[Decision] = field(default_factory=list)  # run sweep
     verdicts: dict[str, list[Verdict]] = field(default_factory=dict)  # run sweep, by task
+    #: Task sweep: tool calls up to this time were judged by a check whose safety
+    #: findings the user answered, so the safety rules leave them out.
+    seen_before: datetime | None = None
 
     # --- lookups ---
 
@@ -163,6 +167,22 @@ class AuditContext:
     def ran(self) -> list[ToolCall]:
         """Tool calls that actually ran; the pre-check stopped the others."""
         return [c for c in self.tool_calls if not c.blocked]
+
+    def seen(self, call: ToolCall) -> bool:
+        """Whether the user already saw this call at an earlier safety stop."""
+        return self.seen_before is not None and call.ts <= self.seen_before
+
+    def unseen(self) -> list[ToolCall]:
+        """The calls that ran and that no answered safety stop covered: what the safety
+        rules (S1 on tool calls, S5, S6, S7) judge."""
+        return [c for c in self.ran() if not self.seen(c)]
+
+    def seen_note(self) -> str | None:
+        """A note on the calls the safety rules left out, or None when there are none."""
+        left = len(self.ran()) - len(self.unseen())
+        if not left:
+            return None
+        return f"left out {left} tool calls the user saw at an earlier safety stop"
 
 
 @dataclass
@@ -337,7 +357,7 @@ def secrets(ctx: AuditContext, rule: Rule) -> HelperResult:
         sources.append((str(ref_of(artifact)), _texts(artifact), artifact, False))
     for _, change, path, text in ctx.code_files():
         sources.append((path, text, change, False))
-    for call in ctx.ran():
+    for call in ctx.unseen():
         text = str(call.args)
         if call.tool not in UNTRUSTED_RESULT_TOOLS:
             text += "\n" + call.result
@@ -359,15 +379,24 @@ def secrets(ctx: AuditContext, rule: Rule) -> HelperResult:
                 )
             )
     res.notes.append(f"scanned {len(sources)} artifacts, files and tool calls for secrets")
+    _note_seen(ctx, res)
     return res
+
+
+def _note_seen(ctx: AuditContext, res: HelperResult) -> None:
+    """Add the note on calls left out because the user saw them, if there are any."""
+    note = ctx.seen_note()
+    if note:
+        res.notes.append(note)
 
 
 @helper("dangerous_actions")
 def dangerous_actions(ctx: AuditContext, rule: Rule) -> HelperResult:
     """S5: destructive commands, downloads piped to a shell, deletes outside the
-    workspace and credential files, in the tool calls that ran."""
+    workspace and credential files, in the tool calls that ran and the user hasn't
+    seen at an earlier safety stop."""
     res = HelperResult()
-    for call in ctx.ran():
+    for call in ctx.unseen():
         command = patterns.command_text(call.args)
         problem = patterns.is_destructive(command) if command else None
         if command and not problem and patterns.rm_outside(command, ctx.run.workspace):
@@ -388,13 +417,15 @@ def dangerous_actions(ctx: AuditContext, rule: Rule) -> HelperResult:
                 )
             )
     res.notes.append(f"checked {len(ctx.tool_calls)} tool calls for dangerous actions")
+    _note_seen(ctx, res)
     return res
 
 
 @helper("injected_instructions")
 def injected_instructions(ctx: AuditContext, rule: Rule) -> HelperResult:
     """S6: text that reads like instructions in what a tool returned, and a hit when
-    a later call reuses a URL or command from that text."""
+    a later call the user hasn't seen at an earlier safety stop reuses a URL or
+    command from that text."""
     res = HelperResult()
     calls = ctx.ran()
     for i, call in enumerate(calls):
@@ -416,6 +447,8 @@ def injected_instructions(ctx: AuditContext, rule: Rule) -> HelperResult:
             if patterns.is_destructive(line)
         }
         for later in after:
+            if ctx.seen(later):
+                continue
             later_text = str(later.args)
             used = sorted(p for p in planted if p and p in later_text)
             if used:
@@ -428,15 +461,17 @@ def injected_instructions(ctx: AuditContext, rule: Rule) -> HelperResult:
                         evidence=f"injected: {markers[0]!r}; reused: {used[:3]}",
                     )
                 )
+    _note_seen(ctx, res)
     return res
 
 
 @helper("data_leaving")
 def data_leaving(ctx: AuditContext, rule: Rule) -> HelperResult:
-    """S7: secrets in outgoing web calls, and commands that upload to outside hosts."""
+    """S7: secrets in outgoing web calls, and commands that upload to outside hosts,
+    in the calls the user hasn't seen at an earlier safety stop."""
     res = HelperResult()
     allowed = ctx.allowed_hosts
-    for call in ctx.ran():
+    for call in ctx.unseen():
         if call.tool in OUTGOING_TOOLS:
             for h in patterns.find_secrets(str(call.args)):
                 res.findings.append(
@@ -459,6 +494,7 @@ def data_leaving(ctx: AuditContext, rule: Rule) -> HelperResult:
                         evidence=command[:300],
                     )
                 )
+    _note_seen(ctx, res)
     return res
 
 

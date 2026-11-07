@@ -395,7 +395,11 @@ class ConversationMixin(OrchestratorBase):
     ) -> Reply | None:
         """Close one pending item with the user's words, without driving the run. Returns
         a reply only when the answer stopped the run; anything else the user should hear
-        is added to ``notes``."""
+        is added to ``notes``. Any answer about a check that stopped on a safety finding
+        means the user has seen the tool calls it judged."""
+        parent = await self.tasks.get_task(target.parent_task_id) if target.parent_task_id else None
+        if parent is not None and target.reason in (ESCALATION, TASK_QUESTION):
+            await self._note_seen_calls(run, parent, target)
         if target.reason in (ESCALATION, TASK_QUESTION) and says_stop(text):
             await self.tasks.transition(target.id, TaskStatus.DONE, reason="user said stop")
             await self.stop(run.id, "the user stopped the run when asked how to proceed")
@@ -412,7 +416,6 @@ class ConversationMixin(OrchestratorBase):
         if target.reason == CONFIRM_CHANGE:
             await self._confirm_change(run, target, text, notes)
             return None
-        parent = await self.tasks.get_task(target.parent_task_id) if target.parent_task_id else None
         if (
             parent is not None
             and target.reason in (TASK_QUESTION, ESCALATION)

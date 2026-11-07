@@ -262,6 +262,30 @@ def stronger_attempts(decisions: list[Decision]) -> dict[str, int]:
     return out
 
 
+#: The ``rule`` of the decision that records the user answering a safety finding.
+SEEN_CALLS = "seen_calls"
+
+
+def is_safety_stop(finding: Finding) -> bool:
+    """Whether a blocker is about a tool call that already ran: a dangerous action
+    (S5, S6, S7) or a helper hit marked ``already_happened``."""
+    return finding.rule_id in DANGEROUS_ACTION_RULES or finding.already_happened
+
+
+def seen_before(decisions: list[Decision], task_id: str) -> datetime | None:
+    """The end of the task's tool calls the user has seen: the latest check whose
+    safety findings the user answered, from the ``SEEN_CALLS`` decisions. Calls up to
+    that time were judged then, so later checks leave them out of the safety rules."""
+    times = [
+        datetime.fromisoformat(d.inputs["seen_before"])
+        for d in decisions
+        if d.rule == SEEN_CALLS
+        and d.task_id == task_id
+        and isinstance(d.inputs.get("seen_before"), str)
+    ]
+    return max(times, default=None)
+
+
 class Task(Contract):
     """One unit of delegated work: an agent, an objective, inputs and the artifact
     kind it must produce. Tracks its attempts, output, last error and lineage."""

@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_team.audit import patterns
 from agent_team.audit.evidence import (
     AuditContext,
     HelperResult,
@@ -60,6 +61,7 @@ from agent_team.core.models import (
     TaskStatus,
     Verdict,
     attempt_text,
+    seen_before,
     stronger_attempts,
 )
 from agent_team.llm.types import LLMClient
@@ -71,6 +73,11 @@ _CONTEXT_CHARS = 6_000
 _FILE_CHARS = 6_000
 _TOOL_RESULT_CHARS = 400
 _MAX_TOOL_CALLS = 60
+#: How the sweep's prompt explains calls marked [seen].
+SEEN_CALLS_NOTE = (
+    "Calls marked [seen] ran before an earlier safety stop that the user answered: they "
+    "were judged then, so report no S1, S5, S6 or S7 finding about them."
+)
 
 
 class _ModelFinding(BaseModel):
@@ -183,6 +190,7 @@ class LLMAuditor:
                 ]
             ctx.latest = await self._latest(run.id)
             ctx.tool_calls = await self.tool_log.for_task(run.id, task.id)
+            ctx.seen_before = seen_before(await self.decisions.list(run.id), task.id)
             if task.agent is AgentName.QA:
                 await self._cover_phase(ctx, run, task)
             rules = await self.rules.for_scope("task", phase=task.phase, agent=task.agent)
@@ -278,7 +286,10 @@ class LLMAuditor:
         for mf in reply.value.findings:
             finding = _from_model(mf, by_id)
             support = _helper_support(finding, helpers)
-            if support is not None:
+            if support is None and _kill_in_sandbox(finding, ctx):
+                finding.severity = Severity.WARNING
+                finding.message = f"[only stopped processes inside the sandbox] {finding.message}"
+            elif support is not None:
                 finding.from_helper = True
                 finding.already_happened = support.already_happened
                 finding.severity = support.severity
@@ -441,6 +452,19 @@ def _same(a: Finding, b: Finding) -> bool:
     return a.rule_id == b.rule_id and _norm_item(a.item) == _norm_item(b.item)
 
 
+def _kill_in_sandbox(finding: Finding, ctx: AuditContext) -> bool:
+    """Whether a model's S5 finding is only about stopping processes, and the task's
+    calls that stop processes all ran in the sandbox, where each command has its own
+    throwaway container (``patterns.SANDBOX_FACTS``). Such a finding is a warning."""
+    if finding.rule_id != "S5" or finding.severity is not Severity.BLOCKER:
+        return False
+    text = " ".join(x for x in (finding.message, finding.evidence, finding.item) if x)
+    if not patterns.only_about_killing(text):
+        return False
+    kills = [c for c in ctx.unseen() if patterns.kills_processes(patterns.command_text(c.args))]
+    return bool(kills) and all(c.tool in patterns.SANDBOX_TOOLS for c in kills)
+
+
 def _helper_support(finding: Finding, helpers: dict[str, HelperResult]) -> Finding | None:
     """The helper hit that backs a model finding, if there is one."""
     result = helpers.get(finding.rule_id)
@@ -518,12 +542,21 @@ def render_prompt(ctx: AuditContext, rules: list[Rule], helpers: dict[str, Helpe
         parts.append(f"## File {path}\n```\n{_clip(text, _FILE_CHARS)}\n```")
     if ctx.tool_calls:
         lines = [
-            f"- [{c.task_id}] {c.tool} {json.dumps(c.args, default=str)[:300]}"
+            f"- [{c.task_id}"
+            + (f" attempt {c.attempt}" if c.attempt else "")
+            + "]"
+            + (" [seen]" if ctx.seen(c) else "")
+            + f" {c.tool} {json.dumps(c.args, default=str)[:300]}"
             + (" (error)" if c.is_error else "")
             + f" -> {_clip(c.result, _TOOL_RESULT_CHARS)!r}"
             for c in ctx.tool_calls[-_MAX_TOOL_CALLS:]
         ]
-        parts.append("## Tool calls\n" + "\n".join(lines))
+        head = ["## Tool calls"]
+        if any(c.tool in patterns.SANDBOX_TOOLS for c in ctx.tool_calls):
+            head.append(patterns.SANDBOX_FACTS)
+        if any(ctx.seen(c) for c in ctx.tool_calls):
+            head.append(SEEN_CALLS_NOTE)
+        parts.append("\n".join([*head, *lines]))
     if ctx.scope is RuleScope.RUN:
         stronger = stronger_attempts(ctx.decisions)
         parts.append(

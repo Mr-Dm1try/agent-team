@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,10 @@ from agent_team.core.artifacts import (
 from agent_team.core.errors import BudgetExceeded, TransientLLMError
 from agent_team.core.models import (
     AUDIT_RULE,
+    SEEN_CALLS,
     AgentName,
+    Decision,
+    DecisionKind,
     Phase,
     RuleScope,
     Run,
@@ -466,3 +470,56 @@ async def test_an_answer_check_sees_every_brief_it_was_written_from(rig: Rig, ru
     assert "## Built from research_brief@v2" in prompt
     assert "Upstream research_brief@v2" not in prompt
     assert "'How to test?'" in prompt and "'Which client?'" in prompt
+
+
+KILL_LOOP = "for p in /proc/[0-9]*; do grep -q 'port 8795' $p/cmdline && kill ${p#/proc/}; done"
+
+
+async def test_stopping_processes_inside_the_sandbox_is_only_a_warning(rig: Rig, run: Run) -> None:
+    qa = make_task(run, AgentName.QA, Phase.IMPLEMENTATION, "qa_report")
+    rig.tool_log.record(call(run, qa, "run_command", "killed 1", argv=["sh", "-c", KILL_LOOP]))
+    killed = {"rule_id": "S5", "severity": "blocker", "item": "run_command"}
+    rig.llm.push({"findings": [dict(killed, message="killed pid 1. Pid 1 is the init process")]})
+    verdict = await rig.auditor.audit_task(qa, None, run)
+    [s5] = [f for f in verdict.findings if f.rule_id == "S5"]
+    assert s5.severity is Severity.WARNING and "inside the sandbox" in s5.message
+    assert len(rig.llm.requests) == 1  # no second check for it
+    assert "the command is pid 1" in str(rig.llm.requests[0].messages[0].content[0])
+
+
+async def test_a_kill_finding_that_names_other_harm_stays_a_blocker(rig: Rig, run: Run) -> None:
+    qa = make_task(run, AgentName.QA, Phase.IMPLEMENTATION, "qa_report")
+    rig.tool_log.record(call(run, qa, "run_command", "", argv=["sh", "-c", KILL_LOOP]))
+    finding = {"rule_id": "S5", "severity": "blocker", "item": "run_command"}
+    rig.llm.push(
+        {"findings": [dict(finding, message="killed pid 1 and deleted the repository")]},
+        {"confirmed": True},
+    )
+    verdict = await rig.auditor.audit_task(qa, None, run)
+    assert [f.rule_id for f in verdict.blockers if f.rule_id == "S5"] == ["S5"]
+
+
+async def test_a_check_after_the_user_answered_leaves_the_seen_calls_out(
+    rig: Rig, run: Run
+) -> None:
+    qa = make_task(run, AgentName.QA, Phase.IMPLEMENTATION, "qa_report")
+    old = call(run, qa, "run_command", "", command="rm -rf /etc/nginx")
+    old.attempt = 1
+    rig.tool_log.record(old)
+    await rig.auditor.decisions.record(
+        Decision(
+            run_id=run.id,
+            task_id=qa.id,
+            kind=DecisionKind.ASK_USER,
+            inputs={"seen_before": (old.ts + timedelta(seconds=1)).isoformat()},
+            choice="count the tool calls that check judged as seen",
+            reason="the user answered",
+            made_by="code",
+            rule=SEEN_CALLS,
+        )
+    )
+    rig.llm.push(PASS)
+    verdict = await rig.auditor.audit_task(qa, None, run)
+    assert "S5" not in {f.rule_id for f in verdict.blockers}
+    assert any("the user saw" in n for n in verdict.notes.get("S5", []))
+    assert "[seen] run_command" in str(rig.llm.requests[0].messages[0].content[0])

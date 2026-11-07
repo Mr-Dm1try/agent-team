@@ -27,6 +27,8 @@ NOTES = "SQLite needs no server.\n"
 #: The auditor model's verdict on one sweep: given the agent and phase under check
 #: (both None for the run sweep), the JSON reply.
 AuditorModel = Callable[[str | None, str | None], Any]
+#: An auditor model that reads the whole sweep prompt instead, and returns the reply.
+SweepJudge = Callable[[str], Any]
 _SWEPT = re.compile(r"^Task \S+: agent (\w+), phase (\w+)", re.MULTILINE)
 
 
@@ -56,15 +58,18 @@ def passing_auditor(agent: str | None, phase: str | None) -> Any:
 
 
 def scripted_provider(
-    script: dict[AgentName, Responder], auditor: AuditorModel = passing_auditor
+    script: dict[AgentName, Responder],
+    auditor: AuditorModel = passing_auditor,
+    judge: SweepJudge | None = None,
 ) -> FakeProvider:
     """A fake provider that answers each agent from ``script`` and the auditor from
-    ``auditor``. Pre-checks are allowed and second checks confirm."""
+    ``auditor``, or from ``judge`` when given. Pre-checks are allowed and second
+    checks confirm."""
 
     def respond(request: LLMRequest) -> LLMResponse | str:
         """Route one request to its agent's scripted reply."""
         if request.agent is AgentName.AUDITOR:
-            return json.dumps(_audit(request, auditor))
+            return json.dumps(_audit(request, auditor, judge))
         out = script[request.agent](request)
         if isinstance(out, str):
             return out
@@ -80,14 +85,17 @@ def scripted_provider(
     return FakeProvider(responder=respond)
 
 
-def _audit(request: LLMRequest, auditor: AuditorModel) -> Any:
+def _audit(request: LLMRequest, auditor: AuditorModel, judge: SweepJudge | None) -> Any:
     """The auditor model's reply: pre-checks allow, second checks confirm, and sweeps
-    go to ``auditor`` with the agent and phase being checked."""
+    go to ``judge`` with the prompt, or else to ``auditor`` with the agent and phase
+    being checked."""
     if request.system == PRECHECK_PROMPT:
         return {"decision": "allow", "reason": "normal work"}
     if request.system == SECOND_CHECK_PROMPT:
         return {"confirmed": True, "reason": "it holds"}
     prompt = getattr(request.messages[0].content[0], "text", "")
+    if judge is not None:
+        return judge(prompt)
     swept = _SWEPT.search(prompt)
     return auditor(swept.group(1), swept.group(2)) if swept else auditor(None, None)
 
@@ -155,11 +163,12 @@ async def scripted_app(
     script: dict[AgentName, Responder] | None = None,
     auditor: AuditorModel = passing_auditor,
     runner: FakeRunner | None = None,
+    judge: SweepJudge | None = None,
 ) -> App:
     """The real app from ``config`` over a scripted model and the fake embedder, with
     the real command tools over a fake runner. Each new run's workspace starts with the
     notes the Researcher reads."""
-    provider = scripted_provider(script or e2e_script(), auditor)
+    provider = scripted_provider(script or e2e_script(), auditor, judge)
     app = await build_app(
         config,
         providers={"fake": provider},
@@ -182,9 +191,10 @@ async def e2e_app(
     script: dict[AgentName, Responder] | None = None,
     auditor: AuditorModel = passing_auditor,
     runner: FakeRunner | None = None,
+    judge: SweepJudge | None = None,
     **config: Any,
 ) -> App:
     """``scripted_app`` over ``e2e_config(tmp_path, **config)``."""
     return await scripted_app(
-        e2e_config(tmp_path, **config), script=script, auditor=auditor, runner=runner
+        e2e_config(tmp_path, **config), script=script, auditor=auditor, runner=runner, judge=judge
     )

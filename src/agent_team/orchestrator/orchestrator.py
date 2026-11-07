@@ -36,12 +36,16 @@ from agent_team.core.models import (
     TaskOrigin,
     TaskStatus,
     check_reason,
+    is_safety_stop,
     new_id,
+    seen_before,
     stronger_attempts,
 )
 from agent_team.core.tracing import Tracer
 from agent_team.orchestrator.base import (
+    ESCALATION,
     PAUSING,
+    TASK_QUESTION,
     OrchestratorConfig,
 )
 from agent_team.orchestrator.control import create_user_task
@@ -120,7 +124,62 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             await self.tasks.update_task(task)
             await self.tasks.transition(task.id, TaskStatus.READY, reason="resumed after a stop")
         await self._set_status(run_id, RunStatus.ACTIVE)
+        await self._recheck_safety_stops(run)
         return await self.drive(run_id)
+
+    async def _recheck_safety_stops(self, run: Run) -> None:
+        """Check again a task whose check stopped the run on a safety finding that is
+        still waiting on the user, when the user had answered an earlier safety stop of
+        the task that this check didn't take into account: such a check judged tool
+        calls the user had already seen. Answers recorded before seen calls were kept
+        are counted first, so a run stopped that way is judged again, not asked again."""
+        for task in await self.tasks.list_tasks(run.id, status=TaskStatus.ESCALATED):
+            output = task.output
+            if not is_work(task) or output is None:
+                continue
+            asked = [
+                t
+                for t in await self.tasks.list_tasks(run.id)
+                if t.parent_task_id == task.id
+                and t.agent is AgentName.USER
+                and t.reason in (TASK_QUESTION, ESCALATION)
+            ]
+            for question in asked:
+                if question.status is TaskStatus.DONE:
+                    await self._note_seen_calls(run, task, question)
+            waiting = [q for q in asked if q.status is TaskStatus.WAITING]
+            latest = await self.verdicts.latest_for_task(task.id)
+            if not waiting or latest is None or latest.passed:
+                continue
+            if not any(is_safety_stop(f) for f in latest.blockers):
+                continue
+            # Seen calls recorded only after this check, for calls from before it.
+            after = [
+                d for d in await self.decisions.list(run.id) if d.created_at > latest.created_at
+            ]
+            seen = seen_before(after, task.id)
+            if seen is None or seen >= latest.created_at:
+                continue
+            for question in waiting:
+                await self.tasks.transition(
+                    question.id, TaskStatus.SUPERSEDED, reason="the check is made again"
+                )
+            task.depends_on = [d for d in task.depends_on if d not in {q.id for q in waiting}]
+            task = await self.tasks.update_task(task)
+            await self._record(
+                Decision(
+                    run_id=run.id,
+                    task_id=task.id,
+                    kind=DecisionKind.RETRY,
+                    inputs={"verdict_id": latest.id, "user_tasks": [q.id for q in waiting]},
+                    choice="check the work again",
+                    reason="its check stopped on tool calls the user had already seen",
+                    made_by="code",
+                    rule="recheck_seen_calls",
+                )
+            )
+            artifact = await self.artifacts.load(run.id, output)
+            await self._audit(run, task, artifact, recheck=True)
 
     async def stop(self, run_id: str, reason: str = "stopped by the user") -> None:
         """The kill switch: the run halts at the next safe point and can be resumed."""
@@ -266,10 +325,13 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             if task.status is TaskStatus.AUDITING:  # not superseded while it ran
                 await self._audit(run, task, result.artifact)
 
-    async def _audit(self, run: Run, task: Task, artifact: Artifact | None) -> None:
+    async def _audit(
+        self, run: Run, task: Task, artifact: Artifact | None, *, recheck: bool = False
+    ) -> None:
         """Check one output with an auditor task and apply the policy's decisions. The
         check has its own attempts and fails closed; budget or stop pauses the run, and
-        the task stays auditing to be checked on resume."""
+        the task stays auditing to be checked on resume. ``recheck`` checks an
+        escalated task's output again, as ``_recheck_safety_stops`` does."""
         check = await self._check_task(run, task)
         try:
             verdict = await self.dispatcher.check(check, task, artifact)
@@ -278,7 +340,9 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             return
         await self._save_verdict(verdict, check=check)
         task = await self.tasks.get_task(task.id)
-        if task.status is not TaskStatus.AUDITING:
+        if task.status is not TaskStatus.AUDITING and not (
+            recheck and task.status is TaskStatus.ESCALATED
+        ):
             return  # superseded by a reopen while the auditor ran
         task.finding_ids = [f.id for f in verdict.findings if f.severity is Severity.BLOCKER]
         task = await self.tasks.update_task(task)
