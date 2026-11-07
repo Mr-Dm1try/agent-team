@@ -28,7 +28,7 @@ from agent_team.core.models import AgentName, DecisionKind, Event, EventName, Ru
 from agent_team.core.tracing import read_events
 from agent_team.llm.types import ContentBlock, LLMRequest, ToolUseBlock
 from agent_team.orchestrator.conversation import HELD_REPLY
-from agent_team.ui.session import STOPPING, Session, StdinLines
+from agent_team.ui.session import NOTHING_WAITING, STOPPING, Session, StdinLines
 from e2e.team import asking_script, e2e_app, e2e_config, e2e_script, engineer_with_tests
 
 PAGED_PRD = dict(
@@ -179,6 +179,36 @@ async def test_a_question_at_the_review_prompt_brings_the_prompt_back(tmp_path: 
     after = text.split("Noted.", 1)[1]
     assert "Type 'accept' to finish, or describe a change." in after
     assert "Accepted. Run" in after
+
+
+async def test_a_bare_yes_at_the_review_doesnt_finish_the_run(tmp_path: Path) -> None:
+    app = await e2e_app(tmp_path)
+    console, out = _console()
+    # A reply-only answer at the review, then a yes and a no with nothing waiting.
+    typist = Typist(app, "what did you build?", "yes", "no", "accept")
+    with app:
+        code = await Session(
+            app, console, plain=True, read_line=typist.read_line, listen=False
+        ).start("Build a books API")
+    text = out.getvalue()
+    assert code == 0, text
+    after = text.split("Noted.", 1)[1]
+    assert after.count(NOTHING_WAITING) == 2
+    assert "Accepted. Run" not in after.rsplit(NOTHING_WAITING, 1)[0]
+    assert "Accepted. Run" in after.rsplit(NOTHING_WAITING, 1)[1]
+
+
+async def test_a_yes_and_input_ending_leaves_the_run_unaccepted(tmp_path: Path) -> None:
+    app = await e2e_app(tmp_path)
+    console, out = _console()
+    typist = Typist(app, "yes")
+    with app:
+        code = await Session(
+            app, console, plain=True, read_line=typist.read_line, listen=False
+        ).start("Build a books API")
+    text = out.getvalue()
+    assert code == 0, text
+    assert NOTHING_WAITING in text and "Accepted. Run" not in text
 
 
 async def test_a_stop_while_the_session_waits_on_the_user_stops_the_run(

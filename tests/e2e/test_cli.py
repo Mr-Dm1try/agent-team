@@ -219,6 +219,11 @@ def test_stats_of_one_run_and_of_all_runs(config_file: Path) -> None:
     assert any(line.startswith("  orchestrator ") for line in narrow_lines), narrow.output
     every = runner.invoke(cli.app, ["stats", "-c", str(config_file)], env=wide)
     assert any(line.startswith("all runs") for line in _plain(every).splitlines())
+    # Each run is listed once, with its title inline or on the line under it.
+    for columns in ("140", "80", "60"):
+        listed = runner.invoke(cli.app, ["stats", "-c", str(config_file)], env={"COLUMNS": columns})
+        assert listed.exit_code == 0, listed.output
+        assert sum(run_id in line for line in _plain(listed).splitlines()) == 1, listed.output
     unknown = runner.invoke(cli.app, ["stats", "run_nope", "-c", str(config_file)])
     assert unknown.exit_code == 1 and "No run run_nope in " in unknown.output
 

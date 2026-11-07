@@ -23,7 +23,7 @@ from agent_team.core.models import (
     Task,
 )
 from agent_team.memory.embed import Embeddings, FakeEmbedder, OllamaEmbedder
-from agent_team.memory.fetch import MAX_QUERY, MemoryFetch, MemorySearch
+from agent_team.memory.fetch import MAX_QUERY, QUOTE, MemoryFetch, MemorySearch, earlier_run
 from agent_team.memory.store import SqliteMemoryIndex
 
 LESSON = "Engineer, implementation: tests for the books endpoints need httpx installed"
@@ -122,6 +122,20 @@ async def test_the_fetch_keeps_the_agents_kinds_and_logs_the_query(tmp_path: Pat
     assert event.data["mode"] == "hybrid" and event.data["embedder_error"] is None
     assert len(event.data["ids"]) == len(lines)
     assert event.data["kinds"] == ["lesson", "decision", "preference"]
+    # The memories from other runs are named, with their kind and run, for the review.
+    earlier = event.data["from_other_runs"]
+    assert earlier and all(m["run_id"] != RUN.id for m in earlier)
+    assert {m["id"] for m in earlier} <= set(event.data["ids"])
+    assert earlier[0]["kind"] == "lesson" and earlier[0]["run_id"] == "run_old"
+
+
+def test_a_long_memory_is_quoted_short_in_the_event() -> None:
+    memory = Memory(
+        kind=MemoryKind.DECISION, text="word " * 100, sources=[MemorySource(run_id="r")]
+    )
+    quoted = earlier_run(memory)
+    assert len(quoted["text"]) == QUOTE and quoted["text"].endswith("…")
+    assert quoted == {"id": memory.id, "kind": "decision", "run_id": "r", "text": quoted["text"]}
 
 
 async def test_the_fetch_respects_the_item_and_token_caps(tmp_path: Path) -> None:

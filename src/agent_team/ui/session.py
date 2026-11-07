@@ -51,10 +51,18 @@ from agent_team.ui.view import RunView
 
 log = logging.getLogger(__name__)
 
+#: What finishes a run at its review: an accept word, never a bare yes, which answers
+#: nothing when nothing is waiting.
 ACCEPT = re.compile(
-    r"^\s*(accept(ed)?|approve[ds]?|ok(ay)?|yes|y|lgtm|looks good|done)[\s.!]*$", re.I
+    r"^\s*((looks good|lgtm|ok(ay)?|yes)[\s,.!]*)?"
+    r"(accept(ed)?|approve[ds]?|done|ship it|lgtm|looks good)[\s.!]*$",
+    re.I,
 )
+#: A yes or no on its own, which the review doesn't take as an accept or a change.
+YES_NO = re.compile(r"^\s*(y|yes|yeah|yep|sure|ok(ay)?|n|no|nope|nah)[\s.!]*$", re.I)
 REVIEW_PROMPT = "Type 'accept' to finish, or describe a change."
+#: The reply to a bare yes or no at the review.
+NOTHING_WAITING = "Nothing is waiting on a yes or no. " + REVIEW_PROMPT
 #: The status line's word for each run status, as the user would say it.
 STATE_WORDS = {RunStatus.WAITING: "waiting for you"}
 
@@ -557,11 +565,14 @@ class Session:
         accepts or ends the input."""
         self.say("")
         self.say(REVIEW_PROMPT)
-        line = await self._next_line()
-        if line is None:
-            self.say(f"Run {run_id} is done.")
-            return None
-        if ACCEPT.match(line):
-            self.say(f"Accepted. Run {run_id} is done.")
-            return None
-        return line
+        while True:
+            line = await self._next_line()
+            if line is None:
+                self.say(f"Run {run_id} is done.")
+                return None
+            if ACCEPT.match(line):
+                self.say(f"Accepted. Run {run_id} is done.")
+                return None
+            if not YES_NO.match(line):
+                return line
+            self.say(NOTHING_WAITING)

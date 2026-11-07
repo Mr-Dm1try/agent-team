@@ -1,11 +1,11 @@
-"""The end-of-run summary's lines: a research answer's sources, and audit findings that
-name the task they are about."""
+"""The end-of-run summary's lines: a research answer's sources, audit findings that
+name the task they are about, and memory from earlier runs."""
 
 from __future__ import annotations
 
 from agent_team.core.artifacts import Source
-from agent_team.core.models import Finding, Severity
-from agent_team.ui.summary import RunSummary, named_tasks, source_line
+from agent_team.core.models import AgentName, Event, EventName, Finding, Severity
+from agent_team.ui.summary import RunSummary, named_tasks, remembered, remembered_count, source_line
 
 TASK = "task_34606c70506b4d94"
 
@@ -58,3 +58,33 @@ def test_a_source_line_shows_the_page_title_without_notes_on_how_it_was_read() -
         ref="https://sqlite.org/wal.html", title="WAL", read="characters 0-10000 of 27246"
     )
     assert "10000" not in source_line(read)
+
+
+def _fetched(agent: AgentName, *memories: dict[str, str]) -> Event:
+    """A memory_fetched event for ``agent`` with these memories from other runs."""
+    return Event(
+        name=EventName.MEMORY_FETCHED,
+        run_id="run_1",
+        agent=agent,
+        data={"ids": [m["id"] for m in memories], "from_other_runs": list(memories)},
+    )
+
+
+def test_memory_from_earlier_runs_is_named_once_for_the_builders_only() -> None:
+    a = {"id": "mem_a", "kind": "decision", "run_id": "run_0", "text": "paginate, default 50"}
+    b = {"id": "mem_b", "kind": "decision", "run_id": "run_0", "text": "use SQLite"}
+    c = {"id": "mem_c", "kind": "lesson", "run_id": "run_0", "text": "run the tests"}
+    events = [
+        _fetched(AgentName.PRODUCT, a),
+        _fetched(AgentName.ARCHITECT, a, b),  # a again: named once
+        _fetched(AgentName.RESEARCHER, c),  # research isn't the build
+        _fetched(AgentName.ENGINEER),
+        Event(name=EventName.MEMORY_FETCHED, run_id="run_1", agent=AgentName.ENGINEER, data={}),
+    ]
+    found = remembered(events)
+    assert [m["id"] for m in found] == ["mem_a", "mem_b"]
+    assert remembered_count(found) == "2 decisions"
+    assert remembered_count([a, c]) == "1 decision and 1 lesson"
+    lines = RunSummary(remembered=found).lines()
+    assert "From memory: 2 decisions from earlier runs" in lines
+    assert "  - decision mem_a from run_0: 'paginate, default 50'" in lines

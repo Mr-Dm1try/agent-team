@@ -203,7 +203,11 @@ def test_the_all_runs_table_never_cuts_numbers_at_80_columns() -> None:
         for r in rows:
             shown = next(line for line in lines if line.startswith(r[0] + " "))
             assert shown[len(r[0]) :].split()[: len(r) - 2] == list(r[1:-1]), shown
-        if width == 80:  # no room for titles: each goes on its own line, cut to fit
-            assert sum(title[:20] in line for line in lines) == 13
+        # Each run is listed once, however its title fits.
+        assert sum(line.startswith("run_") for line in lines) == 13
+        if width == 80:  # no room for titles: each goes under its row, cut to fit
+            titled = [i for i, line in enumerate(lines) if line.startswith("  title: ")]
+            assert len(titled) == 13
+            assert all(lines[i - 1].startswith("run_") for i in titled)
         else:
             assert all(title[:20] in line for line in lines if line.startswith("run_"))

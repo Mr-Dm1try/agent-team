@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -214,17 +215,41 @@ def layout(rows: list[tuple[str, ...]], width: int, *, titled: bool = False) -> 
             for h, w in zip(numbers, widths[1:], strict=True)
         ),
     ]
+    if titled and not inline:
+        return _with_titles_below(cells, titles, widths, width)
     if inline:
         longest = max(len("title"), *(len(t) for t in titles))
         columns.append(Column("title", width=min(room, longest), no_wrap=True))
     table = Table(*columns, box=None, padding=(0, 0, 0, 1), pad_edge=False)
     for cell, title in zip(cells, titles if inline else [None] * len(cells), strict=True):
         table.add_row(*cell, *(() if title is None else (title,)))
-    out: list[Table | Text] = [table]
-    if titled and not inline:
-        for cell, title in zip(cells, titles, strict=True):
-            if title:
-                out.append(Text(f"{cell[0]}  {short(title, max(width - len(cell[0]) - 2, 1))}"))
+    return [table]
+
+
+def _with_titles_below(
+    cells: list[tuple[str, ...]], titles: list[str], widths: list[int], width: int
+) -> list[Table | Text]:
+    """The table as lines, each run's title on the line under its row, marked and cut
+    to fit, so every run is listed once."""
+
+    def line(parts: Iterable[str]) -> Text:
+        """One line of cells: the name to the left, the numbers to the right."""
+        first, *rest = parts
+        cols = [
+            first.ljust(widths[0]),
+            *(p.rjust(w) for p, w in zip(rest, widths[1:], strict=True)),
+        ]
+        return Text(" ".join(cols).rstrip())
+
+    heads = [h.split("\n") for h in HEADER]
+    out: list[Table | Text] = [
+        line(h[0] if len(h) > 1 else "" for h in heads),
+        line(h[-1] for h in heads),
+    ]
+    for cell, title in zip(cells, titles, strict=True):
+        out.append(line(cell))
+        if title:
+            out.append(Text("  title: " + short(title, max(width - 9, 1))))
     return out
 
 

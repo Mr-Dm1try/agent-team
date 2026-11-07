@@ -4,8 +4,9 @@
 ``MemorySearch`` embeds a query, asks the index for keyword and vector matches and
 ranks them; with the embedder down it ranks on BM25 alone and says so. ``MemoryFetch``
 is the dispatcher's memory hook: it builds the task's fixed query, keeps the kinds the
-agent uses, fits the result in the caps, logs a ``memory_fetched`` event with the query
-and ids, and records the fetch so the memories can be credited when the task passes.
+agent uses, fits the result in the caps, logs a ``memory_fetched`` event with the query,
+the ids and the memories that came from other runs, and records the fetch so the
+memories can be credited when the task passes.
 """
 
 from __future__ import annotations
@@ -17,7 +18,16 @@ from datetime import datetime
 from agent_team.core.artifacts import Artifact
 from agent_team.core.config import MemoryConfig
 from agent_team.core.interfaces import EventBus, MemoryIndex
-from agent_team.core.models import AgentName, Event, EventName, MemoryKind, Run, Task, utcnow
+from agent_team.core.models import (
+    AgentName,
+    Event,
+    EventName,
+    Memory,
+    MemoryKind,
+    Run,
+    Task,
+    utcnow,
+)
 from agent_team.memory.embed import Embeddings
 from agent_team.memory.rank import Mode, Ranked, build_query, fit, rank
 
@@ -78,6 +88,22 @@ class MemorySearch:
             await self.index.set_vector(memory.id, vector)
 
 
+#: Longest memory text kept in a fetch event, for the review to quote.
+QUOTE = 120
+
+
+def earlier_run(memory: Memory) -> dict[str, str]:
+    """What a fetch event keeps of a memory saved by another run, so the review can
+    say what shaped the work: its id, kind, run and the start of its text."""
+    text = " ".join(memory.text.split())
+    return {
+        "id": memory.id,
+        "kind": memory.kind.value,
+        "run_id": memory.origin.run_id,
+        "text": text if len(text) <= QUOTE else text[: QUOTE - 1] + "…",
+    }
+
+
 class MemoryFetch:
     """The dispatcher's memory hook: the "Relevant memory" lines for one task."""
 
@@ -106,6 +132,7 @@ class MemoryFetch:
                 max_tokens=self.config.max_tokens,
             )
             ids = [r.memory.id for r, _ in chosen]
+            earlier = [earlier_run(r.memory) for r, _ in chosen if r.memory.origin.run_id != run.id]
             await self.index.record_fetch(run.id, task.id, task.attempt, query, ids)
         except Exception as exc:
             await self._emit(
@@ -122,6 +149,7 @@ class MemoryFetch:
                 "kinds": [k.value for k in kinds],
                 "ids": ids,
                 "scores": {r.memory.id: round(r.score, 4) for r, _ in chosen},
+                "from_other_runs": earlier,
                 "mode": found.mode,
                 "embedder_error": found.embedder_error,
             },

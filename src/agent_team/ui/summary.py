@@ -1,5 +1,6 @@
 """The end-of-run summary: the sources of a research answer, what the audit found,
-QA's evidence for each acceptance criterion, the test results and every assumption.
+QA's evidence for each acceptance criterion, the test results, every assumption, and
+the memories from earlier runs that shaped the build.
 
 The orchestrator's done reply already lists each artifact's summary and the
 assumptions; this adds the parts that make the run reviewable, read from the store
@@ -15,7 +16,7 @@ from pathlib import Path
 
 from agent_team.core.artifacts import CodeChange, QAReport, ResearchAnswer, Source
 from agent_team.core.interfaces import ArtifactStore, TaskStore
-from agent_team.core.models import EventName, Finding, TaskStatus
+from agent_team.core.models import AgentName, Event, EventName, Finding, TaskStatus
 from agent_team.core.tracing import read_events
 from agent_team.ui.view import short
 
@@ -33,6 +34,8 @@ class RunSummary:
     tests: list[str] = field(default_factory=list)
     ran_end_to_end: bool | None = None
     sources: list[str] = field(default_factory=list)  # a research answer's, one line each
+    #: Memories from other runs that Product, the Architect or the Engineer were given.
+    remembered: list[dict[str, str]] = field(default_factory=list)
 
     def lines(self) -> list[str]:
         """The summary as plain lines, section by section."""
@@ -54,6 +57,13 @@ class RunSummary:
             out += self.issues
         if self.tests:
             out += ["", "Tests:", *self.tests]
+        if self.remembered:
+            out += ["", f"From memory: {remembered_count(self.remembered)} from earlier runs"]
+            out += [
+                f"  - {m.get('kind', 'memory')} {m.get('id', '?')} from {m.get('run_id', '?')}: "
+                f"'{m.get('text', '')}'"
+                for m in self.remembered
+            ]
         return out
 
 
@@ -91,6 +101,7 @@ async def summarize(
         summary.issues = [f"  issue ({i.severity}): {i.text}" for i in report.issues]
         summary.ran_end_to_end = report.ran_end_to_end
     events = await asyncio.to_thread(read_events, runs_dir, run_id)
+    summary.remembered = remembered(events)
     audits = [
         e for e in events if e.name is EventName.AUDIT_VERDICT and e.data.get("scope") == "run"
     ]
@@ -102,6 +113,33 @@ async def summarize(
             named_tasks(Finding.model_validate(f), objectives) for f in last.get("findings") or []
         ]
     return summary
+
+
+#: The agents whose memories shape what is built.
+BUILDERS = frozenset({AgentName.PRODUCT, AgentName.ARCHITECT, AgentName.ENGINEER})
+
+
+def remembered(events: list[Event]) -> list[dict[str, str]]:
+    """Each memory from another run that a builder's fetch handed over, once, in the
+    order they were first given."""
+    found: dict[str, dict[str, str]] = {}
+    for e in events:
+        if e.name is not EventName.MEMORY_FETCHED or e.agent not in BUILDERS:
+            continue
+        for m in e.data.get("from_other_runs") or []:
+            if isinstance(m, dict) and isinstance(m.get("id"), str):
+                found.setdefault(m["id"], {k: str(v) for k, v in m.items()})
+    return list(found.values())
+
+
+def remembered_count(memories: list[dict[str, str]]) -> str:
+    """How many memories of each kind, such as "2 decisions and 1 lesson"."""
+    counts: dict[str, int] = {}
+    for m in memories:
+        kind = m.get("kind", "memory")
+        counts[kind] = counts.get(kind, 0) + 1
+    parts = [f"{n} {kind.replace('_', ' ')}{'' if n == 1 else 's'}" for kind, n in counts.items()]
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
 def source_line(source: Source) -> str:
