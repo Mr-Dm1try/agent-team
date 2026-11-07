@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from audit.fakes import FakeTaskStore
+from audit.fakes import FakeArtifactStore, FakeTaskStore
 
-from agent_team.core.artifacts import ArtifactRef
+from agent_team.core.artifacts import ArtifactRef, CodeChange
 from agent_team.core.errors import SandboxError
 from agent_team.core.models import AgentName, Event, EventName, Phase, Run, Task
 from agent_team.sandbox import WorkspaceGit, make_commit_hook
@@ -164,3 +164,75 @@ async def test_a_core_dump_is_never_committed(tmp_path: Path) -> None:
     await WorkspaceGit(ws).commit_version(V2, subject="s")
     assert "core" not in git(ws, "ls-files")
     assert (ws / "core").is_file()  # left in place, just not committed
+
+
+async def test_generated_databases_and_caches_stay_out_of_versions_and_diffs(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "app.py").write_text("x = 1\n")
+    # Written by the code when it runs, such as a module-level create_app().
+    (ws / "library.db").write_bytes(b"SQLite format 3\x00" + b"\x00" * 64)
+    (ws / "data").mkdir()
+    (ws / "data" / "cache.sqlite3").write_bytes(b"\x00" * 16)
+    (ws / "pkg" / "__pycache__").mkdir(parents=True)
+    (ws / "pkg" / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"\x00")
+    (ws / ".gitignore").write_text("# the Engineer's own, without the harness's lines\n")
+    repo = WorkspaceGit(ws)
+    await repo.commit_version(V1, subject="v1")
+    assert "library.db" not in git(ws, "ls-files")
+    assert not [f for f in git(ws, "ls-files") if f.endswith((".sqlite3", ".pyc"))]
+
+    (ws / "library.db").write_bytes(b"SQLite format 3\x00" + b"\x01" * 64)
+    (ws / "app.py").write_text("x = 2\n")
+    await repo.commit_version(V2, subject="v2")
+    diff = await repo.diff(V1, V2)
+    assert "+x = 2" in diff
+    assert "library.db" not in diff
+
+
+async def test_a_database_an_older_version_committed_stays_out_of_later_diffs(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "app.py").write_text("x = 1\n")
+    (ws / "library.db").write_bytes(b"old")
+    git(ws, "init", "-q")
+    git(ws, "add", "-A")
+    git(ws, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "before")
+    git(ws, "tag", "code_change-v1")
+    (ws / "library.db").write_bytes(b"new")
+    (ws / "app.py").write_text("x = 2\n")
+    await WorkspaceGit(ws).commit_version(V2, subject="v2")
+    # Not removed from the history, and its new contents aren't committed.
+    assert git(ws, "show", "code_change-v2:library.db") == ["old"]
+    diff = await WorkspaceGit(ws).diff(V1, V2)
+    assert "+x = 2" in diff and "library.db" not in diff
+
+
+async def test_a_database_the_engineer_wrote_on_purpose_is_kept(tmp_path: Path) -> None:
+    ws = tmp_path / "workspace"
+    (ws / "data").mkdir(parents=True)
+    (ws / "data" / "seed.sqlite").write_bytes(b"seed")
+    (ws / "library.db").write_bytes(b"runtime")
+    outside = tmp_path / "elsewhere.db"
+    outside.write_bytes(b"x")
+    await WorkspaceGit(ws).commit_version(
+        V1, subject="v1", keep=["data/seed.sqlite", "../elsewhere.db", str(outside), "gone.db"]
+    )
+    assert git(ws, "ls-files") == [".gitignore", "data/seed.sqlite"]
+
+
+async def test_the_hook_keeps_the_databases_the_code_change_reports(tmp_path: Path) -> None:
+    tasks, run, task = _setup(tmp_path, AgentName.ENGINEER)
+    ws = Path(run.workspace)
+    (ws / "seed.db").write_bytes(b"seed")
+    (ws / "runtime.db").write_bytes(b"runtime")
+    artifacts = FakeArtifactStore()
+    await artifacts.save(
+        CodeChange(run_id=run.id, summary="s", version=1, files_written=["app.py", "seed.db"])
+    )
+    await make_commit_hook(tasks, artifacts)(_verdict(run, task))
+    assert sorted(git(ws, "ls-files")) == [".gitignore", "app.py", "seed.db"]

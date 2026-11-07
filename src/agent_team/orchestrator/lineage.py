@@ -48,6 +48,18 @@ NEW_WORK = frozenset(
 )
 
 
+#: How a change request's reason starts, followed by the user's words.
+CHANGE_REQUEST_PREFIX = "change request: "
+
+
+def change_request_of(task: Task) -> str | None:
+    """The user's words of the change request ``task`` was reopened for, if it was."""
+    reason = task.reason or ""
+    if task.origin is TaskOrigin.CHANGE_REQUEST and reason.startswith(CHANGE_REQUEST_PREFIX):
+        return reason[len(CHANGE_REQUEST_PREFIX) :]
+    return None
+
+
 def reopens_parent(task: Task) -> bool:
     """Whether ``task`` redoes its parent's work (a retry, revision, fix or rerun), so
     the parent's output is an earlier version of its own."""

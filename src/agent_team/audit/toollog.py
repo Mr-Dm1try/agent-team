@@ -17,6 +17,7 @@ from typing import Any, Protocol
 
 from pydantic import Field
 
+from agent_team.audit.patterns import SANDBOX_TOOLS
 from agent_team.core.base import Contract
 from agent_team.core.interfaces import EventBus
 from agent_team.core.models import Event, EventName, utcnow
@@ -132,8 +133,8 @@ def tool_call_from_event(event: Event) -> ToolCall | None:
 SUMMARY_COMMANDS = 20
 #: Longest command shown in an attempt summary.
 SUMMARY_COMMAND_CHARS = 160
-#: Tools whose calls an attempt summary lists one by one.
-COMMAND_TOOLS = frozenset({"run_command", "install_deps"})
+#: Tools whose calls an attempt summary lists one by one: the sandbox's command tools.
+COMMAND_TOOLS = SANDBOX_TOOLS
 
 
 def _command_line(call: ToolCall) -> str:

@@ -20,9 +20,10 @@ from agent_team.core.models import (
 from agent_team.orchestrator.base import (
     CHILD_ORIGINS,
     ESCALATION,
-    KEEP_HINT,
     OrchestratorBase,
     can_keep,
+    reply_options,
+    rerun_of,
 )
 from agent_team.orchestrator.control import create_user_task
 from agent_team.orchestrator.lineage import ancestry
@@ -81,12 +82,10 @@ class SettleMixin(OrchestratorBase):
         for c in children:
             if c.output is not None and c.output not in task.inputs:
                 task.inputs.append(c.output)
-        if task.status is TaskStatus.ESCALATED:
-            # The user's guidance buys exactly one more attempt.
-            task.max_attempts = max(task.max_attempts, task.attempt + 1)
-        else:
-            # Asking a question or for research doesn't use up a retry.
-            task.max_attempts += 1
+        # The attempt that asked counts like any other. The answers buy one more only
+        # when none is left: the user's guidance on an escalation, or answers to
+        # questions asked on the last attempt (research can't be asked for then).
+        task.max_attempts = max(task.max_attempts, task.attempt + 1)
         await self.tasks.update_task(task)
         await self.tasks.transition(task.id, TaskStatus.READY, reason="answers and research are in")
 
@@ -163,7 +162,7 @@ class SettleMixin(OrchestratorBase):
         brief joins the inputs, and open requested research is waited for unless it
         waits on this task. Past a limit, for a question the task already has the answer
         to, or one planned research is still on, the request is refused and the task
-        told to answer with what it has; it may not ask again."""
+        told to answer with what it has. Either way the task may not ask again."""
         limits = self.config.research
         tasks = await self.tasks.list_tasks(run.id)
         by_id = {t.id: t for t in tasks}
@@ -226,8 +225,9 @@ class SettleMixin(OrchestratorBase):
                     rule="research_request",
                 )
             )
+        # One round of research per task: the next attempt answers with what it has.
+        task.may_request_research = False
         if refused:
-            task.may_request_research = False
             text = (
                 "No more research will be run for this task: "
                 + "; ".join(refused)
@@ -252,14 +252,14 @@ class SettleMixin(OrchestratorBase):
         """Ask the user how to get an escalated task unstuck."""
         why = task.last_error or "it failed its check with no attempts left"
         failed = await self.verdicts.latest_for_task(task.id)
-        keep = KEEP_HINT if can_keep(task, failed) else ""
+        options = reply_options(keep=can_keep(task, failed), rerun=rerun_of(task, failed))
         child = await create_user_task(
             self.tasks,
             run,
             phase=task.phase,
             question=(
                 f"{upper_first(plain_agent(task.agent))} is stuck on: {task.objective} "
-                f"({why}). Reply with guidance to retry it, or 'stop'.{keep}"
+                f"({why}). {options}"
             ),
             origin=TaskOrigin.QUESTION,
             parent=task,

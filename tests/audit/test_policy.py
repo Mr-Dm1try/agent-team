@@ -4,8 +4,21 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from agent_team.audit.policy import CodeVerdictPolicy, PolicyLimits, decide_task
-from agent_team.core.artifacts import ArtifactRef, CodeChange, QAReport
+from agent_team.audit.policy import (
+    CodeVerdictPolicy,
+    PolicyLimits,
+    blame_code,
+    decide_task,
+    planned_in,
+)
+from agent_team.core.artifacts import (
+    ArtifactRef,
+    CodeChange,
+    Component,
+    QAReport,
+    Spec,
+    WorkPackage,
+)
 from agent_team.core.models import (
     AUDIT_RULE,
     AgentName,
@@ -103,6 +116,7 @@ def test_no_attempts_left_own_fault_gets_the_stronger_model(run: Run) -> None:
         "task_id": task.id,
         "model": "strong-1",
         "finding_ids": [v.findings[0].id],
+        "attempt": task.attempt + 1,  # the attempt that runs on the stronger model
     }
 
 
@@ -473,3 +487,133 @@ def test_a_passed_retry_resets_no_progress(run: Run) -> None:
     assert kinds(decide_task(run, task, again, [failed, passed], [], LIMITS)) == [
         DecisionKind.RETRY
     ]
+
+
+def _planned_spec() -> Spec:
+    """A spec of two work packages, where the api package plans REQ-10 in recent."""
+    return Spec(
+        summary="s",
+        version=2,
+        components=[
+            Component(name="db", responsibility="r", requirements=["REQ-1"], files=["app/db.py"]),
+            Component(
+                name="recent",
+                responsibility="r",
+                requirements=["REQ-10"],
+                files=["app/recent.py", "tests/test_recent.py"],
+            ),
+        ],
+        checks=[],
+        work_packages=[
+            WorkPackage(name="db", components=["db"]),
+            WorkPackage(name="api", components=["recent"]),
+        ],
+    )
+
+
+def _packaged(tasks: list[Task]) -> list[Task]:
+    """``impl_tasks`` with the Engineer tasks made for the db and api packages."""
+    e1, e2, qa = tasks
+    return [
+        e1.model_copy(update={"reason": "work package db"}),
+        e2.model_copy(update={"reason": "work package api"}),
+        qa,
+    ]
+
+
+def missing(item: str, message: str, artifact: str = "spec@v2") -> Finding:
+    """A QA blocker that something is missing, blamed on ``artifact``."""
+    return Finding(
+        rule_id="R7",
+        severity=Severity.BLOCKER,
+        item=item,
+        artifact=ArtifactRef.parse(artifact),
+        message=message,
+    )
+
+
+def test_a_missing_requirement_the_spec_plans_is_the_codes_fault(run: Run) -> None:
+    tasks, outputs = impl_tasks(run)
+    tasks = _packaged(tasks)
+    qa = tasks[-1]
+    f = missing("REQ-10", "list_recent_notes is not implemented; app/recent.py is missing")
+    decisions = decide_task(
+        run, qa, verdict(run, f, task=qa), [], [], LIMITS, tasks, outputs, spec=_planned_spec()
+    )
+    assert kinds(decisions) == [DecisionKind.FIX]
+    # The Engineer of the package that builds the component, not the last one by chance.
+    assert decisions[0].task_id == tasks[1].id
+    assert decisions[0].inputs["blamed_code"] == [f.id]
+    # Named by a planned file alone, or blamed on the PRD, it is the code's fault too.
+    by_file = missing("server", "tests/test_recent.py does not exist", "prd@v2")
+    out = decide_task(
+        run, qa, verdict(run, by_file, task=qa), [], [], LIMITS, tasks, outputs, _planned_spec()
+    )
+    assert kinds(out) == [DecisionKind.FIX] and out[0].task_id == tasks[1].id
+
+
+def test_a_requirement_the_spec_lacks_still_reopens_the_spec(run: Run) -> None:
+    tasks, outputs = impl_tasks(run)
+    qa = tasks[-1]
+    arch = make_task(
+        run, AgentName.ARCHITECT, Phase.SPEC, "spec", output=ArtifactRef.parse("spec@v2")
+    )
+    spec = _planned_spec()
+    # REQ-11 isn't planned (and REQ-1 doesn't match it), and a wrong or incomplete
+    # plan isn't missing code.
+    for f in (
+        missing("REQ-11", "REQ-11 is not implemented"),
+        missing("REQ-10", "REQ-10 contradicts the PRD's REQ-1"),
+        missing("REQ-10", "REQ-10 is missing an acceptance criterion", "prd@v2"),
+    ):
+        out = decide_task(
+            run, qa, verdict(run, f, task=qa), [], [], LIMITS, [*tasks, arch], outputs, spec
+        )
+        assert kinds(out) == [DecisionKind.ESCALATE, DecisionKind.UPSTREAM_RERUN], f.message
+        assert "blamed_code" not in out[0].inputs
+    # Without the current spec, nothing is moved.
+    f = missing("REQ-10", "REQ-10 is not implemented")
+    out = decide_task(run, qa, verdict(run, f, task=qa), [], [], LIMITS, [*tasks, arch], outputs)
+    assert kinds(out)[-1] is DecisionKind.UPSTREAM_RERUN
+
+
+def test_an_engineers_own_check_moves_only_its_own_packages_misses(run: Run) -> None:
+    tasks, outputs = impl_tasks(run)
+    db, api, _ = _packaged(tasks)
+    spec = _planned_spec()
+    f = missing("REQ-10", "REQ-10 is not implemented; app/recent.py is missing")
+    # The api Engineer builds recent, so its own check retries its own code.
+    mine = decide_task(
+        run, api, verdict(run, f, task=api), [], [], LIMITS, [db, api], outputs, spec
+    )
+    assert kinds(mine) == [DecisionKind.RETRY] and mine[0].inputs["blamed_code"] == [f.id]
+    # The db Engineer doesn't: that stays a question for the spec, as before.
+    arch = make_task(
+        run, AgentName.ARCHITECT, Phase.SPEC, "spec", output=ArtifactRef.parse("spec@v2")
+    )
+    other = decide_task(
+        run, db, verdict(run, f, task=db), [], [], LIMITS, [db, api, arch], outputs, spec
+    )
+    assert kinds(other) == [DecisionKind.ESCALATE, DecisionKind.UPSTREAM_RERUN]
+
+
+def test_a_moved_finding_keeps_its_evidence(run: Run) -> None:
+    tasks, _ = impl_tasks(run)
+    qa = _packaged(tasks)[-1]
+    f = missing("REQ-10", "REQ-10 is not implemented").model_copy(
+        update={"evidence": "pytest: no tool list_recent_notes"}
+    )
+    blockers, moved = blame_code([f], qa, _planned_spec(), _packaged(tasks), _packaged(tasks))
+    assert moved == [f.id]
+    assert blockers[0].evidence is not None
+    assert blockers[0].evidence.startswith("pytest: no tool list_recent_notes\nspec@v2 plans it")
+
+
+def test_planned_in_matches_whole_ids_and_file_names() -> None:
+    spec = _planned_spec()
+    assert planned_in(spec, missing("REQ-10", "not implemented")) == ["recent"]
+    # A requirement that lacks something in the PRD or spec isn't missing code.
+    assert planned_in(spec, missing("REQ-10", "REQ-10 is missing an acceptance criterion")) == []
+    assert planned_in(spec, missing("x", "recent.py is missing")) == ["recent"]
+    assert planned_in(spec, missing("x", "REQ-100 is missing")) == []
+    assert planned_in(spec, missing("x", "app/recent.pyc is missing")) == []

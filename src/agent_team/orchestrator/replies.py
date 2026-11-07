@@ -49,6 +49,16 @@ class Reply:
     artifact: Artifact | None = None
 
 
+@dataclass
+class WorkingReply:
+    """The answer to a message typed while the team works on the run. ``held`` means
+    the message changes the run, so nothing was done yet and the session sends it
+    again once the team stops."""
+
+    text: str
+    held: bool = False
+
+
 def pending_items(pending: list[Task]) -> list[PendingQuestion]:
     """The user tasks waiting on an answer, as the user sees them."""
     return [PendingQuestion(task_id=t.id, question=t.objective, origin=t.origin) for t in pending]

@@ -19,11 +19,12 @@ from agent_team.core.models import (
     Verdict,
 )
 from agent_team.orchestrator.base import (
-    KEEP_HINT,
     RUN_QUESTION,
     TASK_QUESTION,
     OrchestratorBase,
     can_keep,
+    reply_options,
+    rerun_of,
 )
 from agent_team.orchestrator.control import create_user_task
 
@@ -33,9 +34,16 @@ class DecisionsMixin(OrchestratorBase):
 
     async def _apply(self, run: Run, d: Decision, verdict: Verdict | None = None) -> None:
         """Record the decision, then carry it out on the task store."""
-        await self._record(d)
         task_id = d.inputs.get("task_id") or d.task_id
         task = await self.tasks.get_task(task_id) if isinstance(task_id, str) else None
+        route: object = None
+        if d.kind is DecisionKind.STRONGER_MODEL and task is not None:
+            try:
+                d, route = self._route_to_stronger(d, task)
+            except ValueError:
+                await self._record(d)  # so the policy asks the user next time instead
+                raise
+        await self._record(d)
 
         if d.kind is DecisionKind.RETRY and task is not None:
             if task.status is TaskStatus.AUDITING:
@@ -46,7 +54,6 @@ class DecisionsMixin(OrchestratorBase):
                 await self.tasks.transition(task.id, TaskStatus.ESCALATED, reason=d.reason)
                 await self._emit_task(EventName.TASK_ESCALATED, task, {"reason": d.reason})
         elif d.kind is DecisionKind.STRONGER_MODEL and task is not None:
-            route = self.llm.use_stronger_model(task.id)
             model = d.inputs.get("model")
             task.model = model if isinstance(model, str) else str(route)
             task.max_attempts = max(task.max_attempts, task.attempt + 1)
@@ -72,8 +79,11 @@ class DecisionsMixin(OrchestratorBase):
                 await self._findings_to_feedback(run, checker, found)
         elif d.kind is DecisionKind.ASK_USER:
             question = str(d.inputs.get("question") or d.reason)
-            if task is not None and can_keep(task, verdict):
-                question += KEEP_HINT
+            if task is not None:
+                halted = (await self.tasks.get_run(run.id)).status is RunStatus.STOPPED
+                question += " " + reply_options(
+                    keep=can_keep(task, verdict), stopped=halted, rerun=rerun_of(task, verdict)
+                )
             if task is not None and task.status is TaskStatus.AUDITING:
                 await self.tasks.transition(task.id, TaskStatus.ESCALATED, reason=d.reason)
             phase = (
@@ -97,6 +107,18 @@ class DecisionsMixin(OrchestratorBase):
                 await self.tasks.update_task(task)
         elif d.kind is DecisionKind.STOP:
             await self._set_status(run.id, RunStatus.STOPPED)
+
+    def _route_to_stronger(self, d: Decision, task: Task) -> tuple[Decision, object]:
+        """Send the task's calls to the stronger model. Returns the route, and the
+        decision with what its attempt may cost: the prompt cap it runs with and, when
+        the model has a price, the most one call's prompt can cost."""
+        route = self.llm.use_stronger_model(task.id)
+        cap = self.llm.context_budget(task.agent, task.id)
+        inputs: dict[str, object] = {**d.inputs, "prompt_cap_tokens": cap}
+        price = self.config.stronger_input_usd_per_mtok
+        if price is not None:
+            inputs["max_prompt_usd"] = round(cap * price / 1_000_000, 4)
+        return d.model_copy(update={"inputs": inputs}), route
 
     async def _upstream_rerun(self, run: Run, d: Decision, task: Task | None) -> None:
         """Reopen the producer of a faulty upstream artifact, with the finding as feedback, and

@@ -14,6 +14,8 @@ from agents.scenario import (
     PRD,
     Responder,
     _last_is_tool_result,
+    called_kinds,
+    message_reply,
     orchestrator_responder,
     team_script,
 )
@@ -29,7 +31,7 @@ from agent_team.core.models import (
     TaskStatus,
 )
 from agent_team.llm.types import ContentBlock, LLMRequest, ToolResultBlock, ToolUseBlock
-from agent_team.orchestrator.messages import scrub
+from agent_team.orchestrator.messages import renumber, says_stop, scrub
 from orchestrator.harness import Team, make_team
 
 QUESTIONS = [
@@ -85,7 +87,9 @@ def _then_reply(text: str, first: list[ContentBlock]) -> Responder:
 
     def respond(request: LLMRequest) -> list[ContentBlock] | str:
         """Act once, then reply."""
-        return json.dumps({"reply": text}) if _last_is_tool_result(request) else first
+        if _last_is_tool_result(request):
+            return message_reply(text, *called_kinds(request, "build"))
+        return first
 
     return respond
 
@@ -104,7 +108,7 @@ async def test_the_right_item_is_answered_when_two_are_pending(tmp_path: Path) -
     def message(request: LLMRequest) -> list[ContentBlock] | str:
         """The user named an auth scheme, so it answers the auth question."""
         if _last_is_tool_result(request):
-            return json.dumps({"reply": "Thanks, OAuth it is."})
+            return message_reply("Thanks, OAuth it is.", "answer")
         return tool_call(
             "answer_pending", {"task_id": _item(request, "Which auth?"), "text": "OAuth"}
         )
@@ -143,7 +147,9 @@ async def test_an_answer_and_a_change_in_one_message(tmp_path: Path) -> None:
     def message(request: LLMRequest) -> list[ContentBlock] | str:
         """Postgres answers the database question; /health is a change."""
         if _last_is_tool_result(request):
-            return json.dumps({"reply": "Postgres noted. Adding /health needs your OK."})
+            return message_reply(
+                "Postgres noted. Adding /health needs your OK.", "answer", "change"
+            )
         return [
             ToolUseBlock(
                 id="a",
@@ -182,7 +188,7 @@ async def _proposed(tmp_path: Path) -> tuple[Team, str]:
         if not proposing["done"]:
             if _last_is_tool_result(request):
                 proposing["done"] = True
-                return json.dumps({"reply": "I can add pagination."})
+                return message_reply("I can add pagination.", "change")
             return change
         return default(request)
 
@@ -227,7 +233,7 @@ async def test_a_task_id_that_is_not_pending_is_rejected(tmp_path: Path) -> None
             result = request.messages[-1].content[0]
             assert isinstance(result, ToolResultBlock)
             errors.append(result.content if result.is_error else "")
-            return json.dumps({"reply": "Which question is that for?"})
+            return message_reply("Which question is that for?", "unclear")
         return tool_call("answer_pending", {"task_id": "task_0000000000000000", "text": "yes"})
 
     team = await _team(tmp_path, message, QUESTIONS)
@@ -249,7 +255,7 @@ async def test_a_change_confirmation_takes_yes_or_no(tmp_path: Path) -> None:
         if _last_is_tool_result(request):
             result = request.messages[-1].content[0]
             errors.append(getattr(result, "content", ""))
-            return json.dumps({"reply": "Should I go ahead, yes or no?"})
+            return message_reply("Should I go ahead, yes or no?", "unclear")
         return tool_call("answer_pending", {"task_id": confirm.id, "text": "maybe later"})
 
     team.llm.script[AgentName.ORCHESTRATOR] = orchestrator_responder(message=message)
@@ -274,7 +280,9 @@ async def test_the_reply_shows_no_internal_ids(tmp_path: Path) -> None:
         """A careless reply that names ids and artifact refs."""
         task_id = _item(request, "Which database?")
         if _last_is_tool_result(request):
-            return json.dumps({"reply": f"Answered {task_id} (see prd@v1, run_0123456789abcdef)."})
+            return message_reply(
+                f"Answered {task_id} (see prd@v1, run_0123456789abcdef).", "answer"
+            )
         return tool_call("answer_pending", {"task_id": task_id, "text": "Postgres"})
 
     team = await _team(tmp_path, message, QUESTIONS[:1])
@@ -313,30 +321,44 @@ async def test_a_change_to_work_an_answer_just_reopened_is_folded_in(tmp_path: P
     assert len(await _users(team, run_id)) == 1  # no second confirmation
 
 
-async def test_stopping_one_run_and_starting_another_drives_the_new_one(tmp_path: Path) -> None:
-    team = await _team(
-        tmp_path,
-        _then_reply(
-            "Stopped that one and started the new one.",
-            [
-                ToolUseBlock(id="a", name="stop_run", arguments={"reason": "the user moved on"}),
-                ToolUseBlock(
-                    id="b",
-                    name="start_run",
-                    arguments={"request": "Build a todo API", "kind": "build"},
-                ),
-            ],
-        ),
-        QUESTIONS[:1],
+def _stop_and_start() -> Responder:
+    """A message loop that stops the open run and starts a todo API run."""
+    return _then_reply(
+        "Started the new one.",
+        [
+            ToolUseBlock(id="a", name="stop_run", arguments={"reason": "the user moved on"}),
+            ToolUseBlock(
+                id="b",
+                name="start_run",
+                arguments={"request": "Build a todo API", "kind": "build"},
+            ),
+        ],
     )
+
+
+async def test_stopping_one_run_and_starting_another_drives_the_new_one(tmp_path: Path) -> None:
+    team = await _team(tmp_path, _stop_and_start(), QUESTIONS[:1])
     reply = await team.orch.handle("Build a books API")
     assert reply.run_id
     old = reply.run_id
-    reply = await team.orch.handle("Forget that, build a todo API instead", run_id=old)
+    reply = await team.orch.handle("Stop the run and build a todo API instead", run_id=old)
     assert reply.run_id and reply.run_id != old
     assert (await team.tasks.get_run(old)).status is RunStatus.STOPPED
     assert reply.kind == "done", reply.text
-    assert reply.text.startswith("Stopped that one")
+    assert reply.text.startswith("Started the new one")
+
+
+async def test_a_new_run_without_a_stop_request_leaves_the_old_one_as_it_was(
+    tmp_path: Path,
+) -> None:
+    team = await _team(tmp_path, _stop_and_start(), QUESTIONS[:1])
+    reply = await team.orch.handle("Build a books API")
+    old = reply.run_id or ""
+    reply = await team.orch.handle("Forget that, build a todo API instead", run_id=old)
+    assert reply.run_id != old and reply.kind == "done", reply.text
+    assert (await team.tasks.get_run(old)).status is RunStatus.WAITING
+    assert not any(t.reason == "confirm_stop" for t in await _users(team, old))
+    assert "I left 'Build a books API' as it was, without stopping it" in reply.text
 
 
 async def test_running_out_of_budget_while_reading_pauses_and_acts_on_nothing(
@@ -421,7 +443,7 @@ async def test_a_stated_preference_is_kept_as_a_decision(tmp_path: Path) -> None
                 for b in request.messages[-1].content
                 if isinstance(b, ToolResultBlock) and b.is_error
             )
-            return json.dumps({"reply": "I'll keep using type hints."})
+            return message_reply("I'll keep using type hints.", "preference")
         calls = [
             "Always use type hints",
             "always use type hints",
@@ -453,7 +475,7 @@ async def test_a_preference_with_a_new_run_is_kept_under_that_run(tmp_path: Path
         if not request.system.startswith("You are the orchestrator"):
             return default(request)
         if _last_is_tool_result(request):
-            return json.dumps({"reply": "Started, and I'll use pytest."})
+            return message_reply("Started, and I'll use pytest.", "build", "preference")
         return [
             ToolUseBlock(id="p", name="remember_preference", arguments={"text": "Use pytest"}),
             ToolUseBlock(
@@ -466,3 +488,272 @@ async def test_a_preference_with_a_new_run_is_kept_under_that_run(tmp_path: Path
     reply = await team.orch.handle("Build a todo API, and I always want pytest")
     [kept] = [d for d in team.decisions.items if d.kind is DecisionKind.REMEMBER]
     assert kept.run_id == reply.run_id and kept.inputs["preference"] == "Use pytest"
+
+
+def _stopping(reason: str = "the user is done", then: str = "Okay.") -> Responder:
+    """A message loop that calls stop_run with ``reason`` whatever the message says,
+    reports the tool errors it got, then replies ``then``."""
+
+    def respond(request: LLMRequest) -> list[ContentBlock] | str:
+        """Stop first; reply once the tool has answered."""
+        if _last_is_tool_result(request):
+            errors = [
+                b.content
+                for b in request.messages[-1].content
+                if isinstance(b, ToolResultBlock) and b.is_error
+            ]
+            return message_reply(" | ".join([then, *errors]), "run_question")
+        return tool_call("stop_run", {"reason": reason})
+
+    return respond
+
+
+async def test_a_stop_the_message_didnt_ask_for_is_put_to_the_user(tmp_path: Path) -> None:
+    team = await _team(tmp_path, _stopping(), QUESTIONS[:1])
+    reply = await team.orch.handle("Build a books API")
+    run_id = reply.run_id or ""
+    reply = await team.orch.handle("Why did the engineer need four attempts?", run_id=run_id)
+    assert (await team.tasks.get_run(run_id)).status is RunStatus.WAITING
+    assert reply.kind == "waiting" and "Stop the run? It can be resumed later." in reply.text
+    confirm = next(t for t in await _users(team, run_id) if t.reason == "confirm_stop")
+    assert confirm.status is TaskStatus.WAITING
+
+    team.llm.script[AgentName.ORCHESTRATOR] = orchestrator_responder(
+        message=_then_reply(
+            "Stopped.", tool_call("answer_pending", {"task_id": confirm.id, "text": "yes"})
+        )
+    )
+    reply = await team.orch.handle("yes", run_id=run_id)
+    assert reply.kind == "stopped"
+    assert (await team.tasks.get_run(run_id)).status is RunStatus.STOPPED
+    stops = [d for d in team.decisions.items if d.kind is DecisionKind.STOP]
+    assert [d.reason for d in stops] == ["the user is done"]
+
+
+async def test_declining_a_stop_keeps_the_run_going(tmp_path: Path) -> None:
+    team = await _team(tmp_path, _stopping(), QUESTIONS[:1])
+    reply = await team.orch.handle("Build a books API")
+    run_id = reply.run_id or ""
+    await team.orch.handle("Why did the engineer need four attempts?", run_id=run_id)
+    confirm = next(t for t in await _users(team, run_id) if t.reason == "confirm_stop")
+    team.llm.script[AgentName.ORCHESTRATOR] = orchestrator_responder(
+        message=_then_reply(
+            "Carrying on.", tool_call("answer_pending", {"task_id": confirm.id, "text": "no"})
+        )
+    )
+    reply = await team.orch.handle("no", run_id=run_id)
+    assert (await team.tasks.get_run(run_id)).status is RunStatus.WAITING
+    assert "Okay, I won't stop the run." in reply.text
+    assert not [d for d in team.decisions.items if d.kind is DecisionKind.STOP]
+
+
+async def test_a_stop_the_message_asks_for_stops_at_once(tmp_path: Path) -> None:
+    team = await _team(tmp_path, _stopping(), QUESTIONS[:1])
+    reply = await team.orch.handle("Build a books API")
+    run_id = reply.run_id or ""
+    reply = await team.orch.handle("please stop the run", run_id=run_id)
+    assert reply.kind == "stopped"
+    assert (await team.tasks.get_run(run_id)).status is RunStatus.STOPPED
+
+
+@pytest.mark.parametrize("reason", ["placeholder", "TBD", "<reason>", "...", "n/a"])
+async def test_a_placeholder_argument_is_refused(tmp_path: Path, reason: str) -> None:
+    team = await _team(tmp_path, _stopping(reason), QUESTIONS[:1])
+    reply = await team.orch.handle("Build a books API")
+    run_id = reply.run_id or ""
+    reply = await team.orch.handle("stop", run_id=run_id)
+    assert "is a placeholder" in reply.text
+    assert (await team.tasks.get_run(run_id)).status is RunStatus.WAITING
+    assert not any(t.reason == "confirm_stop" for t in await _users(team, run_id))
+
+
+async def test_a_finished_run_cant_be_stopped(tmp_path: Path) -> None:
+    team = await _team(tmp_path, _stopping())
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "done"
+    run_id = reply.run_id or ""
+    reply = await team.orch.handle("stop it now", run_id=run_id)
+    assert reply.kind == "answer"
+    assert "the run is finished, so there is nothing to stop" in reply.text
+    assert (await team.tasks.get_run(run_id)).status is RunStatus.DONE
+
+
+async def test_an_answer_of_stop_needs_the_user_to_say_stop(tmp_path: Path) -> None:
+    errors: list[str] = []
+
+    def message(request: LLMRequest) -> list[ContentBlock] | str:
+        """Answer the waiting question with "stop" although the user said something else."""
+        if _last_is_tool_result(request):
+            result = request.messages[-1].content[0]
+            errors.append(getattr(result, "content", ""))
+            return message_reply("Which database do you want?", "unclear")
+        return tool_call(
+            "answer_pending", {"task_id": _item(request, "Which database?"), "text": "stop"}
+        )
+
+    team = await _team(tmp_path, message, QUESTIONS[:1])
+    reply = await team.orch.handle("Build a books API")
+    await team.orch.handle("hmm, not sure yet", run_id=reply.run_id)
+    assert errors and "didn't ask to stop" in errors[0]
+
+
+async def test_new_work_sorted_with_a_run_open_must_start_a_run(tmp_path: Path) -> None:
+    repairs: list[str] = []
+
+    def message(request: LLMRequest) -> str:
+        """Sort a new question as research but never start a run."""
+        last = getattr(request.messages[-1].content[0], "text", "")
+        if "did not validate" in last:
+            repairs.append(last)
+        return message_reply("Here is the answer from memory.", "research_question")
+
+    team = await _team(tmp_path, message, QUESTIONS[:1])
+    reply = await team.orch.handle("Build a books API")
+    reply = await team.orch.handle("How does FastMCP run over stdio?", run_id=reply.run_id)
+    assert repairs and "call start_run with kind research_question" in repairs[0]
+    assert reply.text.startswith("I didn't catch that.")
+    assert len(await team.tasks.list_runs()) == 1
+
+
+async def test_an_unclear_message_gets_a_clarifying_question(tmp_path: Path) -> None:
+    replies = iter(["I think so.", "Do you mean the database question?"])
+    team = await _team(
+        tmp_path, lambda request: message_reply(next(replies), "unclear"), QUESTIONS[:1]
+    )
+    reply = await team.orch.handle("Build a books API")
+    reply = await team.orch.handle("hmm", run_id=reply.run_id)
+    assert "Do you mean the database question?" in reply.text
+
+
+@pytest.mark.parametrize(
+    ("text", "stop"),
+    [
+        ("stop", True),
+        ("Stop.", True),
+        ("please stop it now", True),
+        ("halt the whole run", True),
+        ("Stop the run and build a todo API instead", True),
+        ("Why did the spec stop?", False),
+        ("kill the pagination bug", False),
+        ("Stop using SQLite and try Postgres", False),
+        ("don't stop", False),
+        ("cancel that", False),
+        ("cancel the run", True),
+        ("Forget that, build a todo API instead", False),
+    ],
+)
+def test_what_counts_as_asking_to_stop(text: str, stop: bool) -> None:
+    assert says_stop(text) is stop
+
+
+async def test_a_paused_run_stays_paused_while_a_stop_is_confirmed(tmp_path: Path) -> None:
+    team = await _team(tmp_path, _stopping(), QUESTIONS[:1])
+    reply = await team.orch.handle("Build a books API")
+    run_id = reply.run_id or ""
+    run = await team.tasks.get_run(run_id)
+    await team.tasks.update_run(run.model_copy(update={"status": RunStatus.PAUSED}))
+    reply = await team.orch.handle("I'm done for today", run_id=run_id)
+    assert "Stop the run?" in reply.text
+    assert (await team.tasks.get_run(run_id)).status is RunStatus.PAUSED
+
+
+async def test_an_unclear_message_with_no_run_starts_nothing(tmp_path: Path) -> None:
+    script = team_script()
+    script[AgentName.ORCHESTRATOR] = orchestrator_responder(
+        message=lambda request: message_reply("Do you want an API or a CLI?", "unclear", "build")
+    )
+    team = await make_team(tmp_path, script=script)
+    reply = await team.orch.handle("make me something with books")
+    assert reply.text == "Do you want an API or a CLI?"
+    assert await team.tasks.list_runs() == []
+
+
+def _results(request: LLMRequest) -> list[ToolResultBlock]:
+    """Every tool result the message loop has read so far."""
+    return [
+        b
+        for m in request.messages
+        if m.role == "user"
+        for b in m.content
+        if isinstance(b, ToolResultBlock)
+    ]
+
+
+def _keeps_reading() -> Responder:
+    """A model that reads the run's history call after call, as a small model can,
+    and then tries to answer an escalation from long ago; it replies only when it may
+    not call a tool, from what it read."""
+    reads: list[tuple[str, dict[str, Any]]] = [
+        ("list_tasks", {}),
+        ("get_task", {}),
+        ("get_verdicts", {}),
+        ("read_trace", {}),
+        ("read_trace", {"errors_only": True}),
+        ("list_decisions", {}),
+    ]
+
+    def respond(request: LLMRequest) -> list[ContentBlock] | str:
+        """The next read; the answer once tools are taken away."""
+        read = _results(request)
+        if request.tool_choice == "none":
+            listing = read[0].content
+            attempts = re.search(r"product done attempt (\d+)/(\d+)", listing)
+            assert attempts, listing
+            return message_reply(
+                f"Product needed {attempts[1]} of its {attempts[2]} attempts.", "run_question"
+            )
+        if len(read) < len(reads):
+            name, args = reads[len(read)]
+            if name in ("get_task", "get_verdicts"):
+                args = {"task_id": read[0].content.split()[0]}
+            return tool_call(name, args)
+        return tool_call("answer_pending", {"task_id": "task_36b69e6e40054d94", "text": "retry"})
+
+    return respond
+
+
+async def test_a_history_question_on_a_done_run_is_answered_from_the_store(
+    tmp_path: Path,
+) -> None:
+    team = await _team(tmp_path, _keeps_reading())
+    done = await team.orch.handle("Build a books API")
+    assert done.kind == "done" and done.run_id
+    before = len(team.llm.requests)
+    reply = await team.orch.handle("Why did the engineer need four attempts?", run_id=done.run_id)
+    calls = [r for r in team.llm.requests[before:] if r.system.startswith("You are the orch")]
+    assert "didn't catch" not in reply.text
+    assert reply.text == "Product needed 1 of its 3 attempts."
+    # Five tool rounds, then a call that may only reply; nothing waits, so the tools
+    # never offer answer_pending.
+    assert [r.tool_choice for r in calls] == ["auto"] * 5 + ["none"]
+    assert all("answer_pending" not in {t.name for t in r.tools} for r in calls)
+    assert "no answer_pending tool" in _prompt(calls[0])
+    assert (await team.tasks.get_run(done.run_id)).status is RunStatus.DONE
+
+
+async def test_answer_pending_is_offered_while_something_waits(tmp_path: Path) -> None:
+    offered: list[set[str]] = []
+
+    def message(request: LLMRequest) -> list[ContentBlock] | str:
+        """Note the tools, then reply."""
+        offered.append({t.name for t in request.tools})
+        return message_reply("Noted.")
+
+    team = await _team(tmp_path, message, QUESTIONS[:1])
+    reply = await team.orch.handle("Build a books API")
+    await team.orch.handle("what is it asking?", run_id=reply.run_id)
+    assert offered and "answer_pending" in offered[0]
+
+
+def test_a_reply_numbers_its_lists_from_the_items_not_the_model() -> None:
+    said = "The researcher opened:\n1. notes.md\n2. a.md\n2. b.md\n3. c.md\n\nThat's all."
+    assert scrub(said, "which pages?") == (
+        "The researcher opened:\n1. notes.md\n2. a.md\n3. b.md\n4. c.md\n\nThat's all."
+    )
+    # A list goes on across blank lines and an item's own lines, and nested lists
+    # keep their own count; a line as shallow as the items ends it.
+    text = "1) a\n\n1) b\n   more on b\n   1. x\n   1. y\n1) c\nThen:\n5. later\n5. later still"
+    assert renumber(text) == (
+        "1) a\n\n2) b\n   more on b\n   1. x\n   2. y\n3) c\nThen:\n5. later\n6. later still"
+    )
+    assert renumber("No list here.\n2026. A year, alone.") == "No list here.\n2026. A year, alone."

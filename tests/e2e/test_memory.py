@@ -18,6 +18,7 @@ from agent_team.core.tracing import read_events
 from agent_team.llm.types import LLMRequest, TextBlock
 from agent_team.memory import open_search
 from agent_team.memory.embed import FakeEmbedder
+from agent_team.ui.summary import summarize
 from e2e.team import PASS, e2e_app, e2e_config, e2e_script, engineer_with_tests
 
 NO_TESTS = {
@@ -157,3 +158,48 @@ async def test_memory_off_in_the_config_builds_no_memory(tmp_path: Path) -> None
         assert app.memory is None and app.dispatcher.memory is None
         assert "memory_search" not in app.dispatcher.tools
         assert (await app.orchestrator.handle("Build a books API")).kind == "done"
+
+
+async def test_the_review_names_memory_from_earlier_runs_that_shaped_the_build(
+    tmp_path: Path,
+) -> None:
+    app = await e2e_app(tmp_path)
+    assert app.memory is not None
+    # A decision close enough to Product's task to pass the cross-run bar, and a
+    # lesson for the Engineer; the same run's memories wouldn't be named.
+    saved = [
+        Memory(
+            kind=MemoryKind.DECISION,
+            text="Write the PRD for: a REST API that lists books paginates the list, "
+            "default 50. SQLite fits",
+            sources=[MemorySource(run_id="run_old")],
+        ),
+        Memory(
+            kind=MemoryKind.LESSON,
+            text="Engineer: the books API needs a test run",
+            sources=[MemorySource(run_id="run_old", agent=AgentName.ENGINEER)],
+        ),
+    ]
+    for memory in saved:
+        vectors, _ = await app.memory.search.embeddings.vectors([memory.text], query=False)
+        await app.memory.index.save(memory, vectors[0] if vectors else None, merge_at=0.92)
+    with app:
+        reply = await app.orchestrator.handle("Build a books API")
+        assert reply.kind == "done", reply.text
+        assert reply.run_id
+        stores = app.stores
+        summary = await summarize(reply.run_id, stores.tasks, stores.artifacts, app.runs_dir)
+    lines = summary.lines()
+    assert "From memory: 1 decision and 1 lesson from earlier runs" in lines, lines
+    for memory in saved:
+        assert f"  - {memory.kind.value} {memory.id} from run_old: '{memory.text}'" in lines
+
+
+async def test_a_build_with_no_earlier_memory_says_nothing_about_it(tmp_path: Path) -> None:
+    app = await e2e_app(tmp_path)
+    with app:
+        reply = await app.orchestrator.handle("Build a books API")
+        assert reply.run_id
+        stores = app.stores
+        summary = await summarize(reply.run_id, stores.tasks, stores.artifacts, app.runs_dir)
+    assert not [line for line in summary.lines() if line.startswith("From memory")]

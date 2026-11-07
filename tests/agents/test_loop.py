@@ -5,13 +5,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from llm.conftest import Sleeps, make_config
+from llm.test_ollama import error, ollama
 
 from agent_team.agents import Engineer, Product
 from agent_team.agents.compaction import Compactor
-from agent_team.agents.loop import INTERRUPTED_NOTE, LoopSettings
-from agent_team.core.artifacts import CodeChange
+from agent_team.agents.loop import (
+    FINAL_REPLY_NOTE,
+    INTERRUPTED_NOTE,
+    STEPS_LEFT_NOTE,
+    LoopSettings,
+    ToolLoop,
+)
+from agent_team.core.artifacts import CodeChange, ResearchBrief
 from agent_team.core.errors import BudgetExceeded
-from agent_team.core.interfaces import AgentContext
+from agent_team.core.interfaces import AgentContext, ToolContext
 from agent_team.core.models import (
     AgentName,
     EventName,
@@ -24,6 +32,8 @@ from agent_team.core.models import (
     TaskEnvelope,
     Usage,
 )
+from agent_team.llm.fake import FakeProvider
+from agent_team.llm.gateway import Gateway
 from agent_team.llm.types import (
     ContentBlock,
     LLMRequest,
@@ -35,7 +45,7 @@ from agent_team.llm.types import (
 )
 from agent_team.tools import file_tools
 from agents.fakes import FakeBus, FakeCheckpoints, FakeLLM, prompt_tokens, tool_call
-from agents.scenario import CODE, PRD
+from agents.scenario import BRIEF, CODE, PRD
 
 
 def envelope(tmp_path: Path, agent: AgentName, kind: str, **run_kw: object) -> TaskEnvelope:
@@ -604,3 +614,94 @@ async def test_repair_prompt_allows_a_tool_call_first(tmp_path: Path) -> None:
         "write the spec's files with write_file" in text
         and "tool call first, make that call" in text
     )
+
+
+def _reading_loop(
+    tmp_path: Path, llm: FakeLLM, max_steps: int, *, final_reply: bool = False
+) -> ToolLoop[ResearchBrief]:
+    """A Researcher loop over ``llm`` with the file tools, ``max_steps`` long."""
+    env = envelope(tmp_path, AgentName.RESEARCHER, "research_brief")
+    (Path(env.run.workspace) / "notes.md").write_text("notes\n")
+    bus = FakeBus()
+    return ToolLoop(
+        agent=AgentName.RESEARCHER,
+        system="research",
+        output_model=ResearchBrief,
+        llm=llm,
+        bus=bus,
+        checkpoints=FakeCheckpoints(),
+        tools=file_tools(),
+        tool_ctx=ToolContext(run=env.run, task=env.task, bus=bus),
+        run=env.run,
+        task_id=env.task.id,
+        attempt=1,
+        settings=LoopSettings(max_steps=max_steps, final_reply=final_reply),
+    )
+
+
+def _notes(request: LLMRequest) -> list[str]:
+    """The step notes in a request's last message."""
+    last = request.messages[-1].content
+    return [b.text for b in last if isinstance(b, TextBlock) and "turn(s) left" in b.text]
+
+
+async def test_the_model_is_told_to_write_its_output_when_few_steps_are_left(
+    tmp_path: Path,
+) -> None:
+    read = tool_call("read_file", {"path": "notes.md"})
+    llm = FakeLLM({AgentName.RESEARCHER: lambda request: read})
+    outcome = await _reading_loop(tmp_path, llm, max_steps=20).run_loop(Message.user("go"))
+    assert outcome.output is None and "20 steps" in str(outcome.error)
+    told = [i for i, r in enumerate(llm.requests) if _notes(r)]
+    # 20 steps: 15% is 3 left, after the 9th tool round (step 17 saved), so the 9th call
+    # (index 8) is told it has one turn left; the note is given once.
+    assert told == [8]
+    assert _notes(llm.requests[8]) == [STEPS_LEFT_NOTE.format(turns=1)]
+
+
+async def test_a_loop_near_its_step_limit_gets_a_reply_only_turn(tmp_path: Path) -> None:
+    """A model that would keep reading is called with tool choice "none" once only the
+    steps for a reply and its repairs are left, so the attempt ends with an answer."""
+    read = tool_call("read_file", {"path": "notes.md"})
+
+    def researcher(request: LLMRequest) -> Any:
+        """Read again whenever a tool may be called; reply only when it can't."""
+        return json.dumps(BRIEF) if request.tool_choice == "none" else read
+
+    llm = FakeLLM({AgentName.RESEARCHER: researcher})
+    loop = _reading_loop(tmp_path, llm, max_steps=15, final_reply=True)
+    outcome = await loop.run_loop(Message.user("go"))
+    assert outcome.output is not None, outcome.error
+    choices = [r.tool_choice for r in llm.requests]
+    # 15 steps and 2 repairs: forced once 6 are left, after the 4th tool round (step 9).
+    assert choices == ["auto"] * 4 + ["none"]
+    last = llm.requests[-1].messages[-1].content
+    assert [b.text for b in last if isinstance(b, TextBlock)] == [FINAL_REPLY_NOTE]
+    assert llm.requests[-1].tools  # still sent: the history holds tool calls
+
+
+async def test_without_final_reply_every_call_may_use_tools(tmp_path: Path) -> None:
+    read = tool_call("read_file", {"path": "notes.md"})
+    llm = FakeLLM({AgentName.RESEARCHER: lambda request: read})
+    outcome = await _reading_loop(tmp_path, llm, max_steps=9).run_loop(Message.user("go"))
+    assert outcome.output is None
+    assert {r.tool_choice for r in llm.requests} == {"auto"}
+
+
+async def test_an_ollama_tool_call_error_takes_no_loop_step(tmp_path: Path) -> None:
+    """Ollama's "error parsing tool call" 500 is retried once inside the call, so the
+    loop sees one model step, not several."""
+    garbled = error(500, "error parsing tool call: raw='We need to fetch the docs'")
+    provider, server = ollama(garbled, garbled, garbled)
+    config = make_config(
+        defaults={"provider": "ollama", "model": "gpt-oss:20b", "context_budget": 20_000},
+        fallbacks=["ollama", "fake"],
+        fallback_models={"fake": "fake-small"},
+    )
+    brief = json.dumps(BRIEF)
+    gw = Gateway(config, {"ollama": provider, "fake": FakeProvider([brief])}, sleep=Sleeps())
+    loop = _reading_loop(tmp_path, gw, max_steps=20)  # type: ignore[arg-type]
+    outcome = await loop.run_loop(Message.user("go"))
+    assert outcome.output is not None
+    assert outcome.steps == 2  # the first message and the one reply
+    assert len(server.chats) == 2  # the garbled call and its one retry

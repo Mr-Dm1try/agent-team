@@ -52,6 +52,17 @@ CUT_OFF_REPLY = (
     "the reply hit the output token limit; reply with shorter JSON that reports what "
     "you did, such as the paths of files you wrote, without repeating their contents"
 )
+#: Added to the model's next turn once few steps are left.
+STEPS_LEFT_NOTE = (
+    "You have {turns} turn(s) left before this attempt ends with no output. Stop "
+    "gathering and reply now with your final JSON from what you have; list what is "
+    "still unknown as gaps or open questions."
+)
+#: Added to the model's turn when ``final_reply`` takes the tools away.
+FINAL_REPLY_NOTE = (
+    "No more tool calls: this turn can only reply. Answer now with your final JSON from "
+    "what you have already read, and say what you couldn't find out."
+)
 INTERRUPTED_NOTE = (
     "This tool call was running when the process stopped. It was not repeated because "
     "it is not safe to repeat. Check the current state before trying it again."
@@ -67,6 +78,11 @@ class LoopSettings:
     max_steps: int = 80  # checkpointed steps: one per model call and one per tool round
     max_repairs: int = 2
     max_tokens: int | None = None
+    #: Share of the steps left when the model is told to write its output now.
+    warn_at: float = 0.15
+    #: Once only the steps for a reply and its repairs are left, call the model with
+    #: tool choice "none", so the attempt ends with an answer instead of a cut-off call.
+    final_reply: bool = False
 
 
 @dataclass
@@ -242,13 +258,15 @@ class ToolLoop[M: BaseModel]:
 
     # --- the loop ------------------------------------------------------------------
 
-    async def _complete(self, messages: list[Message]) -> LLMResponse:
-        """One model call with the loop's system prompt, tools and output cap."""
+    async def _complete(self, messages: list[Message], *, reply_only: bool = False) -> LLMResponse:
+        """One model call with the loop's system prompt, tools and output cap;
+        ``reply_only`` lets the model reply but not call a tool."""
         request = LLMRequest(
             agent=self.agent,
             system=self.system,
             messages=messages,
             tools=self._specs(),
+            tool_choice="none" if reply_only else "auto",
             run_id=self.run.id,
             task_id=self.task_id,
         )
@@ -346,6 +364,7 @@ class ToolLoop[M: BaseModel]:
         repairs = 0
         pending_calls: list[ToolUseBlock] = []
         final_text: str | None = None
+        warned = noted = False
 
         saved = await self.checkpoints.load_latest(self.task_id, self.attempt) if resume else None
         if saved is None:
@@ -385,9 +404,14 @@ class ToolLoop[M: BaseModel]:
                     errors=["step limit reached"],
                 )
                 return self._outcome(None, messages, error=err)
+            reply_only = self._must_reply()
+            if reply_only:
+                noted = noted or self._note(messages, FINAL_REPLY_NOTE)
+            else:
+                warned = self._warn_steps_left(messages, warned)
 
             messages = await self._maybe_compact(messages)
-            response = await self._complete(messages)
+            response = await self._complete(messages, reply_only=reply_only)
             if response.tool_calls:
                 # A reply that arrived after the run stopped or ran out of budget starts
                 # no tool turn. It isn't kept either, so the resumed attempt asks again
@@ -417,6 +441,31 @@ class ToolLoop[M: BaseModel]:
                 final_text = None
                 continue
             final_text = response.text
+
+    def _must_reply(self) -> bool:
+        """Whether the next call may only reply (``final_reply``): a tool round costs two
+        steps, so once the steps left fit just the reply and its repairs, another
+        call would end the attempt with no output."""
+        left = self.settings.max_steps - self._step
+        return self.settings.final_reply and left <= 2 + 2 * self.settings.max_repairs
+
+    def _warn_steps_left(self, messages: list[Message], warned: bool) -> bool:
+        """Once only ``warn_at`` of the steps are left, tell the model on its next turn
+        how many it has and to write its output now. Returns whether it was told."""
+        left = self.settings.max_steps - self._step
+        if warned or left > max(2, round(self.settings.max_steps * self.settings.warn_at)):
+            return warned
+        return self._note(messages, STEPS_LEFT_NOTE.format(turns=max(1, left // 2)))
+
+    @staticmethod
+    def _note(messages: list[Message], text: str) -> bool:
+        """Add ``text`` to the user turn the model reads next. Returns whether it was
+        added (only a user turn takes one)."""
+        last = messages[-1]
+        if last.role != "user":
+            return False
+        messages[-1] = Message(role="user", content=[*last.content, TextBlock(text=text)])
+        return True
 
     def _outcome(
         self, value: M | None, messages: list[Message], *, error: Exception | None = None

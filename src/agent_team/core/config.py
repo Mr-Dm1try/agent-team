@@ -136,6 +136,10 @@ class OllamaConfig(_Cfg):
     #: Characters per token when estimating a prompt. Low on purpose: running over
     #: the window is silent truncation, while a high estimate only costs a fallback.
     chars_per_token: int = 3
+    #: Agent tasks that run at once on Ollama. A local model answers one call at a
+    #: time, so a task beyond this waits for its turn before it starts, instead of
+    #: spending its timeout waiting for the model.
+    max_concurrent_tasks: int = Field(default=1, ge=1)
 
 
 class ProvidersConfig(_Cfg):
@@ -181,10 +185,14 @@ class WebConfig(_Cfg):
     timeout_s: float = 20.0
     #: Bytes read from one response before the rest is dropped.
     max_bytes: int = 2_000_000
-    #: Characters of readable text returned from one page.
-    max_chars: int = 20_000
+    #: Characters of readable text one web_fetch call returns; offset reads on. Never
+    #: more than fits inline in the tool loop (tools/web.py, PAGE_CHARS).
+    max_chars: int = 10_000
     max_results: int = 8
     max_redirects: int = 5
+    #: web_search and web_fetch calls one attempt may make, together, before the tools
+    #: refuse and tell the agent to write its output with what it has.
+    max_calls_per_attempt: int = Field(default=30, ge=1)
     user_agent: str = "agent-team/0.1 (research tool)"
 
 
@@ -303,21 +311,21 @@ class Config(_Cfg):
         # (llm.tokens) and Ollama at its own, which may be more cautious; scale to
         # Ollama's so the first call of an attempt at the budget still leaves reply room.
         ollama = self.providers.ollama
+        stronger = self.stronger_model
         for agent in AgentName:
-            route = self.route_for(agent)
-            on_ollama = route.provider == "ollama" or (
-                self.stronger_model is not None and self.stronger_model.provider == "ollama"
-            )
-            if not on_ollama:
-                continue
-            budget = self.context_budget(agent)
-            estimated = -(-budget * CHARS_PER_TOKEN // ollama.chars_per_token)
-            if estimated + ollama.min_output_tokens > ollama.num_ctx:
-                raise ValueError(
-                    f"{agent.value}: context_budget {budget} (about {estimated} tokens as "
-                    f"Ollama counts them) plus min_output_tokens {ollama.min_output_tokens} "
-                    f"exceeds ollama num_ctx {ollama.num_ctx}"
-                )
+            budgets = []
+            if self.route_for(agent).provider == "ollama":
+                budgets.append(self.context_budget(agent))
+            if stronger is not None and stronger.provider == "ollama":
+                budgets.append(stronger.context_budget or self.context_budget(agent))
+            for budget in budgets:
+                estimated = -(-budget * CHARS_PER_TOKEN // ollama.chars_per_token)
+                if estimated + ollama.min_output_tokens > ollama.num_ctx:
+                    raise ValueError(
+                        f"{agent.value}: context_budget {budget} (about {estimated} tokens "
+                        f"as Ollama counts them) plus min_output_tokens "
+                        f"{ollama.min_output_tokens} exceeds ollama num_ctx {ollama.num_ctx}"
+                    )
         return self
 
     def route_for(self, agent: AgentName) -> Route:

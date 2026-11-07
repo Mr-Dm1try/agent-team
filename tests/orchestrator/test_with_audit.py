@@ -7,13 +7,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from agents.fakes import tool_call
-from agents.scenario import CODE, Responder, team_script
+from agents.scenario import BRIEF, CODE, Responder, team_script
 
 from agent_team.audit.toollog import ToolCall, tool_call_from_event
 from agent_team.core.artifacts import ArtifactRef
 from agent_team.core.models import (
+    AUDIT_RULE,
+    SEEN_CALLS,
     AgentName,
+    Decision,
     DecisionKind,
     EventName,
     Finding,
@@ -112,12 +116,41 @@ async def test_a_dangerous_action_cannot_be_kept_as_it_is(tmp_path: Path) -> Non
         if t.agent is AgentName.USER
     ]
     assert "unsafe" in asked.objective and "keep the work" not in asked.objective
+    assert "'stop'" not in asked.objective and "the run stays stopped" in asked.objective
     reply = await team.orch.answer(reply.run_id, "ok")
     # Taken as guidance for one more attempt, never as accepting the flagged work.
     assert reply.kind == "done", reply.text
     prd = next(t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd")
     assert prd.attempt == 2
     assert all(v.model != "user" for v in team.verdicts.items)
+
+
+async def test_answering_a_dangerous_action_counts_its_calls_as_seen(tmp_path: Path) -> None:
+    team = await make_team(tmp_path, code_policy=True)
+    team.auditor.fail_next["prd"].append(_blocker("S5", "run_command"))
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "stopped" and reply.run_id, reply.text
+    reply = await team.orch.answer(reply.run_id, "go on, that was fine")
+    assert reply.kind == "done", reply.text
+    prd = next(t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd")
+    [seen] = [d for d in team.decisions.items if d.rule == SEEN_CALLS]
+    assert seen.task_id == prd.id and seen.inputs["finding_ids"]
+    [stopped] = [v for v in team.verdicts.items if v.task_id == prd.id and not v.passed]
+    assert seen.inputs["seen_before"] == stopped.created_at.isoformat()
+
+
+async def test_a_check_that_failed_closed_counts_no_calls_as_seen(tmp_path: Path) -> None:
+    team = await make_team(tmp_path, code_policy=True)
+    verdict = _blocker("S5", "run_command")
+    verdict.findings.append(
+        Finding(rule_id=AUDIT_RULE, severity=Severity.BLOCKER, message="no valid verdict")
+    )
+    team.auditor.fail_next["prd"] += [verdict.model_copy(deep=True) for _ in range(3)]
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "stopped" and reply.run_id, reply.text
+    await team.orch.answer(reply.run_id, "check it again")
+    # The model never judged those calls, so the next check must judge them all.
+    assert not [d for d in team.decisions.items if d.rule == SEEN_CALLS]
 
 
 class _BusToolLog:
@@ -236,3 +269,141 @@ async def test_an_escalation_left_by_a_crash_still_gets_the_stronger_model(
     kinds = [d.kind for d in team.decisions.items if d.task_id == task.id]
     assert kinds == [DecisionKind.NO_PROGRESS, DecisionKind.STRONGER_MODEL]
     assert task.id in team.llm.overrides
+
+
+async def test_research_requests_and_the_stronger_model_stay_within_the_limit(
+    tmp_path: Path,
+) -> None:
+    # A planned research task fails its check, asks for research, keeps asking, and
+    # keeps failing. Its attempts stop at the limit plus the one on the stronger model,
+    # and the attempt that asked counts like any other.
+    script = team_script()
+    team = await make_team(tmp_path, code_policy=True, script=script)
+    prompts: dict[int, str] = {}
+    gap = {"question": "What does the WAL checkpoint cost?", "why": "trade-offs"}
+
+    def researcher(request: LLMRequest) -> str:
+        """A planned brief plain on attempt 1, then always asking for research."""
+        text = request.messages[0].content[0].text  # type: ignore[union-attr]
+        if "origin research_request" in text:
+            return json.dumps(BRIEF)
+        attempt = int(text.split("(attempt ", 1)[1].split(",", 1)[0])
+        prompts[attempt] = text
+        return json.dumps(BRIEF if attempt == 1 else dict(BRIEF, research_requests=[gap]))
+
+    script[AgentName.RESEARCHER] = researcher
+    passing = team.auditor.audit_task
+
+    async def audit_task(task: Task, artifact: object, run: object) -> Verdict:
+        """Fail every attempt of planned research on a new item, so it isn't no progress."""
+        if task.origin is TaskOrigin.PLAN and task.output_kind == "research_brief":
+            return _blocker("P2", f"item {task.attempt}").model_copy(
+                update={"task_id": task.id, "run_id": task.run_id}
+            )
+        return await passing(task, artifact, run)  # type: ignore[arg-type]
+
+    team.auditor.audit_task = audit_task  # type: ignore[method-assign]
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "waiting", reply.text
+    assert reply.run_id
+    tasks = await team.tasks.list_tasks(reply.run_id)
+    planned = next(
+        t for t in tasks if t.origin is TaskOrigin.PLAN and t.output_kind == "research_brief"
+    )
+    # 1 failed, 2 asked for research, 3 (the last) couldn't ask and failed, 4 ran on the
+    # stronger model and failed: then the user is asked.
+    assert planned.attempt == 4 and planned.max_attempts == 4
+    assert planned.status is TaskStatus.ESCALATED
+    children = [t for t in tasks if t.origin is TaskOrigin.RESEARCH_REQUEST]
+    assert [c.parent_task_id for c in children] == [planned.id]
+    assert "can't ask for more research" not in prompts[2]
+    assert all("can't ask for more research" in prompts[n] for n in (3, 4))
+    kinds = [d.kind for d in team.decisions.items if d.task_id == planned.id]
+    assert kinds.count(DecisionKind.STRONGER_MODEL) == 1
+
+
+async def test_the_stronger_model_decision_records_its_prompt_cap_and_cost(
+    tmp_path: Path,
+) -> None:
+    team = await make_team(tmp_path, code_policy=True)
+    for item in ("REQ-1", "REQ-2", "REQ-3"):
+        team.auditor.fail_next["prd"].append(_blocker("R3", item))
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "done", reply.text
+    [stronger] = [d for d in team.decisions.items if d.kind is DecisionKind.STRONGER_MODEL]
+    cap = team.llm.context_budget(AgentName.PRODUCT, stronger.task_id)
+    assert stronger.inputs["prompt_cap_tokens"] == cap
+    # The default routing file prices the stronger model at $2 per million prompt tokens.
+    assert stronger.inputs["max_prompt_usd"] == round(cap * 2.0 / 1_000_000, 4)
+    prd = next(t for t in await team.tasks.list_tasks(stronger.run_id) if t.output_kind == "prd")
+    assert prd.attempt == 4 and prd.max_attempts == 4 and prd.status is TaskStatus.DONE
+
+
+async def test_routes_to_the_stronger_model_come_back_in_a_new_process(tmp_path: Path) -> None:
+    team = await make_team(tmp_path, code_policy=True)
+    run = await team.orch.start_run("Build a books API")
+    open_task, done = [
+        await team.tasks.create_task(
+            Task(
+                run_id=run.id,
+                phase=Phase.PRD,
+                agent=AgentName.PRODUCT,
+                objective=objective,
+                output_kind="prd",
+            )
+        )
+        for objective in ("PRD", "old PRD")
+    ]
+    await team.tasks.transition(done.id, TaskStatus.READY, reason="test")
+    await team.tasks.transition(done.id, TaskStatus.RUNNING, reason="test")
+    await team.tasks.transition(done.id, TaskStatus.AUDITING, reason="test")
+    await team.tasks.transition(done.id, TaskStatus.DONE, reason="test")
+    for task in (open_task, done):
+        await team.decisions.record(
+            Decision(
+                run_id=run.id,
+                task_id=task.id,
+                kind=DecisionKind.STRONGER_MODEL,
+                inputs={"attempt": 4},
+                choice="one last attempt",
+                reason="no attempts left",
+                made_by="code",
+            )
+        )
+    team.llm.overrides.clear()  # routes live in memory: a new process has none
+    await team.orch._restore_stronger_routes(run.id)
+    assert set(team.llm.overrides) == {open_task.id}
+
+
+async def test_a_stronger_model_decision_is_recorded_even_when_routing_fails(
+    tmp_path: Path,
+) -> None:
+    team = await make_team(tmp_path, code_policy=True)
+    run = await team.orch.start_run("Build a books API")
+    task = await team.tasks.create_task(
+        Task(
+            run_id=run.id,
+            phase=Phase.PRD,
+            agent=AgentName.PRODUCT,
+            objective="PRD",
+            output_kind="prd",
+        )
+    )
+
+    def no_stronger(task_id: str) -> object:
+        """A routing file without a stronger model."""
+        raise ValueError("config has no stronger_model")
+
+    team.llm.use_stronger_model = no_stronger  # type: ignore[method-assign]
+    sent = Decision(
+        run_id=run.id,
+        task_id=task.id,
+        kind=DecisionKind.STRONGER_MODEL,
+        inputs={"attempt": 4},
+        choice="one last attempt",
+        reason="no attempts left",
+        made_by="code",
+    )
+    with pytest.raises(ValueError):
+        await team.orch._apply(run, sent)
+    assert [d.id for d in team.decisions.items] == [sent.id]  # so the policy asks next time

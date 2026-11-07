@@ -39,7 +39,7 @@ NO_RESEARCH = (
 )
 #: The assumption recorded for a research request a task wasn't allowed to make.
 NOT_RESEARCHED = (
-    "Not researched: the run's research limit was reached, so this goes ahead without it."
+    "Not researched: no more research could be run for this task, so this goes ahead without it."
 )
 #: Fields the dispatcher fills; the model is told to leave them out.
 _HARNESS_FIELDS = {"run_id", "task_id", "version", "built_from"}
@@ -115,6 +115,15 @@ def render_envelope(envelope: TaskEnvelope, tools: dict[str, Tool]) -> str:
         parts.append(
             "\n## Feedback on your work (answers to your questions go into the "
             "question's `answer`)\n" + "\n".join(lines)
+        )
+    if envelope.input_feedback:
+        lines = [
+            f"- [{fb.source.value} on {fb.artifact or 'an input'}] {fb.text}"
+            for fb in envelope.input_feedback
+        ]
+        parts.append(
+            "\n## The user's guidance on your inputs\nYour inputs were written to follow "
+            "it. Follow it too, and don't contradict those inputs.\n" + "\n".join(lines)
         )
     return "\n".join(parts)
 

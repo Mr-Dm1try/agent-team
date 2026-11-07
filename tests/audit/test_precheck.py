@@ -61,6 +61,9 @@ async def test_clear_violations_are_blocked_by_code(
         ("run_command", {"command": "pip install fastapi==0.115.0 httpx"}),
         ("run_command", {"command": "rm -rf build .pytest_cache"}),
         ("run_command", {"command": "curl -X POST -d '{}' http://localhost:8000/books"}),
+        # Each sandbox command has its own container: a kill reaches only its processes.
+        ("run_command", {"argv": ["sh", "-c", "kill $(cat server.pid)"]}),
+        ("run_command", {"argv": ["sh", "-c", "for p in /proc/[0-9]*; do kill ${p#/proc/}; done"]}),
         ("write_file", {"path": "app/main.py", "content": "print('hi')"}),
         ("read_file", {"path": "README.md"}),
         ("web_search", {"query": "fastapi sqlite tutorial"}),
@@ -245,3 +248,18 @@ async def test_hook_fails_closed_without_context(run: Run) -> None:
     assert not (await hook(stray)).allow
     unknown_task = stray.model_copy(update={"task_id": "task_missing"})
     assert not (await hook(unknown_task)).allow
+
+
+async def test_a_kill_outside_the_sandbox_still_asks_the_model(
+    rule_store: SqliteRuleStore, run: Run, task: Task
+) -> None:
+    llm = FakeLLM([{"decision": "block", "reason": "not in the sandbox"}])
+    result = await pc(rule_store, llm).check("shell", {"command": "pkill -f api"}, task, run)
+    assert result.decision is PrecheckDecision.BLOCK and len(llm.requests) == 1
+    # Other unclear commands in the sandbox still ask, told what the sandbox allows.
+    llm = FakeLLM([{"decision": "allow", "reason": "inside the sandbox"}])
+    args = {"argv": ["sh", "-c", "sudo kill 1"]}
+    assert (await pc(rule_store, llm).check("run_command", args, task, run)).decision is (
+        PrecheckDecision.ALLOW
+    )
+    assert "the command is pid 1" in str(llm.requests[0].messages[0].content[0])

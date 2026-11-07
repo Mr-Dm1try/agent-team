@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import traceback
 
-from agent_team.core.artifacts import plain_kind
+from agent_team.core.artifacts import CodeChange, plain_kind
 from agent_team.core.errors import BudgetExceeded
 from agent_team.core.models import (
     SESSION,
@@ -23,6 +23,7 @@ from agent_team.core.models import (
     EventName,
     Feedback,
     FeedbackSource,
+    Finding,
     Phase,
     RequestKind,
     RuleScope,
@@ -42,22 +43,26 @@ from agent_team.orchestrator.base import (
     TASK_QUESTION,
     OrchestratorBase,
     can_keep,
+    code_blockers,
+    reruns_code,
 )
 from agent_team.orchestrator.control import create_user_task
-from agent_team.orchestrator.lineage import downstream
+from agent_team.orchestrator.lineage import CHANGE_REQUEST_PREFIX, downstream
 from agent_team.orchestrator.messages import (
     CHANGE_TARGETS,
     CONFIRM_CHANGE,
+    CONFIRM_STOP,
     NO,
     YES,
     Action,
     Interpretation,
     describe_pending,
     interpret,
+    says_stop,
     scrub,
 )
 from agent_team.orchestrator.phases import expert_tasks
-from agent_team.orchestrator.replies import Reply, pending_items
+from agent_team.orchestrator.replies import Reply, WorkingReply, pending_items, waiting_reply
 
 #: The order actions are carried out in: answers and a new run, then preferences (kept
 #: under the new run when there is one), changes, and a stop last.
@@ -68,6 +73,24 @@ _ORDER = {
     "request_change": 2,
     "stop_run": 3,
 }
+#: Actions that change the run, so a message typed while the team works waits with
+#: them until it stops.
+_HELD = frozenset({"answer_pending", "request_change", "start_run"})
+#: The reply to a message held until the team stops.
+HELD_REPLY = (
+    "I'll take that up as soon as the team stops: when it next waits for you or "
+    "finishes. To stop it now, type stop."
+)
+#: The reply when a message typed while the team works asks for a stop in other words.
+TYPE_STOP = "To stop the run, type stop."
+#: The fallback when the message loop can't read a message.
+DIDNT_CATCH = "I didn't catch that. Could you say it another way?"
+
+
+def _others(verdict: Verdict | None, code: list[Finding]) -> list[Finding]:
+    """The blockers of a failed check that aren't the code's: the reviewer's own."""
+    ids = {f.id for f in code}
+    return [f for f in (verdict.blockers if verdict else []) if f.id not in ids]
 
 
 class ConversationMixin(OrchestratorBase):
@@ -91,18 +114,65 @@ class ConversationMixin(OrchestratorBase):
         self, message: str, run: Run | None, context_dirs: list[str] | None = None
     ) -> Reply:
         """Read one message and carry out what it means; see ``handle``."""
+        waiting = await self._pending(run.id) if run else []
+        try:
+            meant = await self._read(message, run, waiting)
+        except PAUSING as exc:
+            return await self._paused_while_reading(run, exc)
+        if meant is None:
+            return self._didnt_catch(run, waiting)
+        return await self._carry_out(run, message, meant, context_dirs or [])
+
+    async def handle_while_working(self, message: str, run_id: str) -> WorkingReply:
+        """A message typed while the team works on the run. The message loop reads it
+        as usual, but only what can't disturb the work is done now: the reply to a
+        question and any preference. A message that changes the run (an answer, a
+        change, a new run) is held for the session to send again once the team stops.
+        The session stops the run itself when the user types stop; a stop asked in
+        other words gets a hint to type it."""
+        run = await self.tasks.get_run(run_id)
+        async with Tracer(self.bus).in_run(run, "user message", "other", agent=AgentName.USER):
+            try:
+                meant = await self._read(
+                    message, run, await self._pending(run.id), while_working=True
+                )
+            except PAUSING:
+                return WorkingReply(
+                    "The run is stopping, so I couldn't read that. Send it again once it has."
+                )
+            if meant is None:
+                return WorkingReply(DIDNT_CATCH)
+            tools = {a.tool for a in meant.actions}
+            if tools & _HELD:
+                return WorkingReply(HELD_REPLY, held=True)
+            if not meant.actions:
+                await self._log_action(run.id, message, meant, None)
+            for action in meant.actions:
+                if action.tool == "remember_preference":
+                    await self._remember(run, message, action.args["text"])
+            said = [meant.reply, TYPE_STOP] if "stop_run" in tools else [meant.reply]
+            return WorkingReply("\n\n".join(scrub(t, message) for t in said))
+
+    async def _read(
+        self, message: str, run: Run | None, waiting: list[Task], *, while_working: bool = False
+    ) -> Interpretation | None:
+        """Log the message and run the message loop on it. Returns None when the loop
+        failed (logged as an error), so nothing is acted on; a stop or the budget
+        running out while reading propagates."""
+        data: dict[str, object] = {"text": message}
+        if while_working:
+            data["while_working"] = True
         await self.bus.emit(
             Event(
                 name=EventName.USER_MESSAGE,
                 run_id=run.id if run else SESSION,
                 agent=AgentName.USER,
-                data={"text": message},
+                data=data,
             )
         )
-        waiting = await self._pending(run.id) if run else []
         pending = [(t, await self._asker(t)) for t in waiting]
         try:
-            meant = await interpret(
+            return await interpret(
                 message,
                 run,
                 pending,
@@ -116,8 +186,8 @@ class ConversationMixin(OrchestratorBase):
                 llm=self.llm,
                 workspace=str(self.config.runs_dir),
             )
-        except PAUSING as exc:
-            return await self._paused_while_reading(run, exc)
+        except PAUSING:
+            raise
         except Exception as exc:  # a failed read is never an action
             await self.bus.emit(
                 Event(
@@ -131,10 +201,7 @@ class ConversationMixin(OrchestratorBase):
                     },
                 )
             )
-            meant = None
-        if meant is None:
-            return self._didnt_catch(run, waiting)
-        return await self._carry_out(run, message, meant, context_dirs or [])
+            return None
 
     async def _paused_while_reading(self, run: Run | None, exc: Exception) -> Reply:
         """The budget ran out or the run was stopped while reading the message: pause the
@@ -160,10 +227,12 @@ class ConversationMixin(OrchestratorBase):
         """Carry out the loop's actions (answers first, then changes, a stop last, so a
         change sees the run as the answers left it), log each as a decision, then drive
         what they touched and reply in plain words. Once the run is stopped, the rest of
-        the actions on it are dropped (and logged as dropped); a new run still starts."""
+        the actions on it are dropped (and logged as dropped); a new run still starts.
+        A stop the message didn't ask for is put to the user first, or, when the
+        message starts a new run, left out: the old run stays as it was."""
         if not meant.actions:
             await self._log_action(run.id if run else SESSION, message, meant, None)
-        touched, started, stopped = False, None, None
+        touched, started, stopped, asked = False, None, None, False
         notes: list[str] = []
         for action in sorted(meant.actions, key=lambda a: _ORDER[a.tool]):
             args = action.args
@@ -188,19 +257,31 @@ class ConversationMixin(OrchestratorBase):
                 if target is None:
                     continue  # an earlier answer in this message closed it
                 stopped = await self._record_answer(run, target, args["text"], notes)
-                touched = touched or stopped is None
+                # A declined stop changes nothing, so the run isn't driven for it.
+                touched = touched or (stopped is None and target.reason != CONFIRM_STOP)
             elif action.tool == "request_change":
                 note = await self._propose_change(run, args["text"], args["target"])
                 notes += [note] if note else []
                 touched = True
-            else:
+            elif says_stop(message):
                 await self.stop(run.id, args["reason"])
                 stopped = Reply(kind="stopped", text="", run_id=run.id)
+            elif started is not None:
+                notes.append(
+                    f"I left {run.title!r} as it was, without stopping it; you can resume it later."
+                )
+            else:
+                await self._propose_stop(run, message, args["reason"])
+                asked = True
         states: list[Reply] = []
         if stopped is not None:
             states.append(stopped)
         elif run is not None and touched:
             states.append(await self._continue(run.id))
+        elif run is not None and asked:
+            if run.status is not RunStatus.PAUSED:  # a paused run stays paused
+                run = await self._set_status(run.id, RunStatus.WAITING)
+            states.append(waiting_reply(run, await self._pending(run.id)))
         if started is not None:
             states.append(await self.drive(started.id))
         if not states:
@@ -242,14 +323,18 @@ class ConversationMixin(OrchestratorBase):
             choice += f" {action.args['target']}"
         if dropped:
             choice = f"dropped {choice}: the run was stopped first"
+        by_code = action is not None and action.by == "code"
         await self._record(
             Decision(
                 run_id=run_id,
                 kind=DecisionKind.CLASSIFY_REQUEST,
                 inputs={"message": message[:500], **(action.args if action else {})},
                 choice=choice,
-                reason=meant.reply[:500],
-                made_by="model",
+                reason="the message is new work and no run was open, so code started one"
+                if by_code
+                else meant.reply[:500],
+                made_by="code" if by_code else "model",
+                rule="new_work_starts_a_run" if by_code else None,
             )
         )
 
@@ -264,7 +349,7 @@ class ConversationMixin(OrchestratorBase):
 
     def _didnt_catch(self, run: Run | None, waiting: list[Task]) -> Reply:
         """The fallback when the loop fails: act on nothing and list what's waiting."""
-        text = "I didn't catch that. Could you say it another way?"
+        text = DIDNT_CATCH
         if waiting:
             text += " Here's what's waiting on you:\n" + "\n".join(
                 f"- {t.objective}" for t in waiting
@@ -310,11 +395,17 @@ class ConversationMixin(OrchestratorBase):
     ) -> Reply | None:
         """Close one pending item with the user's words, without driving the run. Returns
         a reply only when the answer stopped the run; anything else the user should hear
-        is added to ``notes``."""
-        if target.reason == ESCALATION and text.strip().lower() == "stop":
+        is added to ``notes``. Any answer about a check that stopped on a safety finding
+        means the user has seen the tool calls it judged."""
+        parent = await self.tasks.get_task(target.parent_task_id) if target.parent_task_id else None
+        if parent is not None and target.reason in (ESCALATION, TASK_QUESTION):
+            await self._note_seen_calls(run, parent, target)
+        if target.reason in (ESCALATION, TASK_QUESTION) and says_stop(text):
             await self.tasks.transition(target.id, TaskStatus.DONE, reason="user said stop")
-            await self.stop(run.id, "the user stopped the run at an escalation")
+            await self.stop(run.id, "the user stopped the run when asked how to proceed")
             return Reply(kind="stopped", text="Stopped the run.", run_id=run.id)
+        if target.reason == CONFIRM_STOP:
+            return await self._confirm_stop(run, target, text, notes)
         if target.origin is TaskOrigin.REVIEW:
             await self.tasks.transition(target.id, TaskStatus.DONE, reason="reviewed")
             if not APPROVE.match(text):
@@ -325,12 +416,17 @@ class ConversationMixin(OrchestratorBase):
         if target.reason == CONFIRM_CHANGE:
             await self._confirm_change(run, target, text, notes)
             return None
-        parent = await self.tasks.get_task(target.parent_task_id) if target.parent_task_id else None
         if (
             parent is not None
             and target.reason in (TASK_QUESTION, ESCALATION)
             and APPROVE.match(text)
             and await self._keep_as_is(run, target, parent)
+        ):
+            return None
+        if (
+            parent is not None
+            and target.reason in (TASK_QUESTION, ESCALATION)
+            and await self._retry_code(run, target, parent, text, notes)
         ):
             return None
         question_id = target.reason if target.reason and target.reason.startswith("Q-") else None
@@ -348,6 +444,68 @@ class ConversationMixin(OrchestratorBase):
         )
         await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
         return None
+
+    async def _retry_code(
+        self, run: Run, target: Task, parent: Task, text: str, notes: list[str]
+    ) -> bool:
+        """Guidance for a stuck QA review whose check failed on the code, or that names
+        the code, retries the code: the first Engineer task at fault is reopened with
+        the guidance and QA's code blockers, the tasks after it re-run, and QA reviews
+        again with the guidance and its own blockers. Returns False when the guidance
+        is for QA's own work."""
+        failed = await self.verdicts.latest_for_task(parent.id)
+        if APPROVE.match(text) or not reruns_code(parent, failed, text):
+            return False
+        live = [
+            t
+            for t in await self.tasks.list_tasks(run.id)
+            if t.agent is AgentName.ENGINEER
+            and t.phase is parent.phase
+            and t.output is not None
+            and t.status is not TaskStatus.SUPERSEDED
+        ]
+        if not live:
+            return False
+        blockers = code_blockers(failed)
+        engineer = await self._code_at_fault(run, live, blockers)
+        await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
+        for task, found in ((engineer, blockers), (parent, _others(failed, blockers))):
+            await self.feedback.add(run.id, self._feedback(task, FeedbackSource.USER_ANSWER, text))
+            for f in found:
+                said = f"{f.rule_id} on {f.item or 'the work'}: {f.message}"
+                await self.feedback.add(run.id, self._feedback(task, FeedbackSource.QA, said))
+        await self._record(
+            Decision(
+                run_id=run.id,
+                task_id=engineer.id,
+                kind=DecisionKind.FIX,
+                inputs={"user_task": target.id, "checker": parent.id, "guidance": text},
+                choice=f"retry the code ({engineer.id}), then QA's review",
+                reason="the user's guidance on QA's stuck review is for the code",
+                made_by="code",
+                rule="retry_code",
+            )
+        )
+        await self.reopen(
+            run, engineer, origin=TaskOrigin.FIX, reason=f"the user asked to retry the code: {text}"
+        )
+        notes.append("I'll retry the code with your guidance, then QA will check it again.")
+        return True
+
+    async def _code_at_fault(
+        self, run: Run, engineers: list[Task], blockers: list[Finding]
+    ) -> Task:
+        """The first of ``engineers`` whose code a blocker is on, by its version or a
+        file it wrote, so reopening it re-runs the later ones too; else the last one."""
+        for t in engineers:
+            assert t.output is not None
+            code = await self.artifacts.load(run.id, t.output)
+            written = set(code.files_written) if isinstance(code, CodeChange) else set()
+            for f in blockers:
+                path = (f.item or "").split(":")[0].strip()
+                if f.artifact == t.output or path in written:
+                    return t
+        return engineers[-1]
 
     async def _keep_as_is(self, run: Run, target: Task, parent: Task) -> bool:
         """The user approved work that failed its check: keep it as it is. A passing
@@ -393,7 +551,7 @@ class ConversationMixin(OrchestratorBase):
         as it is, and anything else is a comment that reopens the last phase."""
         await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
         reply = text.strip()
-        if reply.lower() == "stop":
+        if says_stop(reply):
             await self.stop(run.id, "the user stopped the run after a failed audit")
             return Reply(kind="stopped", text="Stopped the run.", run_id=run.id)
         accepted = bool(APPROVE.match(reply))
@@ -446,7 +604,7 @@ class ConversationMixin(OrchestratorBase):
             self._feedback(producer, FeedbackSource.USER_COMMENT, text),
         )
         await self.reopen(
-            run, producer, origin=TaskOrigin.CHANGE_REQUEST, reason=f"change request: {text}"
+            run, producer, origin=TaskOrigin.CHANGE_REQUEST, reason=CHANGE_REQUEST_PREFIX + text
         )
         await self._set_status(run.id, RunStatus.ACTIVE)
 
@@ -577,3 +735,68 @@ class ConversationMixin(OrchestratorBase):
                 notes.append(await self._fold_into_redo(run, change, kind))
         elif proposal.inputs.get("run_was_done"):
             await self._set_status(run.id, RunStatus.DONE)
+
+    async def _propose_stop(self, run: Run, message: str, reason: str) -> None:
+        """Ask the user to confirm a stop their message didn't ask for; nothing stops
+        until they say yes."""
+        child = await create_user_task(
+            self.tasks,
+            run,
+            phase=await self._current_phase(run),
+            question="Stop the run? It can be resumed later. (yes or no)",
+            origin=TaskOrigin.QUESTION,
+            reason=CONFIRM_STOP,
+        )
+        await self._record(
+            Decision(
+                run_id=run.id,
+                task_id=child.id,
+                kind=DecisionKind.ASK_USER,
+                inputs={"message": message[:500], "reason": reason},
+                choice="confirm the stop before stopping",
+                reason="the user's message didn't ask to stop",
+                made_by="code",
+                rule=CONFIRM_STOP,
+            )
+        )
+
+    async def _current_phase(self, run: Run) -> Phase:
+        """The phase of the run's newest live task, for a question about the whole run."""
+        live = [
+            t for t in await self.tasks.list_tasks(run.id) if t.status is not TaskStatus.SUPERSEDED
+        ]
+        return max(live, key=lambda t: t.created_at).phase if live else Phase.PLANNING
+
+    async def _confirm_stop(
+        self, run: Run, target: Task, text: str, notes: list[str]
+    ) -> Reply | None:
+        """Yes stops the run with the reason given when the stop was proposed; no
+        leaves it going."""
+        proposal = next(
+            (
+                d
+                for d in reversed(await self.decisions.list(run.id))
+                if d.task_id == target.id and d.rule == CONFIRM_STOP
+            ),
+            None,
+        )
+        await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
+        agreed = bool(YES.match(text)) and not NO.match(text)
+        await self._record(
+            Decision(
+                run_id=run.id,
+                task_id=target.id,
+                kind=DecisionKind.ASK_USER,
+                inputs={"answer": text[:500], **(proposal.inputs if proposal else {})},
+                choice="stop the run" if agreed else "keep the run going",
+                reason="the user answered the stop confirmation",
+                made_by="code",
+                rule=CONFIRM_STOP,
+            )
+        )
+        if not agreed:
+            notes.append("Okay, I won't stop the run.")
+            return None
+        reason = str(proposal.inputs.get("reason")) if proposal else "the user confirmed a stop"
+        await self.stop(run.id, reason)
+        return Reply(kind="stopped", text="Stopped the run.", run_id=run.id)

@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from agent_team.core.artifacts import (
     QAReport,
     ResearchAnswer,
     ResearchBrief,
+    ResearchQuestion,
     Spec,
     TestRun,
 )
@@ -43,8 +45,11 @@ from agent_team.core.models import (
     Run,
     Severity,
     Task,
+    TaskOrigin,
     TaskStatus,
     Verdict,
+    attempt_text,
+    stronger_attempts,
 )
 
 #: Upstream order of artifact kinds; used to find the earliest artifact at fault.
@@ -102,12 +107,17 @@ class AuditContext:
     task: Task | None = None
     artifact: Artifact | None = None  # task sweep: the task's output
     previous: Artifact | None = None  # task sweep: the version before it, on revisions
+    #: Task sweep of a research answer: the briefs it was written from.
+    briefs: list[ResearchBrief] = field(default_factory=list)
     outputs: list[tuple[Task, Artifact]] = field(default_factory=list)  # in scope
     latest: dict[str, Artifact] = field(default_factory=dict)  # latest of every kind
     tasks: list[Task] = field(default_factory=list)  # every task in the run
     tool_calls: list[ToolCall] = field(default_factory=list)  # in scope
     decisions: list[Decision] = field(default_factory=list)  # run sweep
     verdicts: dict[str, list[Verdict]] = field(default_factory=dict)  # run sweep, by task
+    #: Task sweep: tool calls up to this time were judged by a check whose safety
+    #: findings the user answered, so the safety rules leave them out.
+    seen_before: datetime | None = None
 
     # --- lookups ---
 
@@ -157,6 +167,22 @@ class AuditContext:
     def ran(self) -> list[ToolCall]:
         """Tool calls that actually ran; the pre-check stopped the others."""
         return [c for c in self.tool_calls if not c.blocked]
+
+    def seen(self, call: ToolCall) -> bool:
+        """Whether the user already saw this call at an earlier safety stop."""
+        return self.seen_before is not None and call.ts <= self.seen_before
+
+    def unseen(self) -> list[ToolCall]:
+        """The calls that ran and that no answered safety stop covered: what the safety
+        rules (S1 on tool calls, S5, S6, S7) judge."""
+        return [c for c in self.ran() if not self.seen(c)]
+
+    def seen_note(self) -> str | None:
+        """A note on the calls the safety rules left out, or None when there are none."""
+        left = len(self.ran()) - len(self.unseen())
+        if not left:
+            return None
+        return f"left out {left} tool calls the user saw at an earlier safety stop"
 
 
 @dataclass
@@ -331,7 +357,7 @@ def secrets(ctx: AuditContext, rule: Rule) -> HelperResult:
         sources.append((str(ref_of(artifact)), _texts(artifact), artifact, False))
     for _, change, path, text in ctx.code_files():
         sources.append((path, text, change, False))
-    for call in ctx.ran():
+    for call in ctx.unseen():
         text = str(call.args)
         if call.tool not in UNTRUSTED_RESULT_TOOLS:
             text += "\n" + call.result
@@ -353,15 +379,24 @@ def secrets(ctx: AuditContext, rule: Rule) -> HelperResult:
                 )
             )
     res.notes.append(f"scanned {len(sources)} artifacts, files and tool calls for secrets")
+    _note_seen(ctx, res)
     return res
+
+
+def _note_seen(ctx: AuditContext, res: HelperResult) -> None:
+    """Add the note on calls left out because the user saw them, if there are any."""
+    note = ctx.seen_note()
+    if note:
+        res.notes.append(note)
 
 
 @helper("dangerous_actions")
 def dangerous_actions(ctx: AuditContext, rule: Rule) -> HelperResult:
     """S5: destructive commands, downloads piped to a shell, deletes outside the
-    workspace and credential files, in the tool calls that ran."""
+    workspace and credential files, in the tool calls that ran and the user hasn't
+    seen at an earlier safety stop."""
     res = HelperResult()
-    for call in ctx.ran():
+    for call in ctx.unseen():
         command = patterns.command_text(call.args)
         problem = patterns.is_destructive(command) if command else None
         if command and not problem and patterns.rm_outside(command, ctx.run.workspace):
@@ -382,13 +417,15 @@ def dangerous_actions(ctx: AuditContext, rule: Rule) -> HelperResult:
                 )
             )
     res.notes.append(f"checked {len(ctx.tool_calls)} tool calls for dangerous actions")
+    _note_seen(ctx, res)
     return res
 
 
 @helper("injected_instructions")
 def injected_instructions(ctx: AuditContext, rule: Rule) -> HelperResult:
     """S6: text that reads like instructions in what a tool returned, and a hit when
-    a later call reuses a URL or command from that text."""
+    a later call the user hasn't seen at an earlier safety stop reuses a URL or
+    command from that text."""
     res = HelperResult()
     calls = ctx.ran()
     for i, call in enumerate(calls):
@@ -410,6 +447,8 @@ def injected_instructions(ctx: AuditContext, rule: Rule) -> HelperResult:
             if patterns.is_destructive(line)
         }
         for later in after:
+            if ctx.seen(later):
+                continue
             later_text = str(later.args)
             used = sorted(p for p in planted if p and p in later_text)
             if used:
@@ -422,15 +461,17 @@ def injected_instructions(ctx: AuditContext, rule: Rule) -> HelperResult:
                         evidence=f"injected: {markers[0]!r}; reused: {used[:3]}",
                     )
                 )
+    _note_seen(ctx, res)
     return res
 
 
 @helper("data_leaving")
 def data_leaving(ctx: AuditContext, rule: Rule) -> HelperResult:
-    """S7: secrets in outgoing web calls, and commands that upload to outside hosts."""
+    """S7: secrets in outgoing web calls, and commands that upload to outside hosts,
+    in the calls the user hasn't seen at an earlier safety stop."""
     res = HelperResult()
     allowed = ctx.allowed_hosts
-    for call in ctx.ran():
+    for call in ctx.unseen():
         if call.tool in OUTGOING_TOOLS:
             for h in patterns.find_secrets(str(call.args)):
                 res.findings.append(
@@ -453,6 +494,7 @@ def data_leaving(ctx: AuditContext, rule: Rule) -> HelperResult:
                         evidence=command[:300],
                     )
                 )
+    _note_seen(ctx, res)
     return res
 
 
@@ -642,17 +684,20 @@ def _unsourced_pins(
 
 @helper("brief_complete")
 def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
-    """P2: every question in the brief has an answer or a reason it couldn't."""
+    """P2: every question in a brief has an answer or a reason it couldn't; a final
+    answer is written from its briefs and pins no version its briefs contradict."""
+    if isinstance(ctx.artifact, ResearchAnswer):
+        return _answer_matches_briefs(ctx, rule, ctx.artifact)
     brief = ctx.artifact
     if not isinstance(brief, ResearchBrief):
         return HelperResult()
     res = HelperResult()
-    plan = ctx.latest.get("plan")
-    if isinstance(plan, Plan) and plan.research_questions:
-        questions = [f"{q.question} ({q.ask})" for q in plan.research_questions]
-        res.notes.append(f"research questions in the plan: {questions}")
     if ctx.task is not None:
-        res.notes.append(f"task objective: {ctx.task.objective}")
+        res.notes.append(f"the questions this brief was given: {own_questions(ctx)}")
+        res.notes.append(
+            "judge the brief only on these: the plan's other research questions are "
+            "other tasks' work"
+        )
     if not brief.answers:
         res.findings.append(hit(rule, "the brief answers no questions", artifact=brief))
     for i, ans in enumerate(brief.answers, start=1):
@@ -665,6 +710,89 @@ def brief_complete(ctx: AuditContext, rule: Rule) -> HelperResult:
                     artifact=brief,
                 )
             )
+    return res
+
+
+def own_questions(ctx: AuditContext) -> list[str]:
+    """The questions a research brief's task was given: its objective, with the plan's
+    ask it serves for planned research, or why an agent asked for research it requested.
+    Never the plan's other research questions, which other tasks answer."""
+    task = ctx.task
+    if task is None:
+        return []
+    question = task.objective
+    plan = ctx.latest.get("plan")
+    request = _request_of(task, ctx.tasks)
+    if request is not None:
+        question += f" ({request.reason})" if request.reason else ""
+    elif isinstance(plan, Plan):
+        asks = [q.ask for q in own_plan_questions(plan, task)]
+        if asks:
+            question += f" (for {', '.join(asks)})"
+    return [question]
+
+
+def _request_of(task: Task, tasks: list[Task]) -> Task | None:
+    """The task made from a research request that ``task`` is, or was reopened from
+    (a fix or revision of requested research); None for planned research."""
+    by_id = {t.id: t for t in tasks}
+    current: Task | None = task
+    seen: set[str] = set()
+    while current is not None and current.id not in seen:
+        if current.origin is TaskOrigin.RESEARCH_REQUEST:
+            return current
+        if current.origin is TaskOrigin.PLAN:
+            return None
+        seen.add(current.id)
+        current = by_id.get(current.parent_task_id) if current.parent_task_id else None
+    return None
+
+
+def own_plan_questions(plan: Plan, task: Task) -> list[ResearchQuestion]:
+    """The plan's research questions a research task was made from: the one its
+    objective is; none for research an agent asked for."""
+    return [q for q in plan.research_questions if q.question == task.objective]
+
+
+def _pins(text: str) -> dict[str, set[str]]:
+    """The releases each package is pinned to in ``text``, by normal package name,
+    with trailing zero parts dropped, so ``==2.3`` and ``~=2.3.0`` are one release."""
+    found: dict[str, set[str]] = {}
+    for m in _PIN.finditer(text):
+        if m[1].lower() not in _NOT_PACKAGES:
+            found.setdefault(_package(m[1]), set()).add(re.sub(r"(\.0)+$", "", m[3]))
+    return found
+
+
+def _answer_matches_briefs(ctx: AuditContext, rule: Rule, answer: ResearchAnswer) -> HelperResult:
+    """P2 for a final answer: it pins no package at a version its briefs don't, when
+    the briefs pin that package. The briefs' answers go in as notes, so the model can
+    judge the rest of the answer against them."""
+    res = HelperResult()
+    if not ctx.briefs:
+        res.notes.append("the answer was written from no research brief")
+        return res
+    brief_pins: dict[str, set[str]] = {}
+    for brief in ctx.briefs:
+        for a in brief.answers:
+            said = a.answer if a.answer else f"(no answer: {a.gap or 'no reason given'})"
+            res.notes.append(f"{ref_of(brief)} on {a.question[:80]!r}: {said[:300]}")
+        for package, versions in _pins(_research_text(brief)).items():
+            brief_pins.setdefault(package, set()).update(versions)
+    for package, versions in sorted(_pins(_research_text(answer)).items()):
+        known = brief_pins.get(package)
+        if not known or versions <= known:
+            continue
+        stated = ", ".join(sorted(versions - known))
+        res.findings.append(
+            hit(
+                rule,
+                f"pins {package} at {stated}, but its briefs found {', '.join(sorted(known))}",
+                item=package,
+                artifact=answer,
+                fix="answer from the briefs, or say why the answer departs from them",
+            )
+        )
     return res
 
 
@@ -1133,6 +1261,7 @@ def process_trail(ctx: AuditContext, rule: Rule) -> HelperResult:
     """R8: every live task finished with times and a verdict within its attempts,
     and every decision has a reason."""
     res = HelperResult()
+    stronger = stronger_attempts(ctx.decisions)
     for task in ctx.tasks:
         if task.status is TaskStatus.SUPERSEDED or task.agent in (
             AgentName.USER,
@@ -1148,6 +1277,13 @@ def process_trail(ctx: AuditContext, rule: Rule) -> HelperResult:
             res.findings.append(hit(rule, "task has no start or end time", item=task.id))
         if not ctx.verdicts.get(task.id):
             res.findings.append(hit(rule, "task has no audit verdict", item=task.id))
+        first = stronger.get(task.id)
+        if first is not None and task.attempt >= first:
+            res.notes.append(
+                f"{task.id}: attempt {first} ran on the stronger model, which the policy "
+                f"grants past the configured limit by raising it; the task ended at "
+                f"{attempt_text(task.attempt, task.max_attempts)}"
+            )
         # max_attempts plus the one attempt the policy may grant on the stronger model
         if task.attempt > task.max_attempts + 1:
             res.findings.append(

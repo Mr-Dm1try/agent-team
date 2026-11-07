@@ -84,7 +84,7 @@ def test_depth_counts_research_requests_along_the_parents() -> None:
     assert [research_depth(t, by_id) for t in by_id.values()] == [0, 1, 1, 2]
 
 
-def test_limits_refuse_past_the_depth_the_cap_or_an_earlier_refusal() -> None:
+def test_limits_refuse_past_the_depth_the_cap_an_earlier_round_or_the_last_attempt() -> None:
     limits = ResearchLimits(max_tasks=2, max_depth=1)
     planned = researcher()
     child = researcher(TaskOrigin.RESEARCH_REQUEST, planned)
@@ -92,8 +92,10 @@ def test_limits_refuse_past_the_depth_the_cap_or_an_earlier_refusal() -> None:
     assert "1 deep" in (limits.refusal(child, [planned, child]) or "")
     other = researcher(TaskOrigin.RESEARCH_REQUEST, planned)
     assert "its 2 requested" in (limits.refusal(planned, [planned, child, other]) or "")
-    refused = planned.model_copy(update={"may_request_research": False})
-    assert "already refused" in (limits.refusal(refused, [refused]) or "")
+    asked = planned.model_copy(update={"may_request_research": False})
+    assert "already asked" in (limits.refusal(asked, [asked]) or "")
+    last = planned.model_copy(update={"attempt": 3, "max_attempts": 3})
+    assert "last attempt" in (limits.refusal(last, [last]) or "")
     assert ResearchLimits(max_tasks=0).refusal(planned, [planned]) is not None
 
 

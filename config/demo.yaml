@@ -1,0 +1,78 @@
+# The live-demo config: default.yaml with the Researcher on Claude Haiku instead of
+# local gpt-oss, which is faster and steadier on stage. Use it with
+# `agent-team run "..." --config config/demo.yaml`. Everything else must match
+# default.yaml; tests/core/test_config.py checks that.
+# effort (low, medium, high, xhigh, max) sets how hard the model reasons: Claude's
+# effort, or Ollama's think level (xhigh and max become high). Cheap Claude roles
+# start at low, engineer and architect at medium; here the researcher is one of
+# the cheap Claude roles.
+defaults: {provider: anthropic, model: claude-haiku-5-5, context_budget: 90000, effort: low}
+agents:
+  researcher: {provider: anthropic, model: claude-haiku-5-5, effort: low}
+  architect: {provider: anthropic, model: claude-haiku-5-5, effort: medium}
+  engineer: {provider: anthropic, model: claude-haiku-5-5, effort: medium}
+# The stronger model gets one last attempt at a task that kept failing. Its prompt is
+# capped well below the defaults' budget, since it costs 20 times as much per token.
+stronger_model: {provider: anthropic, model: claude-sonnet-5-5, context_budget: 30000}
+fallbacks: [anthropic, ollama]
+# Model each provider uses when it stands in for another one.
+fallback_models: {anthropic: claude-haiku-5-5, ollama: "gpt-oss:20b"}
+# Kept at default.yaml's 60 minutes, which allow for a local Researcher; with every
+# agent on Claude, as here, 30 is enough.
+budget: {max_usd_per_run: 1.00, max_minutes_per_run: 60}
+# Research agents ask for mid-run: at most max_research_tasks per run, and at depth 1 a
+# task made from a request can't ask for more. Past a limit a task answers with what it
+# has and lists the rest as open gaps.
+limits:
+  {max_attempts: 3, max_upstream_reruns: 2, max_concurrent_calls: 4,
+   max_research_tasks: 6, max_research_depth: 1}
+review: auto_assumptions
+
+# Gateway details.
+# A provider that refuses a connection is skipped for provider_down_s seconds.
+retry: {delays_s: [1, 2, 4], provider_down_s: 60}
+rate_limits:
+  anthropic: {max_concurrent: 4, requests_per_minute: 50}
+  ollama: {max_concurrent: 1}
+# USD per million tokens, from Anthropic's model table as of 2026-10-06.
+prices:
+  claude-haiku-5-5: {input_per_mtok: 0.10, output_per_mtok: 0.50}
+  claude-sonnet-5-5: {input_per_mtok: 2.00, output_per_mtok: 10.00}
+providers:
+  anthropic:
+    timeout_s: 120
+    thinking: {type: adaptive}
+    # A thinking block whose earlier history was edited is dropped, not a 400.
+    on_history_edit: drop_block
+  # Ollama's native API, which loads the model with num_ctx; a model whose own limit is
+  # smaller gets that. reasoning_models: models that take an effort; others get none.
+  ollama:
+    base_url: "http://localhost:11434"
+    num_ctx: 32768
+    reasoning_models: [gpt-oss]
+    # Agent tasks at once on the local model; more would wait inside their timeout.
+    max_concurrent_tasks: 1
+# Fault injection; the --chaos flag overrides this.
+chaos: {rate: 0.0, faults: []}
+# Custom hooks as "module:function"; each function receives the event bus.
+hooks: []
+# Long-term memory: what each task is given from earlier runs, and how it is ranked.
+memory:
+  enabled: true
+  max_items: 10
+  max_tokens: 500
+  # Text match (0 to 1) a memory needs to be given, and what a decision or research
+  # fact from another run needs. A lesson goes only to the agent whose task taught it.
+  min_relevance: 0.3
+  strong_match: 0.6
+  # A new memory this close (cosine) to one of the same kind is merged into it.
+  merge_similarity: 0.92
+  recency_half_life_days: 30
+  weights: {cosine: 0.5, bm25: 0.3, recency: 0.1, usefulness: 0.1}
+  # Embeddings come from Ollama; when it is down, search uses BM25 alone.
+  embedder: {model: nomic-embed-text, timeout_s: 10, retry_after_s: 60}
+paths: {runs_dir: runs, db: runs/agent_team.db}
+# Docker sandbox for model-written code: network off except for install_deps.
+sandbox: {image: "python:3.12-slim", cpus: 1.0, memory: 1g, timeout_s: 120, install_timeout_s: 300}
+# Researcher web tools: timeouts and size caps.
+web: {timeout_s: 20, max_bytes: 2000000, max_chars: 10000, max_results: 8, max_calls_per_attempt: 30}

@@ -62,7 +62,7 @@ def test_run_answers_questions_from_stdin(config_file: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "Paginate the list?" in result.output
-    assert result.output.count(": waiting]") == 1  # blank lines don't repeat the question
+    assert result.output.count(": waiting for you]") == 1  # blank lines don't repeat the question
     assert "'Build a books API' is done." in result.output
 
 
@@ -205,20 +205,9 @@ def test_stats_of_one_run_and_of_all_runs(config_file: Path) -> None:
     assert one.exit_code == 0, one.output
     lines = _plain(one).splitlines()
     assert lines[0].startswith(f"run {run_id} (waiting): ")
-    assert lines[1].split() == [
-        "calls",
-        "tokens",
-        "in",
-        "tokens",
-        "out",
-        "cost",
-        "time",
-        "tasks",
-        "retries",
-        "1st",
-        "pass",
-    ]
-    assert lines[2].startswith("total ")
+    assert lines[1].split() == ["tokens", "tokens", "1st"]
+    assert lines[2].split() == ["calls", "in", "out", "cost", "time", "tasks", "retries", "pass"]
+    assert lines[3].startswith("total ")
     assert any(line.startswith("  product ") for line in lines), one.output
     assert lines[-1].startswith("time: inside each agent's attempts")
     # At the default width the run id and agent names stay whole.
@@ -230,6 +219,11 @@ def test_stats_of_one_run_and_of_all_runs(config_file: Path) -> None:
     assert any(line.startswith("  orchestrator ") for line in narrow_lines), narrow.output
     every = runner.invoke(cli.app, ["stats", "-c", str(config_file)], env=wide)
     assert any(line.startswith("all runs") for line in _plain(every).splitlines())
+    # Each run is listed once, with its title inline or on the line under it.
+    for columns in ("140", "80", "60"):
+        listed = runner.invoke(cli.app, ["stats", "-c", str(config_file)], env={"COLUMNS": columns})
+        assert listed.exit_code == 0, listed.output
+        assert sum(run_id in line for line in _plain(listed).splitlines()) == 1, listed.output
     unknown = runner.invoke(cli.app, ["stats", "run_nope", "-c", str(config_file)])
     assert unknown.exit_code == 1 and "No run run_nope in " in unknown.output
 

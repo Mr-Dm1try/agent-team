@@ -282,7 +282,8 @@ class OllamaProvider:
         }
         if effort is not None and model.split(":", 1)[0] in self.config.reasoning_models:
             body["think"] = _REASONING_EFFORT[effort]
-        if request.tools:
+        # Ollama has no tool choice, so a reply-only call goes without the tools.
+        if request.tools and request.tool_choice == "auto":
             body["tools"] = [
                 {
                     "type": "function",

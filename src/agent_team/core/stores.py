@@ -173,6 +173,9 @@ class SqliteTaskStore:
                         "kind": task.output_kind,
                         "objective": task.objective[:120],
                         "origin": task.origin.value,
+                        "parent": task.parent_task_id,
+                        "task_reason": task.reason,
+                        "max_attempts": task.max_attempts,
                     },
                 )
             )

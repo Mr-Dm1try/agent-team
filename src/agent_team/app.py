@@ -204,7 +204,7 @@ async def build_app(
         )
     bus.on_before(EventName.TOOL_CALL_BEFORE, make_precheck_hook(auditor, stores.tasks))
     if config.sandbox.commit_versions:
-        bus.on_after(EventName.AUDIT_VERDICT, make_commit_hook(stores.tasks))
+        bus.on_after(EventName.AUDIT_VERDICT, make_commit_hook(stores.tasks, stores.artifacts))
     if tools is None:
         try:
             tools, runner = await _build_tools(config, runs_dir, runner, closers)
@@ -252,9 +252,11 @@ async def build_app(
         auditor=auditor,
         research=research_limits,
         tool_log=tool_log,
+        decisions=stores.decisions,
     )
+    stronger = config.stronger_model
+    stronger_price = config.prices.get(stronger.model) if stronger else None
     if policy is None:
-        stronger = config.stronger_model
         limits = PolicyLimits(
             max_upstream_reruns=config.limits.max_upstream_reruns,
             stronger_model=stronger.model if stronger else PolicyLimits.stronger_model,
@@ -283,6 +285,8 @@ async def build_app(
             max_check_attempts=config.limits.max_check_attempts,
             max_upstream_reruns=config.limits.max_upstream_reruns,
             research=research_limits,
+            stronger_input_usd_per_mtok=stronger_price.input_per_mtok if stronger_price else None,
+            max_tasks_per_provider={"ollama": config.providers.ollama.max_concurrent_tasks},
         ),
         policy=policy,
     )

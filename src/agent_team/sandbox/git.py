@@ -11,7 +11,9 @@ change or stall it. The command tools create the repository before the first com
 runs, so the container only ever sees ``.git`` read-only, and the file tools refuse to
 write there: agents can't rewrite the history or plant config the host's git would run.
 A core dump (a file named ``core`` or ``core.*`` that is an ELF core file) is never
-committed, should a crash leave one.
+committed, should a crash leave one. Files the code writes when it runs (``GENERATED``:
+databases and Python caches) aren't part of the change either: they are left out of
+every version and every diff, unless the Engineer reports writing one on purpose.
 """
 
 from __future__ import annotations
@@ -19,11 +21,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
-from agent_team.core.artifacts import ArtifactRef
+from agent_team.core.artifacts import ArtifactRef, CodeChange
 from agent_team.core.errors import SandboxError
-from agent_team.core.interfaces import AfterHook, TaskStore
+from agent_team.core.interfaces import AfterHook, ArtifactStore, TaskStore
 from agent_team.core.models import AgentName, Event
 from agent_team.sandbox.base import ensure_gitignore
 
@@ -33,6 +36,16 @@ log = logging.getLogger(__name__)
 _ET_CORE = 4
 #: Paths a core dump can have: ``core`` or ``core.*`` in any folder.
 _CORE_PATHS = (":(glob)**/core", ":(glob)**/core.*")
+#: Files the code writes when it runs, such as a SQLite database a module creates on
+#: import, left out of every version and every diff.
+GENERATED = ("**/*.db", "**/*.sqlite", "**/*.sqlite3", "**/__pycache__/**", "**/*.pyc")
+_SKIP_GENERATED = tuple(f":(exclude,glob){g}" for g in GENERATED)
+_GENERATED_SUFFIXES = (".db", ".sqlite", ".sqlite3", ".pyc")
+
+
+def is_generated(path: str) -> bool:
+    """Whether a workspace path looks like a file the code writes when it runs."""
+    return path.endswith(_GENERATED_SUFFIXES) or "__pycache__" in path.split("/")
 
 
 def is_core_dump(path: Path) -> bool:
@@ -114,12 +127,25 @@ class WorkspaceGit:
         if not dot_git.is_dir():
             await self._git("init", "-q")
 
-    async def commit_version(self, ref: ArtifactRef, *, subject: str, body: str = "") -> str:
+    async def commit_version(
+        self, ref: ArtifactRef, *, subject: str, body: str = "", keep: Iterable[str] = ()
+    ) -> str:
         """Commit everything in the workspace for one artifact version, tag it and
-        return the commit sha. A version with no file changes still gets a commit."""
+        return the commit sha. A version with no file changes still gets a commit.
+        Generated files are left out, except those in ``keep``: the files the Engineer
+        reports writing, such as a seed database the spec plans."""
         await self.ensure_repo()
         dumps = await self.core_dumps()
-        await self._git("add", "-A", "--", ".", *(f":(exclude,literal){d}" for d in dumps))
+        await self._git(
+            "add", "-A", "--", ".", *_SKIP_GENERATED, *(f":(exclude,literal){d}" for d in dumps)
+        )
+        wanted = sorted(
+            p
+            for p in keep
+            if is_generated(p) and self._inside(p) and (self.workspace / p).is_file()
+        )
+        if wanted:
+            await self._git("add", "-f", "--", *(f":(literal){p}" for p in wanted))
         if dumps:
             log.warning("leaving core dumps out of the commit: %s", ", ".join(dumps))
             # One a version before this committed leaves the history from here on.
@@ -133,6 +159,13 @@ class WorkspaceGit:
         await self._git("tag", "-f", version_tag(ref))
         return (await self._git("rev-parse", "HEAD")).strip()
 
+    def _inside(self, path: str) -> bool:
+        """Whether a reported path is a relative path inside the workspace."""
+        if Path(path).is_absolute():
+            return False
+        root = self.workspace.resolve()
+        return (root / path).resolve().is_relative_to(root)
+
     async def core_dumps(self) -> list[str]:
         """The workspace's core dumps that git would see (tracked, or untracked and not
         ignored), found by name through git and confirmed by their ELF header, so
@@ -144,15 +177,24 @@ class WorkspaceGit:
         return sorted(n for n in names if is_core_dump(self.workspace / n))
 
     async def diff(self, old: ArtifactRef, new: ArtifactRef) -> str:
-        """The workspace diff between two committed versions."""
+        """The workspace diff between two committed versions, without generated files,
+        which a version from before they were left out may still hold."""
         return await self._git(
-            "diff", "--no-ext-diff", "--no-textconv", version_tag(old), version_tag(new)
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            version_tag(old),
+            version_tag(new),
+            "--",
+            ".",
+            *_SKIP_GENERATED,
         )
 
 
-def make_commit_hook(tasks: TaskStore) -> AfterHook:
+def make_commit_hook(tasks: TaskStore, artifacts: ArtifactStore | None = None) -> AfterHook:
     """An ``audit_verdict`` hook that commits the workspace when an Engineer version
-    passes. Failures are logged, never raised: a missing commit costs a diff, not the run."""
+    passes, keeping the generated-looking files its code change reports writing.
+    Failures are logged, never raised: a missing commit costs a diff, not the run."""
 
     async def hook(event: Event) -> None:
         """Commit the Engineer task's output version if its verdict passed."""
@@ -162,9 +204,13 @@ def make_commit_hook(tasks: TaskStore) -> AfterHook:
         if task.agent is not AgentName.ENGINEER or task.output is None:
             return
         run = await tasks.get_run(event.run_id)
+        written: list[str] = []
+        if artifacts is not None:
+            code = await artifacts.load(run.id, task.output)
+            written = code.files_written if isinstance(code, CodeChange) else []
         try:
             sha = await WorkspaceGit(run.workspace).commit_version(
-                task.output, subject=task.objective[:72], body=f"Task {task.id}"
+                task.output, subject=task.objective[:72], body=f"Task {task.id}", keep=written
             )
         except SandboxError:
             log.warning("couldn't commit %s for task %s", task.output, task.id, exc_info=True)

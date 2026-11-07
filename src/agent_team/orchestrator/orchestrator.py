@@ -16,7 +16,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 from agent_team.agents.planner import kind_from_objective, planning_objective
-from agent_team.core.artifacts import Artifact, CodeChange, Plan, Spec, plain_kind
+from agent_team.core.artifacts import Artifact, ArtifactRef, CodeChange, Plan, Spec, plain_kind
 from agent_team.core.models import (
     AgentName,
     Decision,
@@ -35,18 +35,25 @@ from agent_team.core.models import (
     Task,
     TaskOrigin,
     TaskStatus,
+    Verdict,
+    check_reason,
+    is_safety_stop,
     new_id,
+    seen_before,
+    stronger_attempts,
 )
 from agent_team.core.tracing import Tracer
 from agent_team.orchestrator.base import (
+    ESCALATION,
     PAUSING,
+    TASK_QUESTION,
     OrchestratorConfig,
 )
 from agent_team.orchestrator.control import create_user_task
 from agent_team.orchestrator.conversation import ConversationMixin
 from agent_team.orchestrator.decisions import DecisionsMixin
 from agent_team.orchestrator.dispatcher import INTERRUPTED, PAUSING_ERRORS
-from agent_team.orchestrator.lineage import ancestry
+from agent_team.orchestrator.lineage import ancestry, change_request_of
 from agent_team.orchestrator.phases import PhaseMachine, expert_tasks, is_work, reviewed
 from agent_team.orchestrator.planning import RULE as PIPELINE
 from agent_team.orchestrator.planning import expand_plan, implementation_tasks
@@ -108,13 +115,99 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
         return run
 
     async def resume(self, run_id: str) -> Reply:
-        """After a crash: interrupted attempts continue from their checkpoints."""
+        """After a crash: interrupted attempts continue from their checkpoints. A
+        finished run is only shown: nothing re-runs and no lifecycle event repeats."""
+        run = await self.tasks.get_run(run_id)
+        if run.status is RunStatus.DONE:
+            return await done_reply(run, await self.tasks.list_tasks(run_id), self.artifacts)
         for task in await self.tasks.list_tasks(run_id, status=TaskStatus.RUNNING):
             task.last_error = INTERRUPTED
             await self.tasks.update_task(task)
             await self.tasks.transition(task.id, TaskStatus.READY, reason="resumed after a stop")
         await self._set_status(run_id, RunStatus.ACTIVE)
+        await self._recheck_safety_stops(run)
         return await self.drive(run_id)
+
+    async def _recheck_safety_stops(self, run: Run) -> None:
+        """Check again a task whose check stopped the run on a safety finding that is
+        still waiting on the user, when the user had answered an earlier safety stop of
+        the task that this check didn't take into account: such a check judged tool
+        calls the user had already seen. Answers recorded before seen calls were kept
+        are counted first, so a run stopped that way is judged again, not asked again."""
+        tasks = await self.tasks.list_tasks(run.id)
+        for task in tasks:
+            output = task.output
+            if task.status is not TaskStatus.ESCALATED or not is_work(task) or output is None:
+                continue
+            asked = [
+                t
+                for t in tasks
+                if t.parent_task_id == task.id
+                and t.agent is AgentName.USER
+                and t.reason in (TASK_QUESTION, ESCALATION)
+            ]
+            for question in asked:
+                if question.status is TaskStatus.DONE:
+                    await self._note_seen_calls(run, task, question)
+            waiting = [q for q in asked if q.status is TaskStatus.WAITING]
+            latest = await self.verdicts.latest_for_task(task.id)
+            if not waiting or latest is None or latest.passed:
+                continue
+            if not any(is_safety_stop(f) for f in latest.blockers):
+                continue
+            # Seen calls recorded only after this check, for calls from before it.
+            after = [
+                d for d in await self.decisions.list(run.id) if d.created_at > latest.created_at
+            ]
+            seen = seen_before(after, task.id)
+            if seen is None or seen >= latest.created_at:
+                continue
+            if not await self._check_again(run, task, output, latest, waiting):
+                return  # paused, or the stop stands and the run is stopped again
+
+    async def _check_again(
+        self, run: Run, task: Task, output: ArtifactRef, stopped: Verdict, waiting: list[Task]
+    ) -> bool:
+        """Check an escalated task's output again for ``_recheck_safety_stops``. A pass
+        finishes the task and retires the questions ``waiting`` on the user; anything
+        else leaves them and the run stopped. Returns whether it passed."""
+        artifact = await self.artifacts.load(run.id, output)
+        check = await self._check_task(run, task)
+        try:
+            verdict = await self.dispatcher.check(check, task, artifact)
+        except PAUSING as exc:
+            await self._pause(run.id, exc)
+            return False
+        await self._save_verdict(verdict, check=check)
+        await self._record(
+            Decision(
+                run_id=run.id,
+                task_id=task.id,
+                kind=DecisionKind.RETRY,
+                inputs={
+                    "verdict_id": verdict.id,
+                    "stopped_by": stopped.id,
+                    "user_tasks": [q.id for q in waiting],
+                },
+                choice="finish the task" if verdict.passed else "keep the stop",
+                reason="its check stopped on tool calls the user had already seen, so it "
+                "was checked again without them",
+                made_by="code",
+                rule="recheck_seen_calls",
+            )
+        )
+        if not verdict.passed:
+            await self._set_status(run.id, RunStatus.STOPPED)
+            return False
+        for question in waiting:
+            await self.tasks.transition(
+                question.id, TaskStatus.SUPERSEDED, reason="the work passed its check again"
+            )
+        task = await self.tasks.get_task(task.id)
+        task.depends_on = [d for d in task.depends_on if d not in {q.id for q in waiting}]
+        task = await self.tasks.update_task(task)
+        await self._passed(run, task, artifact)
+        return True
 
     async def stop(self, run_id: str, reason: str = "stopped by the user") -> None:
         """The kill switch: the run halts at the next safe point and can be resumed."""
@@ -125,11 +218,21 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
     async def drive(self, run_id: str) -> Reply:
         """Run until the run is done, waits on the user, or stops. Each pass through a
         phase is a ``phase`` span under the run's root span."""
+        await self._restore_stronger_routes(run_id)
         passes = _PhasePasses(Tracer(self.bus))
         try:
             return await self._drive(run_id, passes)
         finally:
             await passes.close()
+
+    async def _restore_stronger_routes(self, run_id: str) -> None:
+        """Route tasks the policy sent to the stronger model there again, since routes
+        live in memory and a resumed or answered run may be in a new process. A task
+        that passed has its route cleared and stays on its own model."""
+        sent = stronger_attempts(await self.decisions.list(run_id))
+        for task in await self.tasks.list_tasks(run_id):
+            if task.id in sent and task.status not in (TaskStatus.DONE, TaskStatus.SUPERSEDED):
+                self.llm.use_stronger_model(task.id)
 
     async def _drive(self, run_id: str, passes: _PhasePasses) -> Reply:
         """The drive loop; ``passes`` keeps the current phase's span open."""
@@ -179,9 +282,24 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
 
             others = [t for t in ready if t.agent is not AgentName.ENGINEER]
             engineers = [t for t in ready if t.agent is AgentName.ENGINEER]
-            batch = others + engineers[:1]  # Engineer tasks share the workspace
+            # Engineer tasks share the workspace; a local model runs a few tasks at most.
+            batch = self._within_caps(others + engineers[:1])
             await asyncio.gather(*(self._run_task(run, t) for t in batch))
         return Reply(kind="error", text="Stopped: too many orchestration steps.", run_id=run_id)
+
+    def _within_caps(self, ready: list[Task]) -> list[Task]:
+        """The ready tasks that fit each provider's cap on tasks at once, in order; the
+        rest wait for the next round, so their timeout doesn't run while they queue."""
+        caps = self.config.max_tasks_per_provider
+        running: dict[str, int] = {}
+        batch: list[Task] = []
+        for t in ready:
+            provider = next(iter(self.llm.providers_for(t.agent, t.id)), "")
+            if provider in caps and running.get(provider, 0) >= caps[provider]:
+                continue
+            running[provider] = running.get(provider, 0) + 1
+            batch.append(t)
+        return batch
 
     async def _ready(self, run_id: str, phase: Phase) -> list[Task]:
         """Agent tasks in ``phase`` that can run now."""
@@ -263,15 +381,20 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
         if not decisions and not verdict.passed:
             decisions = await SimplePolicy().on_task_verdict(run, task, verdict, history)
         if not decisions:
-            await self.tasks.transition(task.id, TaskStatus.DONE, reason="audit passed")
-            self.llm.set_override(task.id, None)
-            if isinstance(artifact, Plan):
-                await self._after_plan(run, task, artifact)
-            elif isinstance(artifact, CodeChange) and artifact.spec_deviations:
-                await self._record_deviations(run, task, artifact)
+            await self._passed(run, task, artifact)
             return
         for decision in decisions:
             await self._apply(run, decision, verdict)
+
+    async def _passed(self, run: Run, task: Task, artifact: Artifact | None) -> None:
+        """A task's output passed its check: the task is done, its route goes back to
+        its own model, and a plan expands into the pipeline."""
+        await self.tasks.transition(task.id, TaskStatus.DONE, reason="audit passed")
+        self.llm.set_override(task.id, None)
+        if isinstance(artifact, Plan):
+            await self._after_plan(run, task, artifact)
+        elif isinstance(artifact, CodeChange) and artifact.spec_deviations:
+            await self._record_deviations(run, task, artifact)
 
     async def _after_plan(self, run: Run, task: Task, plan: Plan) -> None:
         """Expand a passed plan into the fixed pipeline of tasks."""
@@ -343,7 +466,12 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             and t.agent in (AgentName.ENGINEER, AgentName.QA)
         ]
         new_tasks = implementation_tasks(
-            spec, spec_task, run, previous=previous, max_attempts=self.config.max_attempts
+            spec,
+            spec_task,
+            run,
+            previous=previous,
+            max_attempts=self.config.max_attempts,
+            change_request=await self._open_change_request(tasks),
         )
         for t in new_tasks:
             await self.tasks.create_task(t)
@@ -356,6 +484,23 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             reason=f"spec done; {len(packages)} work package(s), run one at a time",
         )
         return True
+
+    async def _open_change_request(self, tasks: list[Task]) -> str | None:
+        """The user's latest change request while it is still being built: no QA review
+        after it has passed or been kept yet, so a rebuild of the code keeps it as its
+        objective."""
+        requests = [t for t in tasks if change_request_of(t) is not None]
+        if not requests:
+            return None
+        latest = max(requests, key=lambda t: t.created_at)
+        for t in tasks:
+            if t.agent is AgentName.QA and t.created_at > latest.created_at:
+                if t.status is TaskStatus.DONE:
+                    return None
+                verdict = await self.verdicts.latest_for_task(t.id)
+                if verdict is not None and verdict.passed:
+                    return None
+        return change_request_of(latest)
 
     async def _record_pipeline(
         self,
@@ -447,7 +592,7 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
     async def _check_task(self, run: Run, subject: Task | None) -> Task:
         """The auditor task that checks ``subject``'s current attempt (or the run): the
         one left unfinished by a crash or pause, else a new one."""
-        reason = f"check of attempt {subject.attempt}" if subject else "check of the run"
+        reason = check_reason(subject.attempt) if subject else "check of the run"
         parent = subject.id if subject else None
         for t in await self.tasks.list_tasks(run.id):
             if (

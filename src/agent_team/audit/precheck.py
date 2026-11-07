@@ -140,6 +140,7 @@ class ToolPrecheck:
             + "\n".join(f"- {r.id} {r.title}: {r.statement}" for r in rules)
             + f"\n\nAgent: {task.agent.value}, task objective: {task.objective}"
             + f"\nWorkspace: {run.workspace}"
+            + (f"\nSandbox: {patterns.SANDBOX_FACTS}" if tool in patterns.SANDBOX_TOOLS else "")
             + f"\nTool: {tool}\nArguments: {args!r}"[:4000]
             + "\nWhy code flagged it: "
             + "; ".join(why for _, why in unclear)
@@ -206,7 +207,7 @@ def classify(
         external = patterns.external_hosts(command, allowed_hosts)
         if external and not uploads:
             unclear.append(("S7", f"reaches {', '.join(external)}"))
-        if patterns.is_unclear_command(command):
+        if patterns.is_unclear_command(command, sandboxed=tool in patterns.SANDBOX_TOOLS):
             unclear.append(("S5", f"unusual command: {command[:200]}"))
 
     if tool == "install_deps":

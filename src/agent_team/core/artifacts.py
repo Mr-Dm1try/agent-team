@@ -9,9 +9,9 @@ and R9 check these links with code, so field names here are part of the contract
 from __future__ import annotations
 
 import re
-from typing import Annotated, Literal, get_args
+from typing import Annotated, Any, Literal, get_args
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from agent_team.core.base import Contract
 
@@ -67,11 +67,70 @@ class ResearchRequest(Contract):
     why: str
 
 
+#: Words that mark a note about how a source was read, not its title: "opened in this
+#: attempt at offset 361000", "first 10,000 of 27,246 characters", "header only".
+_READ_NOTE = re.compile(
+    r"\boffset\s*=?\s*\d|\bcharacters\s+\d[\d,]*\s*(?:-|to)\s*\d"
+    r"|\b\d[\d,]*\s+of\s+\d[\d,]*\s+characters\b|\bthis attempt\b|\bheader only\b"
+    r"|\bnot (?:reached|read|re-?verified)\b",
+    re.IGNORECASE,
+)
+#: A bracketed aside in a title after a space, such as "(opened for its header only)";
+#: "seek(offset)" is part of the name.
+_ASIDE = re.compile(r"\s+[(\[]([^()\[\]]*)[)\]]")
+#: Where a title splits into parts: a semicolon, a comma, or a spaced dash.
+_TITLE_PARTS = re.compile(r"(\s*;\s*|,\s+|\s+[-\u2013\u2014]\s+)")
+
+
+def split_read_notes(title: str) -> tuple[str, list[str]]:
+    """``title`` without its notes on how the source was read, and those notes. Only
+    asides and trailing parts are taken, so the title's first part always stays."""
+    notes: list[str] = []
+
+    def aside(m: re.Match[str]) -> str:
+        """Drop a bracketed aside that is a read note, keeping it in ``notes``."""
+        if _READ_NOTE.search(m[1]):
+            notes.append(m[1].strip())
+            return ""
+        return m[0]
+
+    parts = _TITLE_PARTS.split(_ASIDE.sub(aside, title).strip())
+    tail: list[str] = []
+    while len(parts) > 1 and _READ_NOTE.search(parts[-1]):
+        tail.insert(0, parts[-1].strip())
+        del parts[-2:]
+    return "".join(parts).strip(), notes + tail
+
+
 class Source(Contract):
     """A file or URL the Researcher actually opened in this attempt."""
 
     ref: str  # URL or path the Researcher actually opened
-    title: str | None = None
+    title: str | None = Field(
+        default=None,
+        description="The page or file title only, as the user would read it. How you read "
+        "it goes in `read`, not here.",
+    )
+    read: str | None = Field(
+        default=None,
+        description="Which part you read, such as 'characters 0-10000 of 27246'. Kept "
+        "for the audit trail; the user isn't shown it.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_notes_out_of_the_title(cls, data: Any) -> Any:
+        """Move notes on how the source was read from ``title`` into ``read``, so the
+        title the user sees is the page's own."""
+        if not isinstance(data, dict) or not isinstance(data.get("title"), str):
+            return data
+        read = data.get("read")
+        if read is not None and not isinstance(read, str):
+            return data  # left for the field's own check to reject
+        title, notes = split_read_notes(data["title"])
+        if not notes:
+            return data
+        return {**data, "title": title or None, "read": "; ".join([r for r in [read] if r] + notes)}
 
 
 class ArtifactBase(Contract):
@@ -293,8 +352,18 @@ class ResearchAnswer(ArtifactBase):
 
     kind: Literal["research_answer"] = "research_answer"
     question: str
-    answer: str
+    answer: str = Field(
+        description="The answer as the user reads it. Say plainly if part of the question "
+        "stays unanswered, but leave out how you researched it, such as which parts of a "
+        "page you read or what you didn't re-check; that goes in `gaps`.",
+    )
     sources: list[Source] = Field(min_length=1)
+    gaps: list[str] = Field(
+        default_factory=list,
+        description="Notes on how the answer was researched, one line each, such as a part "
+        "of a source you didn't read or a claim you didn't re-check. Kept for the audit "
+        "trail; the user isn't shown it.",
+    )
 
 
 Artifact = Annotated[

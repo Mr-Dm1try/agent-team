@@ -83,6 +83,9 @@ class LLMRequest(Contract):
     system: str
     messages: list[Message]
     tools: list[ToolSpec] = Field(default_factory=list)
+    #: "none" sends the tools (a history with tool calls needs them) but lets the model
+    #: only reply, so a loop near its step limit gets an answer instead of another call.
+    tool_choice: Literal["auto", "none"] = "auto"
     #: Covers thinking as well as the answer, so it is set well above a typical reply.
     max_tokens: int = 16_000
     run_id: str

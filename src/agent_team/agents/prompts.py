@@ -45,15 +45,25 @@ can read and from the web, and return them with their sources.
 
 - Use list_dir, grep and read_file on the workspace and the --context folders; use
   web_search and web_fetch when available and the answer isn't in the files.
+- web_fetch returns a page a part at a time. When the part you need isn't in what came
+  back, read on with the offset the result gives; fetching the same URL again only
+  returns the part you already have, and every call counts against your web calls.
 - Every finding cites at least one source you actually opened in this attempt: a file
-  path you read or a URL you fetched. Never cite a source you didn't open.
+  path you read or a URL you fetched. Never cite a source you didn't open, or one whose
+  part that backs the claim you didn't read: read on to that part, or drop the source.
+- A source's `title` is the page or file's own title. Which part you read goes in its
+  `read` field, not in the title.
 - A package version is a claim too. Before you pin one (mcp==1.2.0), fetch
   https://pypi.org/pypi/<package>/json, which lists every released version, and cite
   it; a version no source you opened shows fails the check.
 - Your objective is the research question. Answer it, and any sub-questions you need,
   in `answers`. If you can't, set `answer` to null and say why in `gap`.
-- For a research_answer, write a direct answer to the user's question and list the
-  sources it rests on.
+- For a research_answer, write a direct answer to the user's question from the input
+  briefs and list the sources it rests on. Don't contradict the briefs, such as by
+  pinning another version than they found, and follow the user's guidance on them.
+  The user reads `answer` as it is: write the answer, not how it was researched. If
+  part of the question stays unanswered, say so plainly in the answer. Notes on which
+  parts of a source were or weren't read or re-checked go in `gaps`, not the answer.
 """
 
 PRODUCT = """\
@@ -123,6 +133,10 @@ to end where you can.
   Each command runs in a fresh sandbox with no network, so start the app and call it
   in one command (["sh", "-c", "..."], calling it with python). Packages the Engineer
   installed are already there; add any you need with install_deps.
+- The sandbox has no curl or wget: call the app from Python, with urllib.request or
+  httpx. Start a server in a Python script with subprocess.Popen, keep its PID and
+  stop only that process (terminate, then wait) when you are done. Never look for it
+  by scanning /proc or with pkill or killall.
 - Report one result per acceptance criterion: pass, fail or not_checked, with concrete
   evidence such as a command and its output or a file and line.
 - Report problems in `issues`, with severity blocker for anything that breaks an
@@ -136,30 +150,45 @@ from the user. The user doesn't know how the team works inside: no task ids, no
 artifact names. They say things like "make it paginate" or "yes, Postgres". Work out
 what they mean from the run's state, then act through the tools.
 
+First sort the message; it can be more than one of these:
+- build: new software to build. Call start_run with kind build.
+- research_question: a question to research and answer with sources, such as "How do
+  you run a FastMCP server over stdio?", that isn't about a run. Call start_run with
+  kind research_question. Never answer it yourself from memory: the team researches
+  it and answers with the sources it opened. This holds with no run in progress too.
+- run_question: a question about the run, in progress or finished, such as "why did
+  the spec retry?" or "which pages did the researcher open?". Read what you need (a
+  few calls), then answer it in the reply. It needs no action.
+- change: the user wants the run's result changed. Call request_change.
+- answer: it answers or approves an item waiting on the user. Call answer_pending.
+- stop: the user asks to stop the run. Call stop_run.
+- preference: a lasting preference about how the team should work.
+- unclear: you can't tell. Take no action and ask one short, plain clarifying
+  question in the reply. Never guess an action.
+
+The tools:
 - Read first when you need to: list_tasks, get_task, get_artifact (the plan, prd and
   spec say what was asked and designed), get_verdicts, list_decisions, read_trace.
-- answer_pending: when the message answers an item waiting on the user. Pass that
+- answer_pending (offered only while something waits on the user): pass the waiting
   item's task_id and the user's own words for it. A message can answer several items.
   For a review pass "approve" (when the user approves, in any words) or their comment;
-  for a change confirmation pass "yes" or "no".
-- request_change: when the user wants the run's result changed. Read the plan, prd and
-  spec, then pick the first artifact the change touches as target: "prd" for new or
-  changed behaviour, "spec" for a design change, "code_change" for a code-only change,
-  "plan" when the asks themselves change. This only proposes the change; the user
-  confirms it before anything is redone.
+  for a change or stop confirmation pass "yes" or "no".
+- request_change: read the plan, prd and spec, then pick the first artifact the change
+  touches as target: "prd" for new or changed behaviour, "spec" for a design change,
+  "code_change" for a code-only change, "plan" when the asks themselves change. This
+  only proposes the change; the user confirms it before anything is redone.
 - start_run: for new work unrelated to the run in progress, or when no run exists.
-- stop_run: only when the user asks to stop.
-- remember_preference: when the user states a lasting preference about how the team
-  should work, such as "always use type hints" or "I prefer pytest". Pass it in a short
-  sentence of its own. It is kept for later runs, so skip one-off choices for this run.
-- A question about the run needs no action: read, then answer it in the reply.
-- One message can need several actions, such as an answer and a change.
-- If you can't tell what the user means, take no action and ask one short, plain
-  clarifying question in the reply. Never guess an action.
+- stop_run: only when the user asks to stop, with their reason. Never call it to end
+  your turn or as a placeholder. A finished run can't be stopped.
+- remember_preference: pass the preference in a short sentence of its own, such as
+  "always use type hints". It is kept for later runs, so skip one-off choices.
+- Every argument holds the real value, never a placeholder such as "placeholder",
+  "TBD" or "<reason>".
 
-When done, reply with only JSON: {"reply": "..."}. The reply is shown to the user: plain
-words, no task ids or other internal ids, and no artifact names such as prd or
-code_change unless the user used them. Say what you did and what happens next.
+When done, reply with only JSON: {"kinds": ["run_question"], "reply": "..."}. The
+reply is shown to the user: plain words, no task ids or other internal ids, and no
+artifact names such as prd or code_change unless the user used them. Say what you did
+and what happens next.
 """
 
 

@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_team.core.artifacts import Artifact
+from agent_team.core.artifacts import Artifact, plain_kind
 from agent_team.core.errors import BudgetExceeded, RunStopped
 from agent_team.core.interfaces import (
     ArtifactStore,
@@ -23,6 +23,7 @@ from agent_team.core.interfaces import (
 from agent_team.core.models import (
     AUDIT_RULE,
     DANGEROUS_ACTION_RULES,
+    SEEN_CALLS,
     AgentName,
     Decision,
     DecisionKind,
@@ -30,6 +31,7 @@ from agent_team.core.models import (
     EventName,
     Feedback,
     FeedbackSource,
+    Finding,
     Phase,
     RequestKind,
     ReviewMode,
@@ -39,6 +41,7 @@ from agent_team.core.models import (
     TaskOrigin,
     TaskStatus,
     Verdict,
+    is_safety_stop,
 )
 from agent_team.core.tracing import Tracer
 from agent_team.llm.types import LLMClient
@@ -58,8 +61,75 @@ RUN_QUESTION = "run_audit"
 TASK_QUESTION = "policy"
 #: The user-task reason for a question about a task that is stuck.
 ESCALATION = "escalation"
-#: Added to questions about work the user may keep as it is.
-KEEP_HINT = " Reply 'approve' to keep the work as it is."
+
+
+#: QA rules whose blockers the code must fix: planned files that don't exist (R5) and
+#: the blocking issues in QA's review (R7).
+CODE_RULES = frozenset({"R5", "R7"})
+#: Guidance that names the code, so another try of QA's review reruns the code first.
+NAMES_CODE = re.compile(r"\b(code|engineer|implement\w*)\b|\.py\b", re.I)
+#: Words that name a code without meaning the code, such as "exit code 5".
+OTHER_CODES = re.compile(r"\b(exit|status|error|return|http|response)\s+codes?\b", re.I)
+#: Guidance that says to leave the code alone, such as "don't touch the code".
+LEAVE_CODE = re.compile(
+    r"\b(don't|do not|not|never|without|leave)\b(\W+\w+){0,3}?\W+(code|engineer)\b", re.I
+)
+
+
+def code_blockers(verdict: Verdict | None) -> list[Finding]:
+    """The blockers of a failed check that the code must fix: findings on a code
+    change, and QA's own code rules."""
+    if verdict is None or verdict.passed:
+        return []
+    return [
+        f
+        for f in verdict.blockers
+        if (f.artifact is not None and f.artifact.kind == "code_change") or f.rule_id in CODE_RULES
+    ]
+
+
+def names_code(guidance: str) -> bool:
+    """Whether guidance asks for work on the code: it names the code, an Engineer or a
+    Python file, and doesn't say to leave the code alone."""
+    text = OTHER_CODES.sub("", guidance)
+    return NAMES_CODE.search(text) is not None and LEAVE_CODE.search(text) is None
+
+
+def reruns_code(task: Task, verdict: Verdict | None, guidance: str = "") -> bool:
+    """Whether guidance for another try of a stuck QA review reruns the code first:
+    its check failed on the code, or the guidance names the code. Guidance that says
+    to leave the code alone never does."""
+    if task.agent is not AgentName.QA or LEAVE_CODE.search(guidance):
+        return False
+    return bool(code_blockers(verdict)) or names_code(guidance)
+
+
+def rerun_of(task: Task, verdict: Verdict | None) -> str:
+    """The work that guidance for another try of ``task`` reruns, as the user says it."""
+    if task.agent is not AgentName.QA:
+        return plain_kind(task.output_kind)
+    if reruns_code(task, verdict):
+        return "the code, then the QA check"
+    return "the QA check (guidance that names the code reruns the code first)"
+
+
+def reply_options(*, keep: bool, stopped: bool = False, rerun: str | None = None) -> str:
+    """The replies a question about one stuck or failing task takes, in one sentence:
+    guidance for another try (of ``rerun``, when given), 'approve' when the work may
+    be kept as it is, and 'stop' unless the run is already stopped."""
+    retry = (
+        f"Reply with guidance for another try of {rerun}"
+        if rerun
+        else ("Reply with guidance for another try")
+    )
+    approve = "'approve' to keep the work as it is" if keep else ""
+    if stopped:
+        tail = f", or {approve}" if approve else ""
+        return f"{retry}{tail}; until then the run stays stopped."
+    middle = f" {approve}," if approve else ""
+    return f"{retry},{middle} or 'stop' to stop the run."
+
+
 PAUSING = (BudgetExceeded, RunStopped)
 
 
@@ -74,6 +144,11 @@ class OrchestratorConfig:
     max_check_attempts: int = 3
     max_upstream_reruns: int = 2
     research: ResearchLimits = field(default_factory=ResearchLimits)
+    #: The stronger model's price per million prompt tokens, for its decision's cost.
+    stronger_input_usd_per_mtok: float | None = None
+    #: Agent tasks that may run at once on each provider, by name; a provider not
+    #: named has no cap of its own.
+    max_tasks_per_provider: dict[str, int] = field(default_factory=dict)
     max_loops: int = 500  # safety valve for drive()
 
 
@@ -114,6 +189,45 @@ class OrchestratorBase:
     async def _audit(self, run: Run, task: Task, artifact: Artifact | None) -> None:
         """The task sweep; the mixins call it and Orchestrator implements it."""
         raise NotImplementedError  # the task sweep lives in Orchestrator
+
+    async def _note_seen_calls(self, run: Run, task: Task, question: Task) -> bool:
+        """The user answered ``question`` about ``task``'s check. If that check stopped
+        on a safety finding about a tool call that already ran, record that the user
+        has seen the calls it judged, so later checks of the task don't stop on them
+        again. Returns whether it recorded that; once per question."""
+        judged = [
+            v for v in await self.verdicts.for_task(task.id) if v.created_at <= question.created_at
+        ]
+        if not judged or judged[-1].passed:
+            return False
+        verdict = judged[-1]
+        flagged = [f for f in verdict.blockers if is_safety_stop(f)]
+        if not flagged or any(f.rule_id == AUDIT_RULE for f in verdict.blockers):
+            return False  # nothing to see, or the model never judged the calls
+        if any(
+            d.rule == SEEN_CALLS and d.inputs.get("user_task") == question.id
+            for d in await self.decisions.list(run.id)
+        ):
+            return False
+        await self._record(
+            Decision(
+                run_id=run.id,
+                task_id=task.id,
+                kind=DecisionKind.ASK_USER,
+                inputs={
+                    "user_task": question.id,
+                    "verdict_id": verdict.id,
+                    "finding_ids": [f.id for f in flagged],
+                    "seen_before": verdict.created_at.isoformat(),
+                },
+                choice="count the tool calls that check judged as seen",
+                reason="the user answered the check's safety finding: "
+                + "; ".join(f"{f.rule_id} {f.message}" for f in flagged)[:500],
+                made_by="code",
+                rule=SEEN_CALLS,
+            )
+        )
+        return True
 
     async def _apply(self, run: Run, d: Decision, verdict: Verdict | None = None) -> None:
         """Carry out one decision; the mixins call it and DecisionsMixin implements it."""
@@ -250,7 +364,9 @@ class OrchestratorBase:
 def can_keep(task: Task, verdict: Verdict | None) -> bool:
     """Whether the user may keep this task's output although ``verdict`` failed it: the
     output exists and isn't the plan (the pipeline is built from it), and the check
-    didn't fail closed or find a dangerous action, which are never waved through."""
+    didn't fail closed or find a dangerous action, which are never waved through. The
+    user's guidance on a dangerous action retries the work instead, and the calls that
+    check judged count as seen (``_note_seen_calls``)."""
     if task.output is None or task.output_kind == "plan":
         return False
     if verdict is None or verdict.passed:

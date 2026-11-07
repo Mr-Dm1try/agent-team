@@ -6,6 +6,7 @@ fields) are safe; renames and removals touch every package that uses them.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -224,6 +225,67 @@ class Run(Contract):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
+#: The reason on a check of one task names the attempt it checks.
+_CHECK_REASON = "check of attempt {attempt}"
+_CHECKED = re.compile(r"^check of attempt (\d+)$")
+
+
+def check_reason(attempt: int) -> str:
+    """The reason on the check of a task's ``attempt``."""
+    return _CHECK_REASON.format(attempt=attempt)
+
+
+def checked_attempt(reason: str | None) -> int | None:
+    """The attempt a check's reason names, or None for the run's check or another task."""
+    found = _CHECKED.match(reason or "")
+    return int(found.group(1)) if found else None
+
+
+def attempt_text(
+    attempt: int, max_attempts: int = 0, *, stronger: bool = False, word: str = "attempt"
+) -> str:
+    """An attempt as people and the auditor read it: "attempt 2/3", "attempt 2" when
+    the limit isn't known, and "attempt 4/4 on the stronger model" for one the policy
+    granted past the limit on the stronger model. ``word`` replaces "attempt"."""
+    text = f"{word} {attempt}/{max_attempts}" if max_attempts else f"{word} {attempt}"
+    return f"{text} on the stronger model" if stronger else text
+
+
+def stronger_attempts(decisions: list[Decision]) -> dict[str, int]:
+    """The first attempt each task ran on the stronger model, by task id, from the
+    decisions that sent it there; the stronger route then stays with the task."""
+    out: dict[str, int] = {}
+    for d in decisions:
+        attempt = d.inputs.get("attempt")
+        if d.kind is DecisionKind.STRONGER_MODEL and d.task_id and isinstance(attempt, int):
+            out.setdefault(d.task_id, attempt)
+    return out
+
+
+#: The ``rule`` of the decision that records the user answering a safety finding.
+SEEN_CALLS = "seen_calls"
+
+
+def is_safety_stop(finding: Finding) -> bool:
+    """Whether a blocker is about a tool call that already ran: a dangerous action
+    (S5, S6, S7) or a helper hit marked ``already_happened``."""
+    return finding.rule_id in DANGEROUS_ACTION_RULES or finding.already_happened
+
+
+def seen_before(decisions: list[Decision], task_id: str) -> datetime | None:
+    """The end of the task's tool calls the user has seen: the latest check whose
+    safety findings the user answered, from the ``SEEN_CALLS`` decisions. Calls up to
+    that time were judged then, so later checks leave them out of the safety rules."""
+    times = [
+        datetime.fromisoformat(d.inputs["seen_before"])
+        for d in decisions
+        if d.rule == SEEN_CALLS
+        and d.task_id == task_id
+        and isinstance(d.inputs.get("seen_before"), str)
+    ]
+    return max(times, default=None)
+
+
 class Task(Contract):
     """One unit of delegated work: an agent, an objective, inputs and the artifact
     kind it must produce. Tracks its attempts, output, last error and lineage."""
@@ -299,6 +361,9 @@ class TaskEnvelope(Contract):
     constraints: list[str] = Field(default_factory=list)
     memories: list[str] = Field(default_factory=list)  # pre-rendered "Relevant memory" lines
     feedback: list[Feedback] = Field(default_factory=list)  # answers, comments, findings
+    #: The user's answers and comments on the inputs this task builds on, such as the
+    #: briefs a research answer is written from, so the answer follows that guidance.
+    input_feedback: list[Feedback] = Field(default_factory=list)
     findings: list[Finding] = Field(default_factory=list)  # from the last failed verdict
     previous_output: Artifact | None = None  # set on retries and revisions
     upstream_diff: str | None = None  # set on revisions

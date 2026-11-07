@@ -2,8 +2,8 @@
 search memory.
 
 ``run`` and ``resume`` show the run live and talk to the team (see ui/session.py).
-While the run waits on you, each line typed is sent as a message; end the input
-(Ctrl-D) to leave the run waiting, and pick it up later with ``resume``. When it is
+Each line typed is sent as a message, while the team works too ("stop" stops it); end
+the input (Ctrl-D) to leave the run waiting, and pick it up later with ``resume``. When it is
 done you accept it or describe a change.
 
 At startup ``entry`` reads ``.env`` from the current folder, so the API key can live
@@ -13,17 +13,15 @@ there instead of in the shell. Variables already set in the shell win.
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.table import Column, Table
 
 from agent_team import __version__
 from agent_team.app import App, build_app
@@ -33,15 +31,22 @@ from agent_team.core.db import Database
 from agent_team.core.errors import SandboxError
 from agent_team.core.events import InMemoryEventBus
 from agent_team.core.interfaces import Embedder
-from agent_team.core.models import Event, MemoryKind, RunStatus
+from agent_team.core.models import MemoryKind, RunStatus
 from agent_team.core.stores import SqliteDecisionLog, SqliteTaskStore
-from agent_team.core.tracing import JsonlTracer, load_spans, read_events, render_tree, span_tree
+from agent_team.core.tracing import (
+    JsonlTracer,
+    format_event,
+    load_spans,
+    read_events,
+    render_tree,
+    span_tree,
+)
 from agent_team.llm.chaos import parse_chaos
 from agent_team.memory import open_search
 from agent_team.memory.rank import line
 from agent_team.orchestrator.base import mark_stopped
 from agent_team.ui.session import Session
-from agent_team.ui.stats import FOOTNOTE, HEADER, heading, overview_table, run_stats, run_table
+from agent_team.ui.stats import FOOTNOTE, heading, layout, overview_table, run_stats, run_table
 
 app = typer.Typer(help="Multi-agent harness: Planning, PRD, Spec and Implementation.")
 memory_app = typer.Typer(help="Long-term memory from earlier runs.")
@@ -305,25 +310,17 @@ async def _stats(config: Config, run_id: str | None) -> int:
                 return 1
             console.print(heading(one), highlight=False, markup=False)
             rows = run_table(one)
-            extra: tuple[str, ...] = ()
+            titled = False
         else:
             runs = await tasks.list_runs()
             if not runs:
                 typer.echo(f"No runs yet in {config.paths.db_file()}.")
                 return 0
             rows = overview_table([await run_stats(r.id, tasks, runs_dir) for r in runs])
-            extra = ("title",)
-    name, *numbers = HEADER
-    # Ids, names and numbers never wrap; on a narrow terminal only a title is cut.
-    columns = [
-        Column(name, no_wrap=True),
-        *(Column(h, justify="right", no_wrap=True) for h in numbers),
-        *(Column(h, no_wrap=True, overflow="ellipsis") for h in extra),
-    ]
-    table = Table(*columns, box=None, pad_edge=False, collapse_padding=True)
-    for r in rows:
-        table.add_row(*r)
-    console.print(table)
+            titled = True
+    # Ids, names and numbers never wrap or cut; only a title is cut, or moves below.
+    for part in layout(rows, console.width, titled=titled):
+        console.print(part, highlight=False, markup=False)
     console.print(FOOTNOTE, style="dim", highlight=False, markup=False)
     return 0
 
@@ -331,26 +328,6 @@ async def _stats(config: Config, run_id: str | None) -> int:
 def _no_run(config: Config, run_id: str) -> str:
     """The message for a run id the database doesn't have, naming where it looked."""
     return f"No run {run_id} in {config.paths.db_file()}."
-
-
-def format_event(event: Event) -> str:
-    """One log line: time, agent, task and attempt, event name and its data."""
-    who = event.agent.value if event.agent else "-"
-    where = f"{event.task_id}#{event.attempt}" if event.task_id else "-"
-    data = json.dumps(_short(event.data), ensure_ascii=False, default=str)
-    return f"{event.ts:%H:%M:%S.%f}"[:-3] + f"  {who:<12} {where:<24} {event.name.value}  {data}"
-
-
-def _short(value: Any, limit: int = 200) -> Any:
-    """``value`` with long strings cut, so one event stays on one readable line."""
-    if isinstance(value, str):
-        value = value.replace("\n", " ")
-        return value if len(value) <= limit else value[:limit] + "..."
-    if isinstance(value, dict):
-        return {k: _short(v, limit) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_short(v, limit) for v in value]
-    return value
 
 
 if __name__ == "__main__":

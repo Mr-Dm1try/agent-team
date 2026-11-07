@@ -19,13 +19,18 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from rich.table import Column, Table
+from rich.text import Text
 
 from agent_team.core.errors import OWN_OUTPUT_ERRORS
 from agent_team.core.interfaces import TaskStore
 from agent_team.core.models import AgentName, Event, EventName, Run, Task, TaskOrigin
 from agent_team.core.tracing import SpanRecord, read_events, spans_from_events
+from agent_team.ui.view import compact, short
 
 #: Agents whose tasks are audited work, not checks or questions.
 WORK_AGENTS = frozenset(a for a in AgentName if a not in (AgentName.AUDITOR, AgentName.USER))
@@ -161,13 +166,16 @@ def _time(seconds: float) -> str:
     return f"{minutes}m{secs:02d}s"
 
 
-HEADER = ("", "calls", "tokens in", "tokens out", "cost", "time", "tasks", "retries", "1st pass")
+#: Two-line headers keep the number columns as narrow as their numbers.
+HEADER = ("", "calls", "tokens\nin", "tokens\nout", "cost", "time", "tasks", "retries", "1st\npass")
 #: Printed under the table, so the time column can't be misread.
 FOOTNOTE = (
     "time: inside each agent's attempts (checks for the auditor); for a run, while any "
     "attempt ran. 1st pass: share of tasks, fixes left out, whose first check passed "
     "with no invalid output before it."
 )
+#: The least room a title column is worth; with less, titles go under the table.
+MIN_TITLE = 12
 
 
 def row(name: str, stats: Stats) -> tuple[str, ...]:
@@ -175,14 +183,74 @@ def row(name: str, stats: Stats) -> tuple[str, ...]:
     return (
         name,
         str(stats.calls),
-        f"{stats.input_tokens:,}",
-        f"{stats.output_tokens:,}",
+        compact(stats.input_tokens),
+        compact(stats.output_tokens),
         f"${stats.cost_usd:.4f}",
         _time(stats.seconds),
         str(stats.tasks),
         str(stats.retries),
         _rate(stats),
     )
+
+
+def layout(rows: list[tuple[str, ...]], width: int, *, titled: bool = False) -> list[Table | Text]:
+    """The table for a terminal ``width`` wide. Names and numbers always show whole: each
+    column is as wide as its longest cell. With ``titled``, each row ends in a run's
+    title, which gets the room left, cut to fit; when too little is left, the titles go
+    on their own lines under the table instead."""
+    titles = [r[-1] for r in rows] if titled else []
+    cells = [r[:-1] for r in rows] if titled else rows
+    widths = [
+        max(len(part) for text in (head, *(r[i] for r in cells)) for part in text.split("\n"))
+        for i, head in enumerate(HEADER)
+    ]
+    # One space before every column but the first, and before the title.
+    room = width - sum(widths) - len(widths)
+    inline = titled and room >= MIN_TITLE
+    name, *numbers = HEADER
+    columns = [
+        Column(name, width=widths[0], no_wrap=True),
+        *(
+            Column(h, justify="right", width=w, no_wrap=True)
+            for h, w in zip(numbers, widths[1:], strict=True)
+        ),
+    ]
+    if titled and not inline:
+        return _with_titles_below(cells, titles, widths, width)
+    if inline:
+        longest = max(len("title"), *(len(t) for t in titles))
+        columns.append(Column("title", width=min(room, longest), no_wrap=True))
+    table = Table(*columns, box=None, padding=(0, 0, 0, 1), pad_edge=False)
+    for cell, title in zip(cells, titles if inline else [None] * len(cells), strict=True):
+        table.add_row(*cell, *(() if title is None else (title,)))
+    return [table]
+
+
+def _with_titles_below(
+    cells: list[tuple[str, ...]], titles: list[str], widths: list[int], width: int
+) -> list[Table | Text]:
+    """The table as lines, each run's title on the line under its row, marked and cut
+    to fit, so every run is listed once."""
+
+    def line(parts: Iterable[str]) -> Text:
+        """One line of cells: the name to the left, the numbers to the right."""
+        first, *rest = parts
+        cols = [
+            first.ljust(widths[0]),
+            *(p.rjust(w) for p, w in zip(rest, widths[1:], strict=True)),
+        ]
+        return Text(" ".join(cols).rstrip(), no_wrap=True, overflow="ignore")
+
+    heads = [h.split("\n") for h in HEADER]
+    out: list[Table | Text] = [
+        line(h[0] if len(h) > 1 else "" for h in heads),
+        line(h[-1] for h in heads),
+    ]
+    for cell, title in zip(cells, titles, strict=True):
+        out.append(line(cell))
+        if title:
+            out.append(Text("  title: " + short(title, max(width - 9, 1)), no_wrap=True))
+    return out
 
 
 def heading(stats: RunStats) -> str:

@@ -238,6 +238,28 @@ async def test_stronger_model_override(sleeps: Sleeps) -> None:
     assert gw.providers_for(AgentName.PRODUCT, "task_1")[0] == "fake"
 
 
+async def test_the_stronger_model_runs_with_its_own_prompt_cap(sleeps: Sleeps) -> None:
+    capped = make_config(
+        stronger_model={"provider": "fake", "model": "fake-strong", "context_budget": 300}
+    )
+    gw = gateway(FakeProvider(), sleeps=sleeps, config=capped)
+    assert gw.context_budget(AgentName.PRODUCT, "task_1") == 1000
+    gw.use_stronger_model("task_1")
+    assert gw.context_budget(AgentName.PRODUCT, "task_1") == 300
+    assert gw.context_budget(AgentName.PRODUCT, "task_2") == 1000
+    # A cap above the agent's own budget never raises it.
+    loose = make_config(
+        stronger_model={"provider": "fake", "model": "fake-strong", "context_budget": 5000}
+    )
+    wide = gateway(FakeProvider(), sleeps=sleeps, config=loose)
+    wide.use_stronger_model("task_1")
+    assert wide.context_budget(AgentName.PRODUCT, "task_1") == 1000
+    # Without a cap of its own, it runs with the agent's budget.
+    plain = gateway(FakeProvider(), sleeps=sleeps)
+    plain.use_stronger_model("task_1")
+    assert plain.context_budget(AgentName.PRODUCT, "task_1") == 1000
+
+
 async def test_the_next_call_may_go_to_its_route_then_the_fallbacks(sleeps: Sleeps) -> None:
     gw = gateway(FakeProvider(), FakeProvider(name="backup"), sleeps=sleeps)
     assert gw.providers_for(AgentName.PRODUCT, None) == ["fake", "backup"]

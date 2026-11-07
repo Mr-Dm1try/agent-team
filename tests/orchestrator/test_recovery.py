@@ -30,6 +30,7 @@ from agent_team.core.models import (
 )
 from agent_team.llm.types import LLMRequest
 from agent_team.orchestrator import Orchestrator
+from agent_team.orchestrator.base import reply_options
 from agent_team.orchestrator.policy import SimplePolicy
 from orchestrator.harness import Team, make_team
 
@@ -307,3 +308,35 @@ async def test_a_check_left_running_by_a_crash_continues_on_its_attempt(tmp_path
     assert reply.kind == "done", reply.text
     check = await team.tasks.get_task(check.id)
     assert check.status is TaskStatus.DONE and check.attempt == 1
+
+
+async def test_a_question_about_a_failed_check_lists_each_reply_once(tmp_path: Path) -> None:
+    team = await make_team(tmp_path)
+    from orchestrator.test_flows import failing
+
+    team.auditor.fail_next["prd"] += [failing("R3", "REQ-1")] * 3
+    reply = await team.orch.handle("Build a books API")
+    assert reply.run_id
+    asked = await team.tasks.get_task(reply.pending[0].task_id)
+    assert asked.objective.endswith(
+        "Reply with guidance for another try of the requirements, 'approve' to keep the work "
+        "as it is, or 'stop' to stop the run."
+    )
+    assert asked.objective.count("Reply") == 1
+    # 'stop', as offered, stops the run, however it is typed.
+    reply = await team.orch.answer(reply.run_id, "Stop.")
+    assert reply.kind == "stopped"
+    assert (await team.tasks.get_run(reply.run_id or "")).status is RunStatus.STOPPED
+
+
+def test_reply_options_offer_approve_only_when_the_work_can_be_kept() -> None:
+
+    assert (
+        reply_options(keep=False)
+        == "Reply with guidance for another try, or 'stop' to stop the run."
+    )
+    assert "'approve' to keep the work as it is," in reply_options(keep=True)
+    # A run that is already stopped isn't offered 'stop'.
+    stopped = reply_options(keep=False, stopped=True)
+    assert stopped == "Reply with guidance for another try; until then the run stays stopped."
+    assert "'stop'" not in reply_options(keep=True, stopped=True)

@@ -16,7 +16,8 @@ from agent_team.core.errors import ToolError
 from agent_team.core.interfaces import ToolContext
 from agent_team.core.models import AgentName, Phase, Run, Task
 from agent_team.tools import web_tools
-from agent_team.tools.web import is_public, readable_json, untrusted
+from agent_team.tools.base import MAX_INLINE_CHARS
+from agent_team.tools.web import PAGE_CHARS, is_public, readable_json, untrusted
 from agents.fakes import FakeBus
 
 CONFIG = WebConfig(timeout_s=2, max_bytes=5_000, max_chars=2_000, max_results=3)
@@ -172,7 +173,71 @@ async def test_fetch_caps_bytes_and_chars(ctx: ToolContext) -> None:
     out = await web.fetch()({"url": "https://a.example/big"}, ctx)
     assert out.data is not None and out.data["truncated"] and out.data["bytes"] == 5_000
     assert out.content.count("x") <= CONFIG.max_chars + 10
-    assert "cut at 2000 chars" in out.content
+    assert "Read on with web_fetch and offset=2000." in out.content
+    assert "cut at 5000 bytes" in out.content
+
+
+def _numbered(lines: int) -> httpx.Response:
+    """A plain-text page of numbered lines, 10 characters each."""
+    text = "".join(f"line {i:04d}\n" for i in range(lines))
+    return httpx.Response(200, text=text, headers={"content-type": "text/plain"})
+
+
+async def test_offset_reads_on_from_the_saved_copy(ctx: ToolContext) -> None:
+    web = Web({"a.example": [PUBLIC]}, {"a.example/doc": _numbered(450)})
+    fetch = web.fetch()
+    first = await fetch({"url": "https://a.example/doc"}, ctx)
+    assert first.data is not None and first.data["next_offset"] == 2_000
+    assert "line 0000" in first.content and "line 0200" not in first.content
+    second = await fetch({"url": "https://a.example/doc", "offset": 2_000}, ctx)
+    third = await fetch({"url": "https://a.example/doc", "offset": 4_000}, ctx)
+    assert "line 0200" in second.content and "copy saved earlier" in second.content
+    assert third.data is not None and third.data["next_offset"] is None
+    assert "Characters 4000-4500 of 4500: the end of the page." in third.content
+    assert len(web.requests) == 1  # reading on makes no new request
+    with pytest.raises(ToolError, match="past the end"):
+        await fetch({"url": "https://a.example/doc", "offset": 4_500}, ctx)
+    with pytest.raises(ToolError, match="offset must be"):
+        await fetch({"url": "https://a.example/doc", "offset": -1}, ctx)
+
+
+async def test_a_repeat_fetch_returns_the_saved_copy_and_counts(ctx: ToolContext) -> None:
+    config = CONFIG.model_copy(update={"max_calls_per_attempt": 3})
+    web = Web({"a.example": [PUBLIC]}, {"a.example/doc": _numbered(450)})
+    fetch = web_tools(config, transport=httpx.MockTransport(web.handle), resolver=web.resolve)[
+        "web_fetch"
+    ]
+    await fetch({"url": "https://a.example/doc"}, ctx)
+    again = await fetch({"url": "https://a.example/doc"}, ctx)
+    assert len(web.requests) == 1
+    assert again.data is not None and again.data["cached"]
+    assert "already read this part" in again.content and "offset=2000" in again.content
+    await fetch({"url": "https://a.example/doc"}, ctx)
+    with pytest.raises(ToolError, match="all 3 of its web calls"):
+        await fetch({"url": "https://a.example/doc"}, ctx)
+
+
+async def test_another_task_fetches_the_page_itself(ctx: ToolContext) -> None:
+    web = Web({"a.example": [PUBLIC]}, {"a.example/doc": _numbered(10)})
+    fetch = web.fetch()
+    await fetch({"url": "https://a.example/doc"}, ctx)
+    other = ToolContext(
+        run=ctx.run, task=ctx.task.model_copy(update={"id": "task_other"}), bus=ctx.bus
+    )
+    out = await fetch({"url": "https://a.example/doc"}, other)
+    assert len(web.requests) == 2
+    assert out.data is not None and not out.data["cached"]
+
+
+async def test_a_part_stays_inline_whatever_the_config_says(ctx: ToolContext) -> None:
+    config = CONFIG.model_copy(update={"max_chars": 50_000, "max_bytes": 100_000})
+    web = Web({"a.example": [PUBLIC]}, {"a.example/doc": _numbered(5_000)})
+    fetch = web_tools(config, transport=httpx.MockTransport(web.handle), resolver=web.resolve)[
+        "web_fetch"
+    ]
+    out = await fetch({"url": "https://a.example/doc"}, ctx)
+    assert out.data is not None and out.data["chars"] == PAGE_CHARS
+    assert len(out.content) < MAX_INLINE_CHARS
 
 
 PYPI = {
@@ -292,3 +357,51 @@ async def test_search_failures_are_tool_errors(ctx: ToolContext) -> None:
         await tools["web_search"]({"query": " "}, ctx)
     empty = await web_tools(CONFIG, search=lambda q, n: [])["web_search"]({"query": "x"}, ctx)
     assert empty.content == "no results"
+
+
+async def test_an_attempt_has_a_web_call_budget_shared_by_both_tools(ctx: ToolContext) -> None:
+    config = CONFIG.model_copy(update={"max_calls_per_attempt": 2})
+    web = Web({"docs.example": [PUBLIC]}, {"docs.example/": html(ARTICLE)})
+    tools = web_tools(
+        config,
+        search=lambda q, n: [],
+        transport=httpx.MockTransport(web.handle),
+        resolver=web.resolve,
+    )
+    await tools["web_search"]({"query": "fastapi"}, ctx)
+    await tools["web_fetch"]({"url": "https://docs.example/"}, ctx)
+    with pytest.raises(ToolError, match="used all 2 of its web calls; write your output now"):
+        await tools["web_fetch"]({"url": "https://docs.example/"}, ctx)
+    # The next attempt starts with the whole budget again.
+    ctx.task.attempt += 1
+    await tools["web_search"]({"query": "fastapi"}, ctx)
+
+
+async def test_an_error_page_is_fetched_again(ctx: ToolContext) -> None:
+    busy = httpx.Response(503, text="busy", headers={"content-type": "text/plain"})
+    web = Web({"a.example": [PUBLIC]}, {"a.example/doc": busy})
+    fetch = web.fetch()
+    first = await fetch({"url": "https://a.example/doc"}, ctx)
+    web.pages["a.example/doc"] = _numbered(10)
+    second = await fetch({"url": "https://a.example/doc"}, ctx)
+    assert first.is_error and not second.is_error
+    assert len(web.requests) == 2
+    assert second.data is not None and not second.data["cached"]
+
+
+async def test_json_under_its_cap_comes_back_whole_a_part_at_a_time(ctx: ToolContext) -> None:
+    doc = {"items": [{"id": i, "description": "d" * 400} for i in range(10)]}
+    raw = json.dumps(doc)
+    config = CONFIG.model_copy(update={"max_bytes": 100_000})
+    page = httpx.Response(200, text=raw, headers={"content-type": "application/json"})
+    web = Web({"a.example": [PUBLIC]}, {"a.example/api": page})
+    fetch = web_tools(config, transport=httpx.MockTransport(web.handle), resolver=web.resolve)[
+        "web_fetch"
+    ]
+    parts, offset = [], 0
+    while offset is not None:
+        out = await fetch({"url": "https://a.example/api", "offset": offset}, ctx)
+        assert out.data is not None
+        parts.append(out.data["chars"])
+        offset = out.data["next_offset"]
+    assert sum(parts) == len(raw)  # nothing shortened: offset reads all of it
