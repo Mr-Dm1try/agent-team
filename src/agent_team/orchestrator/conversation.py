@@ -42,9 +42,11 @@ from agent_team.orchestrator.base import (
     TASK_QUESTION,
     OrchestratorBase,
     can_keep,
+    code_blockers,
+    reruns_code,
 )
 from agent_team.orchestrator.control import create_user_task
-from agent_team.orchestrator.lineage import downstream
+from agent_team.orchestrator.lineage import CHANGE_REQUEST_PREFIX, downstream
 from agent_team.orchestrator.messages import (
     CHANGE_TARGETS,
     CONFIRM_CHANGE,
@@ -411,6 +413,12 @@ class ConversationMixin(OrchestratorBase):
             and await self._keep_as_is(run, target, parent)
         ):
             return None
+        if (
+            parent is not None
+            and target.reason in (TASK_QUESTION, ESCALATION)
+            and await self._retry_code(run, target, parent, text, notes)
+        ):
+            return None
         question_id = target.reason if target.reason and target.reason.startswith("Q-") else None
         await self.feedback.add(
             run.id,
@@ -426,6 +434,58 @@ class ConversationMixin(OrchestratorBase):
         )
         await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
         return None
+
+    async def _retry_code(
+        self, run: Run, target: Task, parent: Task, text: str, notes: list[str]
+    ) -> bool:
+        """Guidance for a stuck QA review whose check failed on the code, or that names
+        the code, retries the code: the Engineer task at fault is reopened with the
+        guidance and QA's blockers, and QA reviews again after it. Returns False when
+        the guidance is for QA's own work."""
+        failed = await self.verdicts.latest_for_task(parent.id)
+        if not reruns_code(parent, failed, text):
+            return False
+        live = [
+            t
+            for t in await self.tasks.list_tasks(run.id)
+            if t.agent is AgentName.ENGINEER
+            and t.phase is parent.phase
+            and t.output is not None
+            and t.status is not TaskStatus.SUPERSEDED
+        ]
+        if not live:
+            return False
+        blockers = code_blockers(failed)
+        at_fault = [t for t in live if any(f.artifact == t.output for f in blockers)]
+        engineer = (at_fault or live)[-1]
+        await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
+        await self.feedback.add(run.id, self._feedback(engineer, FeedbackSource.USER_ANSWER, text))
+        for f in blockers:
+            await self.feedback.add(
+                run.id,
+                self._feedback(
+                    engineer,
+                    FeedbackSource.QA,
+                    f"{f.rule_id} on {f.item or 'the code'}: {f.message}",
+                ),
+            )
+        await self._record(
+            Decision(
+                run_id=run.id,
+                task_id=engineer.id,
+                kind=DecisionKind.FIX,
+                inputs={"user_task": target.id, "checker": parent.id, "guidance": text},
+                choice=f"retry the code ({engineer.id}), then QA's review",
+                reason="the user's guidance on QA's stuck review is for the code",
+                made_by="code",
+                rule="retry_code",
+            )
+        )
+        await self.reopen(
+            run, engineer, origin=TaskOrigin.FIX, reason=f"the user asked to retry the code: {text}"
+        )
+        notes.append("I'll retry the code with your guidance, then QA will check it again.")
+        return True
 
     async def _keep_as_is(self, run: Run, target: Task, parent: Task) -> bool:
         """The user approved work that failed its check: keep it as it is. A passing
@@ -524,7 +584,7 @@ class ConversationMixin(OrchestratorBase):
             self._feedback(producer, FeedbackSource.USER_COMMENT, text),
         )
         await self.reopen(
-            run, producer, origin=TaskOrigin.CHANGE_REQUEST, reason=f"change request: {text}"
+            run, producer, origin=TaskOrigin.CHANGE_REQUEST, reason=CHANGE_REQUEST_PREFIX + text
         )
         await self._set_status(run.id, RunStatus.ACTIVE)
 

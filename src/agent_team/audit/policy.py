@@ -7,7 +7,10 @@ policy first works out whose output each blocker is about:
 
 1. Pass: no decisions; the orchestrator marks the task done.
 2. A blocker on an earlier phase's artifact reopens the earliest one at fault
-   (UPSTREAM_RERUN) right away, since retrying this task can't fix it.
+   (UPSTREAM_RERUN) right away, since retrying this task can't fix it. In
+   Implementation, a blocker on the PRD or spec about something missing that the
+   current spec already plans (a requirement id it maps, a file or an interface) is the
+   code's fault instead (``planned_in``): it goes to the Engineer that builds it.
 3. A blocker on another task's output in the same phase revises that task (FIX), and
    the tasks after it re-run too. QA's blocking issues and failed criteria become
    Engineer fixes for the files named, then a fresh QA review.
@@ -40,12 +43,13 @@ model) on STRONGER_MODEL.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from agent_team.audit.evidence import KIND_ORDER, KIND_PHASE
-from agent_team.core.artifacts import Artifact, ArtifactRef, CodeChange, plain_kind
+from agent_team.core.artifacts import Artifact, ArtifactRef, CodeChange, Spec, plain_kind
 from agent_team.core.errors import is_own_output_error, repeats_error
 from agent_team.core.interfaces import ArtifactStore, DecisionLog, TaskStore, VerdictStore
 from agent_team.core.models import (
@@ -61,6 +65,8 @@ from agent_team.core.models import (
     TaskStatus,
     Verdict,
 )
+from agent_team.orchestrator.lineage import ancestry
+from agent_team.orchestrator.planning import package_of
 
 
 @dataclass(frozen=True)
@@ -193,6 +199,82 @@ def route(
     return _producer(ref, others)
 
 
+#: Words a finding uses for work that is missing, rather than wrong.
+MISSING = re.compile(
+    r"\b(missing|not implemented|unimplemented|not registered|not found|absent"
+    r"|doesn't exist|does not exist|no such)\b",
+    re.I,
+)
+#: Upstream kinds whose blame is checked against the current spec.
+PLANNING_KINDS = frozenset({"prd", "spec"})
+
+
+def _names(text: str, name: str) -> bool:
+    """Whether ``text`` names ``name`` as a whole word, id or path (a planned file also
+    by its file name), so REQ-1 doesn't match REQ-10."""
+    names = {name, name.rsplit("/", 1)[-1]} if "." in name else {name}
+    return any(re.search(rf"(?<![\w./-]){re.escape(n)}(?![\w-])", text) for n in names)
+
+
+def planned_in(spec: Spec, finding: Finding) -> list[str]:
+    """The components of ``spec`` that already plan what a finding says is missing: a
+    requirement id they map, a file they plan or an interface they expose. When there
+    are any, the code lacks it, not the spec."""
+    text = f"{finding.item or ''} {finding.message} {finding.evidence or ''}"
+    if finding.rule_id != "R5" and not MISSING.search(text):
+        return []
+    exposed = {i.name: i.component for i in spec.interfaces}
+    found = [
+        c.name
+        for c in spec.components
+        if any(_names(text, n) for n in [*c.requirements, *c.files])
+        or any(_names(text, n) for n, owner in exposed.items() if owner == c.name)
+    ]
+    return found
+
+
+def _builder(
+    components: list[str], task: Task, spec: Spec, engineers: list[Task], tasks: list[Task]
+) -> Task | None:
+    """The Engineer task that builds these components: ``task`` itself when it is an
+    Engineer, else the one for their work package, else the last Engineer."""
+    if task.agent is AgentName.ENGINEER:
+        return task
+    packages = {p.name for p in spec.work_packages if set(p.components) & set(components)}
+    for t in reversed(engineers):
+        if package_of(ancestry(t, tasks)[0]) in packages:
+            return t
+    return engineers[-1] if engineers else None
+
+
+def blame_code(
+    blockers: list[Finding],
+    task: Task,
+    spec: Spec | None,
+    phase_tasks: list[Task],
+    tasks: list[Task],
+) -> tuple[list[Finding], list[str]]:
+    """``blockers`` with each PRD or spec blame about something the current spec
+    already plans moved to the code of the Engineer that builds it, and the ids of the
+    findings moved. Only in Implementation, where the code is built from that spec."""
+    if spec is None or task.phase is not Phase.IMPLEMENTATION:
+        return blockers, []
+    engineers = [t for t in phase_tasks if t.agent is AgentName.ENGINEER and t.output is not None]
+    out: list[Finding] = []
+    moved: list[str] = []
+    for f in blockers:
+        components = planned_in(spec, f) if f.artifact and f.artifact.kind in PLANNING_KINDS else []
+        builder = _builder(components, task, spec, engineers, tasks) if components else None
+        target = builder.output if builder is not None else None
+        if target is None:
+            out.append(f)
+            continue
+        note = f"spec@v{spec.version} plans it in {', '.join(components)}, so the code lacks it"
+        out.append(f.model_copy(update={"artifact": target, "evidence": note}))
+        moved.append(f.id)
+    return out, moved
+
+
 @dataclass
 class _Fix:
     """The findings routed to one other task in the phase."""
@@ -235,14 +317,47 @@ def decide_task(
     limits: PolicyLimits,
     tasks: list[Task] | None = None,
     outputs: Mapping[str, Artifact] | None = None,
+    spec: Spec | None = None,
 ) -> list[Decision]:
     """Decisions for one task's end check. ``history`` is the earlier verdicts of the
     task and of the tasks it was reopened from, oldest first; ``past`` is the run's
-    decision log so far; ``tasks`` the run's tasks and ``outputs`` the loaded output of
-    each live task in the phase, by task id (for routing fixes)."""
+    decision log so far; ``tasks`` the run's tasks, ``outputs`` the loaded output of
+    each live task in the phase, by task id (for routing fixes), and ``spec`` the
+    current spec, to tell missing code from a missing plan. The first decision names
+    the findings moved from the PRD or spec to the code, in ``blamed_code``."""
     if verdict.passed and not verdict.blockers:
         return []
-    blockers = verdict.blockers
+    live = [t for t in tasks or [] if t.status is not TaskStatus.SUPERSEDED]
+    phase_tasks = sorted(
+        (
+            t
+            for t in live
+            if t.phase is task.phase and t.agent not in (AgentName.USER, AgentName.AUDITOR)
+        ),
+        key=lambda t: t.created_at,
+    )
+    blockers, moved = blame_code(verdict.blockers, task, spec, phase_tasks, tasks or [])
+    out = _decide(run, task, verdict, blockers, history, past, limits, live, phase_tasks, outputs)
+    if out and moved:
+        out[0].inputs["blamed_code"] = moved
+    return out
+
+
+def _decide(
+    run: Run,
+    task: Task,
+    verdict: Verdict,
+    blockers: list[Finding],
+    history: list[Verdict],
+    past: list[Decision],
+    limits: PolicyLimits,
+    live: list[Task],
+    phase_tasks: list[Task],
+    outputs: Mapping[str, Artifact] | None,
+) -> list[Decision]:
+    """The decisions for ``blockers``, the failed verdict's blockers with any blame
+    already moved to the code; ``live`` are the run's live tasks and ``phase_tasks``
+    the work in the task's phase, oldest first."""
     fids = _ids(blockers)
 
     dangerous = [f for f in blockers if f.rule_id in DANGEROUS_ACTION_RULES]
@@ -313,21 +428,12 @@ def decide_task(
             ),
         ]
 
-    live = [t for t in tasks or [] if t.status is not TaskStatus.SUPERSEDED]
     lineage = _lineage(task)
     earlier = [v for v in history if v.id != verdict.id]
     no_progress = bool(
         earlier and not earlier[-1].passed and _blocker_keys(earlier[-1]) == _blocker_keys(verdict)
     )
     upstream = _earliest_upstream(blockers, task)
-    phase_tasks = sorted(
-        (
-            t
-            for t in live
-            if t.phase is task.phase and t.agent not in (AgentName.USER, AgentName.AUDITOR)
-        ),
-        key=lambda t: t.created_at,
-    )
     fixes: dict[str, _Fix] = {}
     if upstream is None:
         for finding in blockers:
@@ -672,7 +778,33 @@ class CodeVerdictPolicy:
                 and t.status is not TaskStatus.SUPERSEDED
             ):
                 outputs[t.id] = await self.artifacts.load(run.id, t.output)
-        return decide_task(run, task, verdict, history, past, self.limits, tasks, outputs)
+        return decide_task(
+            run,
+            task,
+            verdict,
+            history,
+            past,
+            self.limits,
+            tasks,
+            outputs,
+            spec=await self._spec(run, tasks),
+        )
+
+    async def _spec(self, run: Run, tasks: list[Task]) -> Spec | None:
+        """The current spec: the newest live Architect task's output."""
+        done = [
+            t
+            for t in tasks
+            if t.agent is AgentName.ARCHITECT
+            and t.output is not None
+            and t.status is not TaskStatus.SUPERSEDED
+        ]
+        if not done:
+            return None
+        latest = max(done, key=lambda t: t.created_at)
+        assert latest.output is not None
+        spec = await self.artifacts.load(run.id, latest.output)
+        return spec if isinstance(spec, Spec) else None
 
     async def on_task_error(self, run: Run, task: Task) -> list[Decision]:
         """Decisions for a task escalated after a failed attempt; see ``decide_error``."""

@@ -194,7 +194,34 @@ def scrub(text: str, message: str) -> str:
         named = re.search(rf"\b{m.group(1)}\b", said)
         return m.group(0) if named else plain_kind(m.group(1))
 
-    return _REFS.sub(ref, _IDS.sub("", text)).strip()
+    return renumber(_REFS.sub(ref, _IDS.sub("", text)).strip())
+
+
+#: A numbered list item: its indent, number, and the rest from the marker's end.
+_ITEM = re.compile(r"^(\s*)(\d+)([.)]\s.*)$")
+
+
+def renumber(text: str) -> str:
+    """Each numbered list numbered by its items' places, from the first item's number,
+    so a model's "1, 2, 2, 3" reads 1, 2, 3, 4. A list goes on across blank lines and
+    deeper lines (an item's own text or a nested list), and ends at a line as shallow
+    as its items that isn't one."""
+    counters: dict[int, int] = {}  # indent -> the number the next item there gets
+    out: list[str] = []
+    for line in text.split("\n"):
+        m = _ITEM.match(line)
+        indent = len(line) - len(line.lstrip())
+        if not line.strip():
+            out.append(line)
+            continue
+        counters = {i: n for i, n in counters.items() if i < indent or (m and i == indent)}
+        if m is None:
+            out.append(line)
+            continue
+        number = counters.get(indent, int(m.group(2)))
+        counters[indent] = number + 1
+        out.append(f"{m.group(1)}{number}{m.group(3)}")
+    return "\n".join(out)
 
 
 def _spec(name: str, description: str, props: dict[str, Any]) -> ToolSpec:

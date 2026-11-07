@@ -48,7 +48,7 @@ from agent_team.orchestrator.control import create_user_task
 from agent_team.orchestrator.conversation import ConversationMixin
 from agent_team.orchestrator.decisions import DecisionsMixin
 from agent_team.orchestrator.dispatcher import INTERRUPTED, PAUSING_ERRORS
-from agent_team.orchestrator.lineage import ancestry
+from agent_team.orchestrator.lineage import ancestry, change_request_of
 from agent_team.orchestrator.phases import PhaseMachine, expert_tasks, is_work, reviewed
 from agent_team.orchestrator.planning import RULE as PIPELINE
 from agent_team.orchestrator.planning import expand_plan, implementation_tasks
@@ -195,9 +195,24 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
 
             others = [t for t in ready if t.agent is not AgentName.ENGINEER]
             engineers = [t for t in ready if t.agent is AgentName.ENGINEER]
-            batch = others + engineers[:1]  # Engineer tasks share the workspace
+            # Engineer tasks share the workspace; a local model runs a few tasks at most.
+            batch = self._within_caps(others + engineers[:1])
             await asyncio.gather(*(self._run_task(run, t) for t in batch))
         return Reply(kind="error", text="Stopped: too many orchestration steps.", run_id=run_id)
+
+    def _within_caps(self, ready: list[Task]) -> list[Task]:
+        """The ready tasks that fit each provider's cap on tasks at once, in order; the
+        rest wait for the next round, so their timeout doesn't run while they queue."""
+        caps = self.config.max_tasks_per_provider
+        running: dict[str, int] = {}
+        batch: list[Task] = []
+        for t in ready:
+            provider = next(iter(self.llm.providers_for(t.agent, t.id)), "")
+            if provider in caps and running.get(provider, 0) >= caps[provider]:
+                continue
+            running[provider] = running.get(provider, 0) + 1
+            batch.append(t)
+        return batch
 
     async def _ready(self, run_id: str, phase: Phase) -> list[Task]:
         """Agent tasks in ``phase`` that can run now."""
@@ -359,7 +374,12 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             and t.agent in (AgentName.ENGINEER, AgentName.QA)
         ]
         new_tasks = implementation_tasks(
-            spec, spec_task, run, previous=previous, max_attempts=self.config.max_attempts
+            spec,
+            spec_task,
+            run,
+            previous=previous,
+            max_attempts=self.config.max_attempts,
+            change_request=await self._open_change_request(tasks),
         )
         for t in new_tasks:
             await self.tasks.create_task(t)
@@ -372,6 +392,23 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             reason=f"spec done; {len(packages)} work package(s), run one at a time",
         )
         return True
+
+    async def _open_change_request(self, tasks: list[Task]) -> str | None:
+        """The user's latest change request while it is still being built: no QA review
+        after it has passed or been kept yet, so a rebuild of the code keeps it as its
+        objective."""
+        requests = [t for t in tasks if change_request_of(t) is not None]
+        if not requests:
+            return None
+        latest = max(requests, key=lambda t: t.created_at)
+        for t in tasks:
+            if t.agent is AgentName.QA and t.created_at > latest.created_at:
+                if t.status is TaskStatus.DONE:
+                    return None
+                verdict = await self.verdicts.latest_for_task(t.id)
+                if verdict is not None and verdict.passed:
+                    return None
+        return change_request_of(latest)
 
     async def _record_pipeline(
         self,

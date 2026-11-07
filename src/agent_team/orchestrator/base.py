@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_team.core.artifacts import Artifact
+from agent_team.core.artifacts import Artifact, plain_kind
 from agent_team.core.errors import BudgetExceeded, RunStopped
 from agent_team.core.interfaces import (
     ArtifactStore,
@@ -30,6 +30,7 @@ from agent_team.core.models import (
     EventName,
     Feedback,
     FeedbackSource,
+    Finding,
     Phase,
     RequestKind,
     ReviewMode,
@@ -60,16 +61,57 @@ TASK_QUESTION = "policy"
 ESCALATION = "escalation"
 
 
-def reply_options(*, keep: bool, stopped: bool = False) -> str:
+#: QA rules whose blockers the code must fix: planned files that don't exist (R5) and
+#: the blocking issues in QA's review (R7).
+CODE_RULES = frozenset({"R5", "R7"})
+#: Guidance that names the code, so another try of QA's review reruns the code first.
+NAMES_CODE = re.compile(r"\b(code|engineer|implement\w*)\b|\.py\b", re.I)
+
+
+def code_blockers(verdict: Verdict | None) -> list[Finding]:
+    """The blockers of a failed check that the code must fix: findings on a code
+    change, and QA's own code rules."""
+    if verdict is None or verdict.passed:
+        return []
+    return [
+        f
+        for f in verdict.blockers
+        if (f.artifact is not None and f.artifact.kind == "code_change") or f.rule_id in CODE_RULES
+    ]
+
+
+def reruns_code(task: Task, verdict: Verdict | None, guidance: str = "") -> bool:
+    """Whether guidance for another try of a stuck QA review reruns the code first:
+    its check failed on the code, or the guidance names the code."""
+    if task.agent is not AgentName.QA:
+        return False
+    return bool(code_blockers(verdict)) or NAMES_CODE.search(guidance) is not None
+
+
+def rerun_of(task: Task, verdict: Verdict | None) -> str:
+    """The work that guidance for another try of ``task`` reruns, as the user says it."""
+    if task.agent is not AgentName.QA:
+        return plain_kind(task.output_kind)
+    if reruns_code(task, verdict):
+        return "the code, then the QA check"
+    return "the QA check (guidance that names the code reruns the code first)"
+
+
+def reply_options(*, keep: bool, stopped: bool = False, rerun: str | None = None) -> str:
     """The replies a question about one stuck or failing task takes, in one sentence:
-    guidance for another try, 'approve' when the work may be kept as it is, and 'stop'
-    unless the run is already stopped."""
+    guidance for another try (of ``rerun``, when given), 'approve' when the work may
+    be kept as it is, and 'stop' unless the run is already stopped."""
+    retry = (
+        f"Reply with guidance for another try of {rerun}"
+        if rerun
+        else ("Reply with guidance for another try")
+    )
     approve = "'approve' to keep the work as it is" if keep else ""
     if stopped:
         tail = f", or {approve}" if approve else ""
-        return f"Reply with guidance for another try{tail}; until then the run stays stopped."
+        return f"{retry}{tail}; until then the run stays stopped."
     middle = f" {approve}," if approve else ""
-    return f"Reply with guidance for another try,{middle} or 'stop' to stop the run."
+    return f"{retry},{middle} or 'stop' to stop the run."
 
 
 PAUSING = (BudgetExceeded, RunStopped)
@@ -88,6 +130,9 @@ class OrchestratorConfig:
     research: ResearchLimits = field(default_factory=ResearchLimits)
     #: The stronger model's price per million prompt tokens, for its decision's cost.
     stronger_input_usd_per_mtok: float | None = None
+    #: Agent tasks that may run at once on each provider, by name; a provider not
+    #: named has no cap of its own.
+    max_tasks_per_provider: dict[str, int] = field(default_factory=dict)
     max_loops: int = 500  # safety valve for drive()
 
 

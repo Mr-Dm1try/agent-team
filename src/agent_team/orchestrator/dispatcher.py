@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
 from agent_team.audit.toollog import ToolCallLog, summarize_attempt
-from agent_team.core.artifacts import Artifact, ArtifactRef
+from agent_team.core.artifacts import PRD, Artifact, ArtifactRef, Spec
 from agent_team.core.errors import BudgetExceeded, RunStopped, repeats_error
 from agent_team.core.interfaces import (
     Agent,
@@ -77,6 +77,10 @@ INPUT_KINDS: dict[AgentName, tuple[str, ...]] = {
 READS_INPUT_FEEDBACK = frozenset({"research_answer"})
 #: Feedback from the user, as opposed to the auditor, QA or the harness.
 USER_SOURCES = frozenset({FeedbackSource.USER_ANSWER, FeedbackSource.USER_COMMENT})
+
+#: Feedback that reports a finding, which a later passing check of the same line of
+#: work resolves.
+FINDING_SOURCES = frozenset({FeedbackSource.AUDITOR, FeedbackSource.QA})
 
 #: Errors that pause the run rather than fail the attempt.
 PAUSING_ERRORS = frozenset({"BudgetExceeded", "RunStopped"})
@@ -344,6 +348,7 @@ class Dispatcher:
                 refs=[t.output for t in chain if t.output is not None],
                 task_ids=[t.id for t in chain],
             )
+            feedback = await self._open(feedback, chain)
 
         input_feedback: list[Feedback] = []
         if self.feedback is not None and task.output_kind in READS_INPUT_FEEDBACK:
@@ -389,6 +394,22 @@ class Dispatcher:
             trace_id=task.trace_id or run.trace_id,
             span_id=task.span_id or run.span_id,
         )
+
+    async def _open(self, feedback: list[Feedback], chain: list[Task]) -> list[Feedback]:
+        """``feedback`` without the findings a later version in the line already
+        resolved: a finding from the auditor or QA stays only until a check of the line
+        passes after it. The user's words always stay."""
+        if self.verdicts is None:
+            return feedback
+        passed = [
+            v.created_at for t in chain for v in await self.verdicts.for_task(t.id) if v.passed
+        ]
+        if not passed:
+            return feedback
+        resolved = max(passed)
+        return [
+            fb for fb in feedback if fb.source not in FINDING_SOURCES or fb.created_at > resolved
+        ]
 
     async def _on_stronger(self, task: Task) -> bool:
         """Whether this attempt of ``task`` runs on the stronger model: a decision sent
@@ -448,6 +469,10 @@ class Dispatcher:
             except Exception:
                 parts.append(f"{art.kind}: v{before.version} -> v{art.version}")
                 continue
+            changes = requirement_changes(old_art, art)
+            if changes:
+                head = f"Requirements in {art.kind}@v{art.version} since v{old_art.version}:"
+                parts.append("\n".join([head, *(f"- {c}" for c in changes)]))
             parts.append(json_diff(old_art, art))
         return "\n\n".join(parts) or None
 
@@ -593,6 +618,33 @@ def json_diff(old: Artifact, new: Artifact) -> str:
             lineterm="",
         )
     )
+
+
+def _requirements(art: Artifact) -> dict[str, tuple[str, str]]:
+    """Each requirement id a PRD or spec names, with how to show it and what it holds
+    for comparing versions: a PRD's requirement text, or the spec's components and
+    files for it."""
+    if isinstance(art, PRD):
+        return {r.id: (r.text, r.model_dump_json()) for r in art.requirements}
+    if isinstance(art, Spec):
+        where: dict[str, list[str]] = {}
+        for c in art.components:
+            for rid in c.requirements:
+                where.setdefault(rid, []).append(f"{c.name} ({', '.join(c.files)})")
+        return {rid: (f"in {'; '.join(w)}", "; ".join(w)) for rid, w in where.items()}
+    return {}
+
+
+def requirement_changes(old: Artifact, new: Artifact) -> list[str]:
+    """What a PRD or spec revision did to its requirements, one line each: new,
+    changed and dropped ids, so a revision sees them before the full diff."""
+    before, after = _requirements(old), _requirements(new)
+    lines = [
+        f"{'new' if rid not in before else 'changed'}: {rid} {shown}"
+        for rid, (shown, held) in after.items()
+        if rid not in before or before[rid][1] != held
+    ]
+    return lines + [f"dropped: {rid}" for rid in before if rid not in after]
 
 
 def failed_verdict(run: Run, message: str, *, task_id: str | None = None) -> Verdict:

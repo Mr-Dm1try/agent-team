@@ -286,6 +286,7 @@ async def build_app(
             max_upstream_reruns=config.limits.max_upstream_reruns,
             research=research_limits,
             stronger_input_usd_per_mtok=stronger_price.input_per_mtok if stronger_price else None,
+            max_tasks_per_provider={"ollama": config.providers.ollama.max_concurrent_tasks},
         ),
         policy=policy,
     )

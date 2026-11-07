@@ -164,3 +164,48 @@ async def test_a_core_dump_is_never_committed(tmp_path: Path) -> None:
     await WorkspaceGit(ws).commit_version(V2, subject="s")
     assert "core" not in git(ws, "ls-files")
     assert (ws / "core").is_file()  # left in place, just not committed
+
+
+async def test_generated_databases_and_caches_stay_out_of_versions_and_diffs(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "app.py").write_text("x = 1\n")
+    # Written by the code when it runs, such as a module-level create_app().
+    (ws / "library.db").write_bytes(b"SQLite format 3\x00" + b"\x00" * 64)
+    (ws / "data").mkdir()
+    (ws / "data" / "cache.sqlite3").write_bytes(b"\x00" * 16)
+    (ws / "pkg" / "__pycache__").mkdir(parents=True)
+    (ws / "pkg" / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"\x00")
+    (ws / ".gitignore").write_text("# the Engineer's own, without the harness's lines\n")
+    repo = WorkspaceGit(ws)
+    await repo.commit_version(V1, subject="v1")
+    assert "library.db" not in git(ws, "ls-files")
+    assert not [f for f in git(ws, "ls-files") if f.endswith((".sqlite3", ".pyc"))]
+
+    (ws / "library.db").write_bytes(b"SQLite format 3\x00" + b"\x01" * 64)
+    (ws / "app.py").write_text("x = 2\n")
+    await repo.commit_version(V2, subject="v2")
+    diff = await repo.diff(V1, V2)
+    assert "+x = 2" in diff
+    assert "library.db" not in diff
+
+
+async def test_a_database_an_older_version_committed_leaves_the_history(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "app.py").write_text("x = 1\n")
+    (ws / "library.db").write_bytes(b"old")
+    git(ws, "init", "-q")
+    git(ws, "add", "-A")
+    git(ws, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "before")
+    git(ws, "tag", "code_change-v1")
+    (ws / "library.db").write_bytes(b"new")
+    (ws / "app.py").write_text("x = 2\n")
+    await WorkspaceGit(ws).commit_version(V2, subject="v2")
+    assert "library.db" not in git(ws, "ls-files")
+    diff = await WorkspaceGit(ws).diff(V1, V2)
+    assert "+x = 2" in diff and "library.db" not in diff

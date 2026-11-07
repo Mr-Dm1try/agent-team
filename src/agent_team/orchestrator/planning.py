@@ -20,6 +20,7 @@ from agent_team.core.models import (
     TaskOrigin,
     new_id,
 )
+from agent_team.orchestrator.lineage import ancestry
 from agent_team.orchestrator.research import is_requested
 
 RULE = "pipeline"
@@ -144,17 +145,25 @@ def implementation_tasks(
     *,
     previous: list[Task] | None = None,
     max_attempts: int = 3,
+    change_request: str | None = None,
 ) -> list[Task]:
     """Engineer tasks per work package, chained one after another, then QA.
 
     ``previous`` are superseded Implementation tasks from before a spec revision: a
-    new task for the same package points back at the old one, so it runs as a
-    revision of that code instead of a rebuild."""
+    new task for the same package points back at the newest task in that package's
+    line (a fix included), so it runs as a revision of the latest code instead of a
+    rebuild. ``change_request`` is the user's change still being built, added to
+    every objective so the Engineer and QA know what is new."""
     packages = [(p.name, p.components) for p in spec.work_packages] or [
         ("all", [c.name for c in spec.components])
     ]
-    old_by_package = {package_of(t): t for t in previous or [] if t.agent is AgentName.ENGINEER}
-    old_qa = next((t for t in reversed(previous or []) if t.agent is AgentName.QA), None)
+    earlier = sorted(previous or [], key=lambda t: t.created_at)
+    old_by_package: dict[str | None, Task] = {}
+    for t in earlier:
+        if t.agent is AgentName.ENGINEER:
+            old_by_package[package_of(ancestry(t, earlier)[0])] = t
+    old_qa = next((t for t in reversed(earlier) if t.agent is AgentName.QA), None)
+    change = f". Change request: {change_request}" if change_request else ""
 
     tasks: list[Task] = []
     prev_id = spec_task.id
@@ -167,7 +176,7 @@ def implementation_tasks(
                 run_id=run.id,
                 phase=Phase.IMPLEMENTATION,
                 agent=AgentName.ENGINEER,
-                objective=f"Implement {what}: components {', '.join(components)}",
+                objective=f"Implement {what}: components {', '.join(components)}{change}",
                 output_kind="code_change",
                 depends_on=[prev_id],
                 max_attempts=max_attempts,
@@ -183,7 +192,7 @@ def implementation_tasks(
             run_id=run.id,
             phase=Phase.IMPLEMENTATION,
             agent=AgentName.QA,
-            objective="Review the whole solution against the PRD and run it end to end",
+            objective="Review the whole solution against the PRD and run it end to end" + change,
             output_kind="qa_report",
             depends_on=[t.id for t in tasks],
             max_attempts=max_attempts,

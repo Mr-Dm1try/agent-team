@@ -136,6 +136,10 @@ class OllamaConfig(_Cfg):
     #: Characters per token when estimating a prompt. Low on purpose: running over
     #: the window is silent truncation, while a high estimate only costs a fallback.
     chars_per_token: int = 3
+    #: Agent tasks that run at once on Ollama. A local model answers one call at a
+    #: time, so a task beyond this waits for its turn before it starts, instead of
+    #: spending its timeout waiting for the model.
+    max_concurrent_tasks: int = Field(default=1, ge=1)
 
 
 class ProvidersConfig(_Cfg):

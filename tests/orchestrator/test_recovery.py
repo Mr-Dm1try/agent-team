@@ -319,8 +319,8 @@ async def test_a_question_about_a_failed_check_lists_each_reply_once(tmp_path: P
     assert reply.run_id
     asked = await team.tasks.get_task(reply.pending[0].task_id)
     assert asked.objective.endswith(
-        "Reply with guidance for another try, 'approve' to keep the work as it is, "
-        "or 'stop' to stop the run."
+        "Reply with guidance for another try of the requirements, 'approve' to keep the work "
+        "as it is, or 'stop' to stop the run."
     )
     assert asked.objective.count("Reply") == 1
     # 'stop', as offered, stops the run, however it is typed.

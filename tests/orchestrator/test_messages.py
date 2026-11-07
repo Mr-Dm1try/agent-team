@@ -31,7 +31,7 @@ from agent_team.core.models import (
     TaskStatus,
 )
 from agent_team.llm.types import ContentBlock, LLMRequest, ToolResultBlock, ToolUseBlock
-from agent_team.orchestrator.messages import says_stop, scrub
+from agent_team.orchestrator.messages import renumber, says_stop, scrub
 from orchestrator.harness import Team, make_team
 
 QUESTIONS = [
@@ -743,3 +743,17 @@ async def test_answer_pending_is_offered_while_something_waits(tmp_path: Path) -
     reply = await team.orch.handle("Build a books API")
     await team.orch.handle("what is it asking?", run_id=reply.run_id)
     assert offered and "answer_pending" in offered[0]
+
+
+def test_a_reply_numbers_its_lists_from_the_items_not_the_model() -> None:
+    said = "The researcher opened:\n1. notes.md\n2. a.md\n2. b.md\n3. c.md\n\nThat's all."
+    assert scrub(said, "which pages?") == (
+        "The researcher opened:\n1. notes.md\n2. a.md\n3. b.md\n4. c.md\n\nThat's all."
+    )
+    # A list goes on across blank lines and an item's own lines, and nested lists
+    # keep their own count; a line as shallow as the items ends it.
+    text = "1) a\n\n1) b\n   more on b\n   1. x\n   1. y\n1) c\nThen:\n5. later\n5. later still"
+    assert renumber(text) == (
+        "1) a\n\n2) b\n   more on b\n   1. x\n   2. y\n3) c\nThen:\n5. later\n6. later still"
+    )
+    assert renumber("No list here.\n2026. A year, alone.") == "No list here.\n2026. A year, alone."

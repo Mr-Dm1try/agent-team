@@ -43,7 +43,12 @@ providers:
     on_history_edit: drop_block
   # Ollama's native API, which loads the model with num_ctx; a model whose own limit is
   # smaller gets that. reasoning_models: models that take an effort; others get none.
-  ollama: {base_url: "http://localhost:11434", num_ctx: 32768, reasoning_models: [gpt-oss]}
+  ollama:
+    base_url: "http://localhost:11434"
+    num_ctx: 32768
+    reasoning_models: [gpt-oss]
+    # Agent tasks at once on the local model; more would wait inside their timeout.
+    max_concurrent_tasks: 1
 # Fault injection; the --chaos flag overrides this.
 chaos: {rate: 0.0, faults: []}
 # Custom hooks as "module:function"; each function receives the event bus.

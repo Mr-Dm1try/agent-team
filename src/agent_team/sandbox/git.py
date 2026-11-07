@@ -11,7 +11,8 @@ change or stall it. The command tools create the repository before the first com
 runs, so the container only ever sees ``.git`` read-only, and the file tools refuse to
 write there: agents can't rewrite the history or plant config the host's git would run.
 A core dump (a file named ``core`` or ``core.*`` that is an ELF core file) is never
-committed, should a crash leave one.
+committed, should a crash leave one, and neither are files the code generates when it
+runs (``GENERATED``: databases and Python caches), which aren't part of the change.
 """
 
 from __future__ import annotations
@@ -33,6 +34,10 @@ log = logging.getLogger(__name__)
 _ET_CORE = 4
 #: Paths a core dump can have: ``core`` or ``core.*`` in any folder.
 _CORE_PATHS = (":(glob)**/core", ":(glob)**/core.*")
+#: Files the code writes when it runs, such as a SQLite database a module creates on
+#: import, left out of every version and every diff.
+GENERATED = ("**/*.db", "**/*.sqlite", "**/*.sqlite3", "**/__pycache__/**", "**/*.pyc")
+_SKIP_GENERATED = tuple(f":(exclude,glob){g}" for g in GENERATED)
 
 
 def is_core_dump(path: Path) -> bool:
@@ -119,7 +124,19 @@ class WorkspaceGit:
         return the commit sha. A version with no file changes still gets a commit."""
         await self.ensure_repo()
         dumps = await self.core_dumps()
-        await self._git("add", "-A", "--", ".", *(f":(exclude,literal){d}" for d in dumps))
+        await self._git(
+            "add", "-A", "--", ".", *_SKIP_GENERATED, *(f":(exclude,literal){d}" for d in dumps)
+        )
+        # A generated file a version before this committed leaves the history too.
+        await self._git(
+            "rm",
+            "-q",
+            "-r",
+            "--cached",
+            "--ignore-unmatch",
+            "--",
+            *(f":(glob){g}" for g in GENERATED),
+        )
         if dumps:
             log.warning("leaving core dumps out of the commit: %s", ", ".join(dumps))
             # One a version before this committed leaves the history from here on.
@@ -144,9 +161,17 @@ class WorkspaceGit:
         return sorted(n for n in names if is_core_dump(self.workspace / n))
 
     async def diff(self, old: ArtifactRef, new: ArtifactRef) -> str:
-        """The workspace diff between two committed versions."""
+        """The workspace diff between two committed versions, without generated files
+        an older version may still hold."""
         return await self._git(
-            "diff", "--no-ext-diff", "--no-textconv", version_tag(old), version_tag(new)
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            version_tag(old),
+            version_tag(new),
+            "--",
+            ".",
+            *_SKIP_GENERATED,
         )
 
 

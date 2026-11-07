@@ -23,6 +23,7 @@ from agent_team.orchestrator.base import (
     OrchestratorBase,
     can_keep,
     reply_options,
+    rerun_of,
 )
 from agent_team.orchestrator.control import create_user_task
 from agent_team.orchestrator.lineage import ancestry
@@ -251,13 +252,14 @@ class SettleMixin(OrchestratorBase):
         """Ask the user how to get an escalated task unstuck."""
         why = task.last_error or "it failed its check with no attempts left"
         failed = await self.verdicts.latest_for_task(task.id)
+        options = reply_options(keep=can_keep(task, failed), rerun=rerun_of(task, failed))
         child = await create_user_task(
             self.tasks,
             run,
             phase=task.phase,
             question=(
                 f"{upper_first(plain_agent(task.agent))} is stuck on: {task.objective} "
-                f"({why}). {reply_options(keep=can_keep(task, failed))}"
+                f"({why}). {options}"
             ),
             origin=TaskOrigin.QUESTION,
             parent=task,

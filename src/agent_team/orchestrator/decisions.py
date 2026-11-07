@@ -24,6 +24,7 @@ from agent_team.orchestrator.base import (
     OrchestratorBase,
     can_keep,
     reply_options,
+    rerun_of,
 )
 from agent_team.orchestrator.control import create_user_task
 
@@ -80,7 +81,9 @@ class DecisionsMixin(OrchestratorBase):
             question = str(d.inputs.get("question") or d.reason)
             if task is not None:
                 halted = (await self.tasks.get_run(run.id)).status is RunStatus.STOPPED
-                question += " " + reply_options(keep=can_keep(task, verdict), stopped=halted)
+                question += " " + reply_options(
+                    keep=can_keep(task, verdict), stopped=halted, rerun=rerun_of(task, verdict)
+                )
             if task is not None and task.status is TaskStatus.AUDITING:
                 await self.tasks.transition(task.id, TaskStatus.ESCALATED, reason=d.reason)
             phase = (
