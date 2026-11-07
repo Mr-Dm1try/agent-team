@@ -156,24 +156,27 @@ SANDBOX_FACTS = (
     "still are."
 )
 _PROCESS_KILL = re.compile(r"\b(?:kill|pkill|killall)\b")
-_KILL_WORDS = re.compile(
-    r"\b(?:kill(?:ed|s|ing)?|pkill|killall|pids?|process(?:es)?)\b|/proc\b", re.I
-)
+_KILL_WORDS = re.compile(r"\b(?:kill(?:ed|s|ing)?|pkill|killall|sig(?:kill|term))\b", re.I)
+#: Anything else a finding may name: then it isn't only about stopping processes.
 _OTHER_HARM = re.compile(
-    r"\b(?:rm|delet\w*|remov\w*|wip\w*|overwr\w*|credential\w*|ssh|secrets?|tokens?|keys?"
-    r"|curl|wget|upload\w*|chmod|chown|mkfs|dd|shutdown|reboot|push\w*|sudo|docker|mount)\b",
+    r"\b(?:rm|rmdir|unlink|shred|truncat\w*|delet\w*|remov\w*|wip\w*|eras\w*|emptie\w*"
+    r"|overwr\w*|clobber\w*|mv|mov\w*|renam\w*|reset|checkout|clean|corrupt\w*|destroy\w*"
+    r"|credential\w*|ssh|secrets?|tokens?|keys?|passwords?|environ|env|exfiltrat\w*|leak\w*"
+    r"|curl|wget|scp|rsync|nc|netcat|upload\w*|sen[dt]\w*|post\w*|chmod|chown|mkfs|dd"
+    r"|shutdown|reboot|push\w*|sudo|docker|mount|host)\b",
     re.I,
 )
 
 
 def kills_processes(command: str) -> bool:
-    """Whether a command stops processes: kill, pkill, killall, or a walk over /proc."""
-    return bool(_PROCESS_KILL.search(command)) or "/proc/" in command
+    """Whether a command stops processes with kill, pkill or killall."""
+    return bool(_PROCESS_KILL.search(command))
 
 
 def only_about_killing(text: str) -> bool:
-    """Whether a finding's text is about stopping processes and nothing else harmful,
-    such as deleting files or reading credentials."""
+    """Whether a finding's text is about stopping processes and names nothing else
+    that could do harm, such as deleting or moving files, reading credentials or
+    sending data out."""
     return bool(_KILL_WORDS.search(text)) and not _OTHER_HARM.search(text)
 
 

@@ -161,3 +161,29 @@ async def test_resume_checks_again_a_stop_on_calls_the_user_had_seen(
         if t.parent_task_id == qa.id and t.agent is AgentName.USER
     ]
     assert [t.status for t in asked] == [TaskStatus.DONE, TaskStatus.SUPERSEDED]
+
+
+async def test_a_check_made_again_that_still_fails_keeps_the_stop_and_its_question(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = await _team(tmp_path, dangerous={1, 2})
+    run_id = await _stopped_change(app)
+
+    async def forget(*_: Any) -> bool:
+        """Record nothing, as the team did before it kept seen calls."""
+        return False
+
+    monkeypatch.setattr(app.orchestrator, "_note_seen_calls", forget)
+    await app.orchestrator.answer(run_id, GUIDANCE)
+    monkeypatch.undo()
+
+    reply = await app.orchestrator.resume(run_id)
+    # The retry's own call is still dangerous: the stop stands and still asks the user.
+    assert reply.kind == "stopped", reply.text
+    assert "unsafe" in await _asked(app, run_id)
+    [recheck] = [
+        d for d in await app.stores.decisions.list(run_id) if d.rule == "recheck_seen_calls"
+    ]
+    assert recheck.choice == "keep the stop"
+    qa = await _change_qa(app, run_id)
+    assert qa.status is TaskStatus.ESCALATED and qa.attempt == 2

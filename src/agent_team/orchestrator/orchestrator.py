@@ -16,7 +16,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 from agent_team.agents.planner import kind_from_objective, planning_objective
-from agent_team.core.artifacts import Artifact, CodeChange, Plan, Spec, plain_kind
+from agent_team.core.artifacts import Artifact, ArtifactRef, CodeChange, Plan, Spec, plain_kind
 from agent_team.core.models import (
     AgentName,
     Decision,
@@ -35,6 +35,7 @@ from agent_team.core.models import (
     Task,
     TaskOrigin,
     TaskStatus,
+    Verdict,
     check_reason,
     is_safety_stop,
     new_id,
@@ -133,13 +134,14 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
         the task that this check didn't take into account: such a check judged tool
         calls the user had already seen. Answers recorded before seen calls were kept
         are counted first, so a run stopped that way is judged again, not asked again."""
-        for task in await self.tasks.list_tasks(run.id, status=TaskStatus.ESCALATED):
+        tasks = await self.tasks.list_tasks(run.id)
+        for task in tasks:
             output = task.output
-            if not is_work(task) or output is None:
+            if task.status is not TaskStatus.ESCALATED or not is_work(task) or output is None:
                 continue
             asked = [
                 t
-                for t in await self.tasks.list_tasks(run.id)
+                for t in tasks
                 if t.parent_task_id == task.id
                 and t.agent is AgentName.USER
                 and t.reason in (TASK_QUESTION, ESCALATION)
@@ -160,26 +162,52 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             seen = seen_before(after, task.id)
             if seen is None or seen >= latest.created_at:
                 continue
-            for question in waiting:
-                await self.tasks.transition(
-                    question.id, TaskStatus.SUPERSEDED, reason="the check is made again"
-                )
-            task.depends_on = [d for d in task.depends_on if d not in {q.id for q in waiting}]
-            task = await self.tasks.update_task(task)
-            await self._record(
-                Decision(
-                    run_id=run.id,
-                    task_id=task.id,
-                    kind=DecisionKind.RETRY,
-                    inputs={"verdict_id": latest.id, "user_tasks": [q.id for q in waiting]},
-                    choice="check the work again",
-                    reason="its check stopped on tool calls the user had already seen",
-                    made_by="code",
-                    rule="recheck_seen_calls",
-                )
+            if not await self._check_again(run, task, output, latest, waiting):
+                return  # paused, or the stop stands and the run is stopped again
+
+    async def _check_again(
+        self, run: Run, task: Task, output: ArtifactRef, stopped: Verdict, waiting: list[Task]
+    ) -> bool:
+        """Check an escalated task's output again for ``_recheck_safety_stops``. A pass
+        finishes the task and retires the questions ``waiting`` on the user; anything
+        else leaves them and the run stopped. Returns whether it passed."""
+        artifact = await self.artifacts.load(run.id, output)
+        check = await self._check_task(run, task)
+        try:
+            verdict = await self.dispatcher.check(check, task, artifact)
+        except PAUSING as exc:
+            await self._pause(run.id, exc)
+            return False
+        await self._save_verdict(verdict, check=check)
+        await self._record(
+            Decision(
+                run_id=run.id,
+                task_id=task.id,
+                kind=DecisionKind.RETRY,
+                inputs={
+                    "verdict_id": verdict.id,
+                    "stopped_by": stopped.id,
+                    "user_tasks": [q.id for q in waiting],
+                },
+                choice="finish the task" if verdict.passed else "keep the stop",
+                reason="its check stopped on tool calls the user had already seen, so it "
+                "was checked again without them",
+                made_by="code",
+                rule="recheck_seen_calls",
             )
-            artifact = await self.artifacts.load(run.id, output)
-            await self._audit(run, task, artifact, recheck=True)
+        )
+        if not verdict.passed:
+            await self._set_status(run.id, RunStatus.STOPPED)
+            return False
+        for question in waiting:
+            await self.tasks.transition(
+                question.id, TaskStatus.SUPERSEDED, reason="the work passed its check again"
+            )
+        task = await self.tasks.get_task(task.id)
+        task.depends_on = [d for d in task.depends_on if d not in {q.id for q in waiting}]
+        task = await self.tasks.update_task(task)
+        await self._passed(run, task, artifact)
+        return True
 
     async def stop(self, run_id: str, reason: str = "stopped by the user") -> None:
         """The kill switch: the run halts at the next safe point and can be resumed."""
@@ -325,13 +353,10 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             if task.status is TaskStatus.AUDITING:  # not superseded while it ran
                 await self._audit(run, task, result.artifact)
 
-    async def _audit(
-        self, run: Run, task: Task, artifact: Artifact | None, *, recheck: bool = False
-    ) -> None:
+    async def _audit(self, run: Run, task: Task, artifact: Artifact | None) -> None:
         """Check one output with an auditor task and apply the policy's decisions. The
         check has its own attempts and fails closed; budget or stop pauses the run, and
-        the task stays auditing to be checked on resume. ``recheck`` checks an
-        escalated task's output again, as ``_recheck_safety_stops`` does."""
+        the task stays auditing to be checked on resume."""
         check = await self._check_task(run, task)
         try:
             verdict = await self.dispatcher.check(check, task, artifact)
@@ -340,9 +365,7 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             return
         await self._save_verdict(verdict, check=check)
         task = await self.tasks.get_task(task.id)
-        if task.status is not TaskStatus.AUDITING and not (
-            recheck and task.status is TaskStatus.ESCALATED
-        ):
+        if task.status is not TaskStatus.AUDITING:
             return  # superseded by a reopen while the auditor ran
         task.finding_ids = [f.id for f in verdict.findings if f.severity is Severity.BLOCKER]
         task = await self.tasks.update_task(task)
@@ -358,15 +381,20 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
         if not decisions and not verdict.passed:
             decisions = await SimplePolicy().on_task_verdict(run, task, verdict, history)
         if not decisions:
-            await self.tasks.transition(task.id, TaskStatus.DONE, reason="audit passed")
-            self.llm.set_override(task.id, None)
-            if isinstance(artifact, Plan):
-                await self._after_plan(run, task, artifact)
-            elif isinstance(artifact, CodeChange) and artifact.spec_deviations:
-                await self._record_deviations(run, task, artifact)
+            await self._passed(run, task, artifact)
             return
         for decision in decisions:
             await self._apply(run, decision, verdict)
+
+    async def _passed(self, run: Run, task: Task, artifact: Artifact | None) -> None:
+        """A task's output passed its check: the task is done, its route goes back to
+        its own model, and a plan expands into the pipeline."""
+        await self.tasks.transition(task.id, TaskStatus.DONE, reason="audit passed")
+        self.llm.set_override(task.id, None)
+        if isinstance(artifact, Plan):
+            await self._after_plan(run, task, artifact)
+        elif isinstance(artifact, CodeChange) and artifact.spec_deviations:
+            await self._record_deviations(run, task, artifact)
 
     async def _after_plan(self, run: Run, task: Task, plan: Plan) -> None:
         """Expand a passed plan into the fixed pipeline of tasks."""

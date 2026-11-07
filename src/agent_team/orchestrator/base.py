@@ -186,9 +186,7 @@ class OrchestratorBase:
         #: (phase, newest task id) pairs already reported finished, per run.
         self._finished: dict[str, set[tuple[Phase, str]]] = {}
 
-    async def _audit(
-        self, run: Run, task: Task, artifact: Artifact | None, *, recheck: bool = False
-    ) -> None:
+    async def _audit(self, run: Run, task: Task, artifact: Artifact | None) -> None:
         """The task sweep; the mixins call it and Orchestrator implements it."""
         raise NotImplementedError  # the task sweep lives in Orchestrator
 
@@ -204,8 +202,8 @@ class OrchestratorBase:
             return False
         verdict = judged[-1]
         flagged = [f for f in verdict.blockers if is_safety_stop(f)]
-        if not flagged:
-            return False
+        if not flagged or any(f.rule_id == AUDIT_RULE for f in verdict.blockers):
+            return False  # nothing to see, or the model never judged the calls
         if any(
             d.rule == SEEN_CALLS and d.inputs.get("user_task") == question.id
             for d in await self.decisions.list(run.id)

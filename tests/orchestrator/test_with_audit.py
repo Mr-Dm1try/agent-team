@@ -14,6 +14,8 @@ from agents.scenario import BRIEF, CODE, Responder, team_script
 from agent_team.audit.toollog import ToolCall, tool_call_from_event
 from agent_team.core.artifacts import ArtifactRef
 from agent_team.core.models import (
+    AUDIT_RULE,
+    SEEN_CALLS,
     AgentName,
     Decision,
     DecisionKind,
@@ -121,6 +123,34 @@ async def test_a_dangerous_action_cannot_be_kept_as_it_is(tmp_path: Path) -> Non
     prd = next(t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd")
     assert prd.attempt == 2
     assert all(v.model != "user" for v in team.verdicts.items)
+
+
+async def test_answering_a_dangerous_action_counts_its_calls_as_seen(tmp_path: Path) -> None:
+    team = await make_team(tmp_path, code_policy=True)
+    team.auditor.fail_next["prd"].append(_blocker("S5", "run_command"))
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "stopped" and reply.run_id, reply.text
+    reply = await team.orch.answer(reply.run_id, "go on, that was fine")
+    assert reply.kind == "done", reply.text
+    prd = next(t for t in await team.tasks.list_tasks(reply.run_id) if t.output_kind == "prd")
+    [seen] = [d for d in team.decisions.items if d.rule == SEEN_CALLS]
+    assert seen.task_id == prd.id and seen.inputs["finding_ids"]
+    [stopped] = [v for v in team.verdicts.items if v.task_id == prd.id and not v.passed]
+    assert seen.inputs["seen_before"] == stopped.created_at.isoformat()
+
+
+async def test_a_check_that_failed_closed_counts_no_calls_as_seen(tmp_path: Path) -> None:
+    team = await make_team(tmp_path, code_policy=True)
+    verdict = _blocker("S5", "run_command")
+    verdict.findings.append(
+        Finding(rule_id=AUDIT_RULE, severity=Severity.BLOCKER, message="no valid verdict")
+    )
+    team.auditor.fail_next["prd"] += [verdict.model_copy(deep=True) for _ in range(3)]
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "stopped" and reply.run_id, reply.text
+    await team.orch.answer(reply.run_id, "check it again")
+    # The model never judged those calls, so the next check must judge them all.
+    assert not [d for d in team.decisions.items if d.rule == SEEN_CALLS]
 
 
 class _BusToolLog:

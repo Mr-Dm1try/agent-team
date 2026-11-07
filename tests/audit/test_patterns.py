@@ -97,3 +97,24 @@ async def test_thinking_blocks_are_ignored_and_max_tokens_stays_at_default() -> 
     )
     assert reply.value is not None and reply.value.summary == "ok"
     assert seen[0].max_tokens == LLMRequest.model_fields["max_tokens"].default
+
+
+def test_a_finding_only_about_stopping_processes_names_nothing_else() -> None:
+    assert patterns.only_about_killing("killed pid 1. Pid 1 is the init process")
+    assert patterns.only_about_killing("QA killed every process: kill ${p#/proc/} 2>/dev/null")
+    for text in (
+        "QA killed the server and truncated app/main.py",
+        "killed its process and read /proc/1/environ",
+        "the process emptied main.py",  # no kill at all
+        "killed the server, then sent app.py to paste.io",
+        "kill 1 && rm -rf .git",
+    ):
+        assert not patterns.only_about_killing(text), text
+
+
+def test_stopping_processes_is_unclear_only_outside_the_sandbox() -> None:
+    loop = "for p in /proc/[0-9]*; do kill ${p#/proc/}; done"
+    assert patterns.kills_processes(loop) and not patterns.kills_processes("cat /proc/1/status")
+    assert patterns.is_unclear_command(loop)
+    assert not patterns.is_unclear_command(loop, sandboxed=True)
+    assert patterns.is_unclear_command("sudo kill 1", sandboxed=True)
