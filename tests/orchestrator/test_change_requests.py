@@ -12,12 +12,13 @@ from typing import Any
 
 from agents.scenario import PLAN_BUILD, PRD, QA, SPEC, orchestrator_responder, team_script
 
-from agent_team.core.artifacts import ArtifactRef
+from agent_team.core.artifacts import ArtifactRef, CodeChange
 from agent_team.core.models import (
     AgentName,
     DecisionKind,
     FeedbackSource,
     Finding,
+    Phase,
     RuleScope,
     Severity,
     Task,
@@ -27,6 +28,7 @@ from agent_team.core.models import (
     new_id,
 )
 from agent_team.llm.types import LLMRequest
+from agent_team.orchestrator.base import names_code, reruns_code
 from orchestrator.harness import make_team
 
 CHANGE = "Add a search route"
@@ -207,8 +209,15 @@ async def test_guidance_that_names_the_code_reruns_the_code_then_qa(tmp_path: Pa
     assert qa[-1].status is TaskStatus.DONE
     assert qa[-1].created_at > engineers[-1].created_at
     assert engineers[-1].id in qa[-1].depends_on
-    [user_fb] = [f for _, f in team.feedback.items if f.source is FeedbackSource.USER_ANSWER]
-    assert user_fb.task_id == engineers[-2].id
+    # The guidance went to the code and to QA's fresh review.
+    given = [f.task_id for _, f in team.feedback.items if f.source is FeedbackSource.USER_ANSWER]
+    assert given == [engineers[-2].id, qa[-2].id]
+    assert (
+        guidance
+        in [
+            prompt(r) for r in team.llm.requests if r.agent is AgentName.QA and len(r.messages) == 1
+        ][-1]
+    )
 
 
 async def test_guidance_for_a_review_stuck_on_its_own_work_retries_qa(tmp_path: Path) -> None:
@@ -303,3 +312,54 @@ async def test_tasks_on_a_local_model_queue_before_their_timeout_starts(tmp_path
     reply = await team2.orch.handle("Build a books API")
     assert reply.kind == "done", reply.text
     assert most == 3
+
+
+def test_guidance_names_the_code_unless_it_says_to_leave_it() -> None:
+    assert names_code("Retry the code: implement list_recent_notes (recent.py)")
+    assert names_code("ask the engineer to add recent.py")
+    assert not names_code("don't touch the code, just rerun tests/test_api.py")
+    assert not names_code("exit code 5 means no tests were collected")
+    assert not names_code("Record the open question as an assumption")
+    qa = Task(
+        run_id="r",
+        phase=Phase.IMPLEMENTATION,
+        agent=AgentName.QA,
+        objective="o",
+        output_kind="qa_report",
+    )
+    on_code = blocker("R7", "500 on GET /books", item="app.py", artifact=None)
+    assert reruns_code(qa, on_code)
+    # Saying to leave the code alone wins over code blockers; other agents never rerun it.
+    assert not reruns_code(qa, on_code, "leave the code as it is and check again")
+    engineer = qa.model_copy(update={"agent": AgentName.ENGINEER})
+    assert not reruns_code(engineer, on_code, "fix the code")
+
+
+async def test_a_retry_of_the_code_reopens_the_engineer_that_wrote_the_file(
+    tmp_path: Path,
+) -> None:
+    team = await make_team(tmp_path)
+    run = await team.orch.start_run("Build a books API")
+    engineers = []
+    for path in ("a.py", "b.py"):
+        ref = await team.artifacts.save(
+            CodeChange(run_id=run.id, summary="s", files_written=[path])
+        )
+        engineers.append(
+            Task(
+                run_id=run.id,
+                phase=Phase.IMPLEMENTATION,
+                agent=AgentName.ENGINEER,
+                objective="o",
+                output_kind="code_change",
+                output=ref,
+            )
+        )
+
+    def at(item: str) -> list[Finding]:
+        """One R7 blocker on ``item``."""
+        return blocker("R7", "broken", item=item, artifact=None).findings
+
+    assert await team.orch._code_at_fault(run, engineers, at("a.py:12")) is engineers[0]
+    assert await team.orch._code_at_fault(run, engineers, at("b.py")) is engineers[1]
+    assert await team.orch._code_at_fault(run, engineers, at("c.py")) is engineers[1]

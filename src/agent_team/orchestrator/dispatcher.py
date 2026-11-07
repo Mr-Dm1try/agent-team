@@ -401,9 +401,8 @@ class Dispatcher:
         passes after it. The user's words always stay."""
         if self.verdicts is None:
             return feedback
-        passed = [
-            v.created_at for t in chain for v in await self.verdicts.for_task(t.id) if v.passed
-        ]
+        verdicts = await asyncio.gather(*(self.verdicts.for_task(t.id) for t in chain))
+        passed = [v.created_at for found in verdicts for v in found if v.passed]
         if not passed:
             return feedback
         resolved = max(passed)

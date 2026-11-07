@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from agent_team.audit.policy import CodeVerdictPolicy, PolicyLimits, decide_task, planned_in
+from agent_team.audit.policy import (
+    CodeVerdictPolicy,
+    PolicyLimits,
+    blame_code,
+    decide_task,
+    planned_in,
+)
 from agent_team.core.artifacts import (
     ArtifactRef,
     CodeChange,
@@ -553,10 +559,12 @@ def test_a_requirement_the_spec_lacks_still_reopens_the_spec(run: Run) -> None:
         run, AgentName.ARCHITECT, Phase.SPEC, "spec", output=ArtifactRef.parse("spec@v2")
     )
     spec = _planned_spec()
-    # REQ-11 isn't planned (and REQ-1 doesn't match it), and a wrong plan isn't missing code.
+    # REQ-11 isn't planned (and REQ-1 doesn't match it), and a wrong or incomplete
+    # plan isn't missing code.
     for f in (
         missing("REQ-11", "REQ-11 is not implemented"),
         missing("REQ-10", "REQ-10 contradicts the PRD's REQ-1"),
+        missing("REQ-10", "REQ-10 is missing an acceptance criterion", "prd@v2"),
     ):
         out = decide_task(
             run, qa, verdict(run, f, task=qa), [], [], LIMITS, [*tasks, arch], outputs, spec
@@ -569,9 +577,43 @@ def test_a_requirement_the_spec_lacks_still_reopens_the_spec(run: Run) -> None:
     assert kinds(out)[-1] is DecisionKind.UPSTREAM_RERUN
 
 
+def test_an_engineers_own_check_moves_only_its_own_packages_misses(run: Run) -> None:
+    tasks, outputs = impl_tasks(run)
+    db, api, _ = _packaged(tasks)
+    spec = _planned_spec()
+    f = missing("REQ-10", "REQ-10 is not implemented; app/recent.py is missing")
+    # The api Engineer builds recent, so its own check retries its own code.
+    mine = decide_task(
+        run, api, verdict(run, f, task=api), [], [], LIMITS, [db, api], outputs, spec
+    )
+    assert kinds(mine) == [DecisionKind.RETRY] and mine[0].inputs["blamed_code"] == [f.id]
+    # The db Engineer doesn't: that stays a question for the spec, as before.
+    arch = make_task(
+        run, AgentName.ARCHITECT, Phase.SPEC, "spec", output=ArtifactRef.parse("spec@v2")
+    )
+    other = decide_task(
+        run, db, verdict(run, f, task=db), [], [], LIMITS, [db, api, arch], outputs, spec
+    )
+    assert kinds(other) == [DecisionKind.ESCALATE, DecisionKind.UPSTREAM_RERUN]
+
+
+def test_a_moved_finding_keeps_its_evidence(run: Run) -> None:
+    tasks, _ = impl_tasks(run)
+    qa = _packaged(tasks)[-1]
+    f = missing("REQ-10", "REQ-10 is not implemented").model_copy(
+        update={"evidence": "pytest: no tool list_recent_notes"}
+    )
+    blockers, moved = blame_code([f], qa, _planned_spec(), _packaged(tasks), _packaged(tasks))
+    assert moved == [f.id]
+    assert blockers[0].evidence is not None
+    assert blockers[0].evidence.startswith("pytest: no tool list_recent_notes\nspec@v2 plans it")
+
+
 def test_planned_in_matches_whole_ids_and_file_names() -> None:
     spec = _planned_spec()
-    assert planned_in(spec, missing("REQ-10", "missing")) == ["recent"]
+    assert planned_in(spec, missing("REQ-10", "not implemented")) == ["recent"]
+    # A requirement that lacks something in the PRD or spec isn't missing code.
+    assert planned_in(spec, missing("REQ-10", "REQ-10 is missing an acceptance criterion")) == []
     assert planned_in(spec, missing("x", "recent.py is missing")) == ["recent"]
     assert planned_in(spec, missing("x", "REQ-100 is missing")) == []
     assert planned_in(spec, missing("x", "app/recent.pyc is missing")) == []

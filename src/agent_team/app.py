@@ -204,7 +204,7 @@ async def build_app(
         )
     bus.on_before(EventName.TOOL_CALL_BEFORE, make_precheck_hook(auditor, stores.tasks))
     if config.sandbox.commit_versions:
-        bus.on_after(EventName.AUDIT_VERDICT, make_commit_hook(stores.tasks))
+        bus.on_after(EventName.AUDIT_VERDICT, make_commit_hook(stores.tasks, stores.artifacts))
     if tools is None:
         try:
             tools, runner = await _build_tools(config, runs_dir, runner, closers)

@@ -44,6 +44,7 @@ model) on STRONGER_MODEL.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -199,52 +200,74 @@ def route(
     return _producer(ref, others)
 
 
-#: Words a finding uses for work that is missing, rather than wrong.
+#: Words a finding uses for a file or interface that isn't in the code.
 MISSING = re.compile(
     r"\b(missing|not implemented|unimplemented|not registered|not found|absent"
     r"|doesn't exist|does not exist|no such)\b",
     re.I,
 )
+#: Words that say a requirement isn't built, as opposed to the PRD or spec lacking
+#: something about it, such as "REQ-3 is missing an acceptance criterion".
+NOT_BUILT = re.compile(
+    r"\b(not implemented|unimplemented|isn't implemented|not registered|not built)\b", re.I
+)
 #: Upstream kinds whose blame is checked against the current spec.
 PLANNING_KINDS = frozenset({"prd", "spec"})
 
 
-def _names(text: str, name: str) -> bool:
-    """Whether ``text`` names ``name`` as a whole word, id or path (a planned file also
-    by its file name), so REQ-1 doesn't match REQ-10."""
-    names = {name, name.rsplit("/", 1)[-1]} if "." in name else {name}
+def _names(text: str, names: Iterable[str]) -> bool:
+    """Whether ``text`` names any of ``names`` as a whole word, id or path, so REQ-1
+    doesn't match REQ-10 and recent.py doesn't match recent.pyc."""
     return any(re.search(rf"(?<![\w./-]){re.escape(n)}(?![\w-])", text) for n in names)
 
 
 def planned_in(spec: Spec, finding: Finding) -> list[str]:
-    """The components of ``spec`` that already plan what a finding says is missing: a
-    requirement id they map, a file they plan or an interface they expose. When there
-    are any, the code lacks it, not the spec."""
+    """The components of ``spec`` that already plan what a finding says the code
+    lacks: a file they plan or an interface they expose that is missing, or a
+    requirement id they map that isn't built (R5, planned files, counts as either).
+    When there are any, the code lacks it, not the spec."""
     text = f"{finding.item or ''} {finding.message} {finding.evidence or ''}"
-    if finding.rule_id != "R5" and not MISSING.search(text):
+    files_missing = finding.rule_id == "R5" or MISSING.search(text) is not None
+    req_missing = finding.rule_id == "R5" or NOT_BUILT.search(text) is not None
+    if not (files_missing or req_missing):
         return []
-    exposed = {i.name: i.component for i in spec.interfaces}
-    found = [
-        c.name
-        for c in spec.components
-        if any(_names(text, n) for n in [*c.requirements, *c.files])
-        or any(_names(text, n) for n, owner in exposed.items() if owner == c.name)
-    ]
+    # A planned file is also named by its file name, when no other planned file has it.
+    basenames = Counter(f.rsplit("/", 1)[-1] for c in spec.components for f in c.files)
+    found: list[str] = []
+    for c in spec.components:
+        things = [i.name for i in spec.interfaces if i.component == c.name]
+        for path in c.files:
+            base = path.rsplit("/", 1)[-1]
+            things += [path, base] if basenames[base] == 1 and base != "__init__.py" else [path]
+        if (files_missing and _names(text, things)) or (
+            req_missing and _names(text, c.requirements)
+        ):
+            found.append(c.name)
     return found
 
 
 def _builder(
     components: list[str], task: Task, spec: Spec, engineers: list[Task], tasks: list[Task]
 ) -> Task | None:
-    """The Engineer task that builds these components: ``task`` itself when it is an
-    Engineer, else the one for their work package, else the last Engineer."""
-    if task.agent is AgentName.ENGINEER:
-        return task
+    """The Engineer task that builds these components: the one for their work package,
+    else the last Engineer. An Engineer's own check names only itself, and only when
+    the components are in its package: another package's are built by its own task."""
     packages = {p.name for p in spec.work_packages if set(p.components) & set(components)}
+    if task.agent is AgentName.ENGINEER:
+        mine = package_of(ancestry(task, tasks)[0])
+        return task if not spec.work_packages or mine in packages else None
     for t in reversed(engineers):
         if package_of(ancestry(t, tasks)[0]) in packages:
             return t
     return engineers[-1] if engineers else None
+
+
+def needs_spec(task: Task, blockers: Iterable[Finding]) -> bool:
+    """Whether deciding these blockers needs the current spec: an Implementation task's
+    check that blames the PRD or spec."""
+    return task.phase is Phase.IMPLEMENTATION and any(
+        f.artifact is not None and f.artifact.kind in PLANNING_KINDS for f in blockers
+    )
 
 
 def blame_code(
@@ -257,7 +280,7 @@ def blame_code(
     """``blockers`` with each PRD or spec blame about something the current spec
     already plans moved to the code of the Engineer that builds it, and the ids of the
     findings moved. Only in Implementation, where the code is built from that spec."""
-    if spec is None or task.phase is not Phase.IMPLEMENTATION:
+    if spec is None or not needs_spec(task, blockers):
         return blockers, []
     engineers = [t for t in phase_tasks if t.agent is AgentName.ENGINEER and t.output is not None]
     out: list[Finding] = []
@@ -270,7 +293,8 @@ def blame_code(
             out.append(f)
             continue
         note = f"spec@v{spec.version} plans it in {', '.join(components)}, so the code lacks it"
-        out.append(f.model_copy(update={"artifact": target, "evidence": note}))
+        evidence = f"{f.evidence}\n{note}" if f.evidence else note
+        out.append(f.model_copy(update={"artifact": target, "evidence": evidence}))
         moved.append(f.id)
     return out, moved
 
@@ -765,11 +789,13 @@ class CodeVerdictPolicy:
         self, run: Run, task: Task, verdict: Verdict, history: list[Verdict]
     ) -> list[Decision]:
         """Decisions for a task verdict; see ``decide_task``. The outputs of the live
-        tasks in the task's phase are loaded so fixes can be routed by file."""
+        tasks in the task's phase are loaded so fixes can be routed by file, and the
+        current spec when a blocker blames it or the PRD in Implementation."""
         if verdict.passed and not verdict.blockers:
             return []
         past = await self.decisions.list(run.id)
         tasks = await self.tasks.list_tasks(run.id)
+        spec = await self._spec(run, tasks) if needs_spec(task, verdict.blockers) else None
         outputs: dict[str, Artifact] = {}
         for t in tasks:
             if (
@@ -787,7 +813,7 @@ class CodeVerdictPolicy:
             self.limits,
             tasks,
             outputs,
-            spec=await self._spec(run, tasks),
+            spec=spec,
         )
 
     async def _spec(self, run: Run, tasks: list[Task]) -> Spec | None:

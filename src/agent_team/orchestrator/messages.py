@@ -205,13 +205,17 @@ def renumber(text: str) -> str:
     """Each numbered list numbered by its items' places, from the first item's number,
     so a model's "1, 2, 2, 3" reads 1, 2, 3, 4. A list goes on across blank lines and
     deeper lines (an item's own text or a nested list), and ends at a line as shallow
-    as its items that isn't one."""
+    as its items that isn't one. Fenced code blocks are left as they are."""
     counters: dict[int, int] = {}  # indent -> the number the next item there gets
+    fenced = False
     out: list[str] = []
     for line in text.split("\n"):
-        m = _ITEM.match(line)
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            counters = {}
+        m = None if fenced else _ITEM.match(line)
         indent = len(line) - len(line.lstrip())
-        if not line.strip():
+        if fenced or not line.strip():
             out.append(line)
             continue
         counters = {i: n for i, n in counters.items() if i < indent or (m and i == indent)}

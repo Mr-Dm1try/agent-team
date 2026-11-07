@@ -66,6 +66,12 @@ ESCALATION = "escalation"
 CODE_RULES = frozenset({"R5", "R7"})
 #: Guidance that names the code, so another try of QA's review reruns the code first.
 NAMES_CODE = re.compile(r"\b(code|engineer|implement\w*)\b|\.py\b", re.I)
+#: Words that name a code without meaning the code, such as "exit code 5".
+OTHER_CODES = re.compile(r"\b(exit|status|error|return|http|response)\s+codes?\b", re.I)
+#: Guidance that says to leave the code alone, such as "don't touch the code".
+LEAVE_CODE = re.compile(
+    r"\b(don't|do not|not|never|without|leave)\b(\W+\w+){0,3}?\W+(code|engineer)\b", re.I
+)
 
 
 def code_blockers(verdict: Verdict | None) -> list[Finding]:
@@ -80,12 +86,20 @@ def code_blockers(verdict: Verdict | None) -> list[Finding]:
     ]
 
 
+def names_code(guidance: str) -> bool:
+    """Whether guidance asks for work on the code: it names the code, an Engineer or a
+    Python file, and doesn't say to leave the code alone."""
+    text = OTHER_CODES.sub("", guidance)
+    return NAMES_CODE.search(text) is not None and LEAVE_CODE.search(text) is None
+
+
 def reruns_code(task: Task, verdict: Verdict | None, guidance: str = "") -> bool:
     """Whether guidance for another try of a stuck QA review reruns the code first:
-    its check failed on the code, or the guidance names the code."""
-    if task.agent is not AgentName.QA:
+    its check failed on the code, or the guidance names the code. Guidance that says
+    to leave the code alone never does."""
+    if task.agent is not AgentName.QA or LEAVE_CODE.search(guidance):
         return False
-    return bool(code_blockers(verdict)) or NAMES_CODE.search(guidance) is not None
+    return bool(code_blockers(verdict)) or names_code(guidance)
 
 
 def rerun_of(task: Task, verdict: Verdict | None) -> str:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import traceback
 
-from agent_team.core.artifacts import plain_kind
+from agent_team.core.artifacts import CodeChange, plain_kind
 from agent_team.core.errors import BudgetExceeded
 from agent_team.core.models import (
     SESSION,
@@ -23,6 +23,7 @@ from agent_team.core.models import (
     EventName,
     Feedback,
     FeedbackSource,
+    Finding,
     Phase,
     RequestKind,
     RuleScope,
@@ -84,6 +85,12 @@ HELD_REPLY = (
 TYPE_STOP = "To stop the run, type stop."
 #: The fallback when the message loop can't read a message.
 DIDNT_CATCH = "I didn't catch that. Could you say it another way?"
+
+
+def _others(verdict: Verdict | None, code: list[Finding]) -> list[Finding]:
+    """The blockers of a failed check that aren't the code's: the reviewer's own."""
+    ids = {f.id for f in code}
+    return [f for f in (verdict.blockers if verdict else []) if f.id not in ids]
 
 
 class ConversationMixin(OrchestratorBase):
@@ -439,11 +446,12 @@ class ConversationMixin(OrchestratorBase):
         self, run: Run, target: Task, parent: Task, text: str, notes: list[str]
     ) -> bool:
         """Guidance for a stuck QA review whose check failed on the code, or that names
-        the code, retries the code: the Engineer task at fault is reopened with the
-        guidance and QA's blockers, and QA reviews again after it. Returns False when
-        the guidance is for QA's own work."""
+        the code, retries the code: the first Engineer task at fault is reopened with
+        the guidance and QA's code blockers, the tasks after it re-run, and QA reviews
+        again with the guidance and its own blockers. Returns False when the guidance
+        is for QA's own work."""
         failed = await self.verdicts.latest_for_task(parent.id)
-        if not reruns_code(parent, failed, text):
+        if APPROVE.match(text) or not reruns_code(parent, failed, text):
             return False
         live = [
             t
@@ -456,19 +464,13 @@ class ConversationMixin(OrchestratorBase):
         if not live:
             return False
         blockers = code_blockers(failed)
-        at_fault = [t for t in live if any(f.artifact == t.output for f in blockers)]
-        engineer = (at_fault or live)[-1]
+        engineer = await self._code_at_fault(run, live, blockers)
         await self.tasks.transition(target.id, TaskStatus.DONE, reason="answered")
-        await self.feedback.add(run.id, self._feedback(engineer, FeedbackSource.USER_ANSWER, text))
-        for f in blockers:
-            await self.feedback.add(
-                run.id,
-                self._feedback(
-                    engineer,
-                    FeedbackSource.QA,
-                    f"{f.rule_id} on {f.item or 'the code'}: {f.message}",
-                ),
-            )
+        for task, found in ((engineer, blockers), (parent, _others(failed, blockers))):
+            await self.feedback.add(run.id, self._feedback(task, FeedbackSource.USER_ANSWER, text))
+            for f in found:
+                said = f"{f.rule_id} on {f.item or 'the work'}: {f.message}"
+                await self.feedback.add(run.id, self._feedback(task, FeedbackSource.QA, said))
         await self._record(
             Decision(
                 run_id=run.id,
@@ -486,6 +488,21 @@ class ConversationMixin(OrchestratorBase):
         )
         notes.append("I'll retry the code with your guidance, then QA will check it again.")
         return True
+
+    async def _code_at_fault(
+        self, run: Run, engineers: list[Task], blockers: list[Finding]
+    ) -> Task:
+        """The first of ``engineers`` whose code a blocker is on, by its version or a
+        file it wrote, so reopening it re-runs the later ones too; else the last one."""
+        for t in engineers:
+            assert t.output is not None
+            code = await self.artifacts.load(run.id, t.output)
+            written = set(code.files_written) if isinstance(code, CodeChange) else set()
+            for f in blockers:
+                path = (f.item or "").split(":")[0].strip()
+                if f.artifact == t.output or path in written:
+                    return t
+        return engineers[-1]
 
     async def _keep_as_is(self, run: Run, target: Task, parent: Task) -> bool:
         """The user approved work that failed its check: keep it as it is. A passing
