@@ -132,6 +132,7 @@ async def test_a_command_runs_locked_down_and_offline(tmp_path: Path) -> None:
     assert kw["user"] == f"{os.getuid()}:{os.getgid()}"
     assert kw["cap_drop"] == ["ALL"] and kw["security_opt"] == ["no-new-privileges"]
     assert kw["read_only"] and "/tmp" in kw["tmpfs"]
+    assert kw["ulimits"] == [{"name": "core", "soft": 0, "hard": 0}]  # no core dumps
     assert (kw["mem_limit"], kw["nano_cpus"], kw["pids_limit"]) == ("512m", 500_000_000, 64)
     ws = str(tmp_path / "ws")
     assert kw["volumes"][ws] == {"bind": "/workspace", "mode": "rw"}

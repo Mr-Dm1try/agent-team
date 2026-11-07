@@ -10,6 +10,11 @@ link-local, cloud metadata and so on), and connects to the address it checked, s
 DNS answer that changes between the check and the connection can't reach an internal
 host. The URL stays in the call's ``url`` argument, which R2 matches citations against;
 the URL after redirects is in ``data.final_url``.
+
+JSON over the size cap is shortened first, so its structure survives: long strings
+are cut. A PyPI project document (``https://pypi.org/pypi/<package>/json``) becomes
+its latest version and the list of released versions, without the long description
+that would otherwise fill the cap before the version list.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import html
 import ipaddress
+import json
 import re
 import socket
 from collections.abc import Awaitable, Callable
@@ -39,6 +45,10 @@ Resolver = Callable[[str, int], Awaitable[list[str]]]
 REDIRECTS = frozenset({301, 302, 303, 307, 308})
 HTML_TYPES = ("text/html", "application/xhtml+xml")
 TEXT_TYPES = ("text/", "application/json", "application/xml", "application/x-yaml")
+#: Longest string value kept when JSON is shortened.
+JSON_STRING_CHARS = 300
+#: Longest list of dependencies shown for a PyPI project.
+PYPI_REQUIRES = 30
 _CLOSE_TAG = re.compile(r"<\s*/\s*untrusted_content", re.IGNORECASE)
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 _TAG = re.compile(r"<(script|style)\b.*?</\1>|<[^>]+>", re.DOTALL | re.IGNORECASE)
@@ -292,9 +302,87 @@ class WebFetchTool:
         if kind in HTML_TYPES or (not kind and raw.lstrip().startswith("<")):
             extracted = await asyncio.to_thread(_extract_html, raw, url)
             return extracted
+        if kind == "application/json" or kind.endswith("+json"):
+            return readable_json(raw, self.config.max_chars)
         if not kind or kind.startswith(TEXT_TYPES):
             return raw
         return None
+
+
+def readable_json(raw: str, limit: int) -> str:
+    """JSON as the model reads it: a PyPI project as its versions; anything else as it
+    came when it fits in ``limit`` characters, else compact with long strings cut so
+    the structure fits; the raw text if it doesn't parse."""
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return _cut_pypi_project(raw) or raw
+    if isinstance(value, dict) and isinstance(value.get("info"), dict) and "releases" in value:
+        return _pypi_project(value)
+    if len(raw) <= limit:
+        return raw
+    return json.dumps(_shorten(value), separators=(",", ":"), ensure_ascii=False)
+
+
+def _shorten(value: Any) -> Any:
+    """The JSON value with every string longer than ``JSON_STRING_CHARS`` cut."""
+    if isinstance(value, str) and len(value) > JSON_STRING_CHARS:
+        return value[:JSON_STRING_CHARS] + f"... [{len(value) - JSON_STRING_CHARS} chars cut]"
+    if isinstance(value, list):
+        return [_shorten(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _shorten(v) for k, v in value.items()}
+    return value
+
+
+def _pypi_project(doc: dict[str, Any]) -> str:
+    """A PyPI project document as its latest version, Python requirement, summary,
+    dependencies and every released version, newest first so a cut keeps the ones
+    people pin, marking yanked ones."""
+    info: dict[str, Any] = doc["info"]
+    releases = doc.get("releases")
+    lines = [
+        f"PyPI project {info.get('name')}: latest version {info.get('version')}"
+        + (f" (requires Python {info['requires_python']})" if info.get("requires_python") else "")
+    ]
+    if info.get("summary"):
+        lines.append(f"Summary: {info['summary']}")
+    requires = info.get("requires_dist") or []
+    if requires:
+        more = f" (+{len(requires) - PYPI_REQUIRES} more)" if len(requires) > PYPI_REQUIRES else ""
+        lines.append("Requires: " + "; ".join(map(str, requires[:PYPI_REQUIRES])) + more)
+    if isinstance(releases, dict):
+
+        def uploaded(files: Any) -> str:
+            """The earliest upload time of a release's files, for ordering."""
+            times = [f.get("upload_time_iso_8601") or f.get("upload_time") or "" for f in files]
+            return min((t for t in times if t), default="")
+
+        versions = []
+        for version, files in releases.items():
+            files = files if isinstance(files, list) else []
+            yanked = bool(files) and all(f.get("yanked") for f in files)
+            versions.append((uploaded(files), version, yanked, bool(files)))
+        versions.sort(key=lambda v: (v[0], v[1]), reverse=True)
+        shown = [v + (" (yanked)" if yanked else "") for _, v, yanked, has in versions if has]
+        lines.append(f"Released versions, newest first ({len(shown)}): " + ", ".join(shown))
+    return "\n".join(lines)
+
+
+def _cut_pypi_project(raw: str) -> str | None:
+    """The versions of a PyPI project document cut at the size cap, read from the text
+    since it no longer parses; None if it isn't one."""
+    head = re.search(r'"info"\s*:\s*\{', raw)
+    start = raw.find('"releases"')
+    if head is None or start < 0:
+        return None
+    latest = re.search(r'"version"\s*:\s*"([^"]+)"', raw[:start])
+    versions = re.findall(r'"([0-9][^"]*)"\s*:\s*\[', raw[start:])
+    return (
+        f"PyPI project (cut at the size cap): latest version "
+        f"{latest[1] if latest else 'unknown'}\n"
+        f"Released versions ({len(versions)}, maybe not all): " + ", ".join(versions)
+    )
 
 
 def _extract_html(html: str, url: str) -> str:

@@ -7,13 +7,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agents.fakes import FakeTaskStore
-from agents.scenario import BRIEF, PRD, SPEC, team_script
+from agents.fakes import FakeTaskStore, tool_call
+from agents.scenario import BRIEF, CODE, PRD, SPEC, team_script
 
 from agent_team.core.models import (
     AgentName,
     Decision,
     DecisionKind,
+    FeedbackSource,
     Finding,
     Phase,
     ReviewMode,
@@ -26,7 +27,8 @@ from agent_team.core.models import (
     TaskStatus,
     Verdict,
 )
-from agent_team.llm.types import LLMRequest
+from agent_team.llm.types import ContentBlock, LLMRequest
+from agent_team.orchestrator.policy import SimplePolicy
 from orchestrator.harness import make_team
 
 
@@ -227,7 +229,7 @@ async def test_research_requests_stop_at_the_run_cap(tmp_path: Path) -> None:
     assert "can't ask for more research" in second
 
 
-class UpstreamPolicy:
+class UpstreamPolicy(SimplePolicy):
     """Fails QA once and blames the spec, to drive an upstream re-run."""
 
     def __init__(self) -> None:
@@ -276,7 +278,7 @@ async def test_upstream_rerun_supersedes_and_rebuilds_downstream(tmp_path: Path)
     assert "Your previous output spec@v1" in arch[1].messages[0].content[0].text  # type: ignore[union-attr]
 
 
-class FixPolicy:
+class FixPolicy(SimplePolicy):
     """Sends QA's first finding back to the Engineer, and re-runs QA after the fix."""
 
     def __init__(self) -> None:
@@ -441,3 +443,29 @@ async def test_tool_events_carry_the_auditor_keys(tmp_path: Path) -> None:
     await team.orch.handle("Build a books API")
     after = [e for e in team.bus.events if e.name.value == "tool_call_after"]
     assert after and {"tool", "args", "result", "is_error", "blocked"} <= set(after[0].data)
+
+
+async def test_a_spec_deviation_reaches_the_next_spec_revision(tmp_path: Path) -> None:
+    script = team_script()
+    deviation = "mcp==1.30.0, not the spec's mcp==2.3.0: 2.3.0 has no mcp.server.fastmcp"
+
+    def engineer(request: LLMRequest) -> list[ContentBlock] | str:
+        """Write app.py, then report it with one departure from the spec."""
+        if len(request.messages) == 1:
+            return tool_call("write_file", {"path": "app.py", "content": "print('books')\n"})
+        return json.dumps({**CODE, "spec_deviations": [deviation]})
+
+    script[AgentName.ENGINEER] = engineer
+    team = await make_team(tmp_path, script=script)
+    reply = await team.orch.handle("Build a books API")
+    assert reply.kind == "done" and reply.run_id
+    [fb] = [f for _, f in team.feedback.items if f.source is FeedbackSource.ENGINEER]
+    assert fb.artifact is not None and fb.artifact.kind == "spec" and deviation in fb.text
+
+    reply = await team.orch.request_change(reply.run_id, "Add a search route", target="spec")
+    assert reply.kind == "done", reply.text
+    revision = [
+        r for r in team.llm.requests if r.agent is AgentName.ARCHITECT and len(r.messages) == 1
+    ][-1]
+    text = getattr(revision.messages[0].content[0], "text", "")
+    assert f"[engineer] code_change@v1 departs from spec@v1: {deviation}" in text

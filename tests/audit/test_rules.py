@@ -251,6 +251,63 @@ def test_r2_site_root_does_not_open_its_pages(run: Run) -> None:
     assert blockers(run_helper("R2", ctx)) == [page]
 
 
+def test_r2_an_unsourced_version_pin_fails(run: Run, tmp_path: Path) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    pypi = "https://pypi.org/pypi/mcp/json"
+    brief = ResearchBrief(
+        summary="Use the official SDK.",
+        answers=[AnsweredQuestion(question="q", answer="Pin mcp==2.3.0 and pytest==9.2.0.")],
+        findings=[ResearchFinding(claim="mcp ships FastMCP", sources=[Source(ref=pypi)])],
+        constraints=["fastapi==0.115.0 as the user asked"],
+    )
+    # The PyPI page was cut before its version list, so it shows neither pin.
+    cut = call(run, task, "web_fetch", "PyPI project mcp: latest version 1.30.0", url=pypi)
+    ctx = AuditContext(run=run, scope=RuleScope.TASK, task=task, artifact=brief, tool_calls=[cut])
+    run.request = "Build it with fastapi == 0.115.0"
+    found = run_helper("R2", ctx).findings
+    assert sorted(f.item or "" for f in found) == ["mcp==2.3.0", "pytest==9.2.0"]
+    assert all(f.severity is Severity.BLOCKER for f in found)
+    assert "pypi.org/pypi/mcp/json" in (found[0].suggested_fix or "")
+
+    # A source showing the version, saved to a file for being long, clears it; a
+    # version that only appears for another package, or inside a longer one, doesn't.
+    saved = tmp_path / "pypi.txt"
+    saved.write_text("PyPI project mcp: released versions: 1.29.0, 2.3.0\n")
+    full = cut.model_copy(update={"stored_at": str(saved)})
+    other = call(run, task, "web_fetch", "PyPI project pytest: 8.3.0, 9.2.01", url="https://x.org")
+    ctx = AuditContext(
+        run=run, scope=RuleScope.TASK, task=task, artifact=brief, tool_calls=[full, other]
+    )
+    assert [f.item for f in run_helper("R2", ctx).findings] == ["pytest==9.2.0"]
+
+
+def test_r2_pins_match_however_the_source_spells_them(run: Run) -> None:
+    task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
+    claims = (
+        "Pin pydantic-settings==2.1.0, typing_extensions==4.12.2 and httpx==0.28. "
+        "Requires python==3.12.1; GET returns status_code==200 and timeout>=30 is enough."
+    )
+    brief = ResearchBrief(summary="s", answers=[AnsweredQuestion(question="q", answer=claims)])
+    page = (
+        "pydantic_settings 2.1.0 released; Typing-Extensions v4.12.2 is out; "
+        "httpx versions: 0.27.2, 0.28.0"
+    )
+    fetched = call(run, task, "web_fetch", page, url="https://pypi.org/")
+    ctx = AuditContext(
+        run=run, scope=RuleScope.TASK, task=task, artifact=brief, tool_calls=[fetched]
+    )
+    # Hyphens, underscores, a v-tag and a zero-padded release all count; the
+    # interpreter and prose comparisons aren't pins.
+    assert run_helper("R2", ctx).findings == []
+    unseen = brief.model_copy(
+        update={"answers": [AnsweredQuestion(question="q", answer="pydantic-settings==2.2.0")]}
+    )
+    ctx = AuditContext(
+        run=run, scope=RuleScope.TASK, task=task, artifact=unseen, tool_calls=[fetched]
+    )
+    assert [f.item for f in run_helper("R2", ctx).findings] == ["pydantic-settings==2.2.0"]
+
+
 def test_p2_brief_complete(run: Run) -> None:
     task = make_task(run, AgentName.RESEARCHER, Phase.PLANNING, "research_brief")
     ok_brief = ResearchBrief(

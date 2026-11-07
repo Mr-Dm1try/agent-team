@@ -16,13 +16,15 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 from agent_team.agents.planner import kind_from_objective, planning_objective
-from agent_team.core.artifacts import Artifact, Plan, Spec, plain_kind
+from agent_team.core.artifacts import Artifact, CodeChange, Plan, Spec, plain_kind
 from agent_team.core.models import (
     AgentName,
     Decision,
     DecisionKind,
     Event,
     EventName,
+    Feedback,
+    FeedbackSource,
     Phase,
     RequestKind,
     ResultStatus,
@@ -265,6 +267,8 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             self.llm.set_override(task.id, None)
             if isinstance(artifact, Plan):
                 await self._after_plan(run, task, artifact)
+            elif isinstance(artifact, CodeChange) and artifact.spec_deviations:
+                await self._record_deviations(run, task, artifact)
             return
         for decision in decisions:
             await self._apply(run, decision, verdict)
@@ -296,6 +300,23 @@ class Orchestrator(ConversationMixin, SettleMixin, DecisionsMixin):
             },
             reason=f"{plan.request_kind} pipeline with one Researcher task per research question",
         )
+
+    async def _record_deviations(self, run: Run, task: Task, change: CodeChange) -> None:
+        """Passed code that departs from its spec: each deviation becomes Engineer
+        feedback on the spec version it was built from, which the next spec revision
+        reads and takes in."""
+        spec = next((r for r in change.built_from if r.kind == "spec"), None)
+        if spec is None:
+            return
+        for line in change.spec_deviations:
+            await self.feedback.add(
+                run.id,
+                Feedback(
+                    artifact=spec,
+                    source=FeedbackSource.ENGINEER,
+                    text=f"{task.output or 'the code'} departs from {spec}: {line}",
+                ),
+            )
 
     async def _start_implementation(self, run: Run, tasks: list[Task]) -> bool:
         """Once the spec is done: one Engineer task per work package, then QA. Returns

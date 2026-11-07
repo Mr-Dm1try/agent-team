@@ -247,7 +247,8 @@ class MemoryConfig(_Cfg):
     max_tokens: int = Field(default=500, ge=0)
     #: Text match (0 to 1) below which a memory is too weak to give.
     min_relevance: float = Field(default=0.3, ge=0, le=1)
-    #: Text match a decision or research fact from another run needs to be given.
+    #: Text match a decision or research fact from another run needs to be given,
+    #: counting words in common rather than BM25 (see memory/rank.py).
     strong_match: float = Field(default=0.6, ge=0, le=1)
     #: Cosine at or above which a new memory merges into an existing one.
     merge_similarity: float = Field(default=0.92, ge=0, le=1)

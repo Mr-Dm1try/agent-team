@@ -238,16 +238,25 @@ class TestRun(Contract):
     passed: int
     failed: int
     exit_code: int
-    output_tail: str
+    output_tail: str = Field(description="The last few lines of the test output, not all of it.")
 
 
 class CodeChange(ArtifactBase):
     """What one Engineer attempt wrote: files, the commit, and its test run."""
 
     kind: Literal["code_change"] = "code_change"
-    files_written: list[str]
+    files_written: list[str] = Field(
+        description="Workspace-relative paths of the files you wrote with write_file in this "
+        "attempt. Paths only, never file contents."
+    )
     commit: str | None = None  # git sha in the run workspace
     tests: TestRun | None = None
+    spec_deviations: list[str] = Field(
+        default_factory=list,
+        description="Where the code departs from the spec and why, one line each, such as "
+        "'mcp==1.30.0, not the spec's mcp==2.3.0: 2.3.0 has no mcp.server.fastmcp'. The "
+        "next spec revision takes these in.",
+    )
 
 
 class CriterionResult(Contract):

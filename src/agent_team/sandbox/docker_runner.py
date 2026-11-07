@@ -2,7 +2,8 @@
 
 Each container mounts the run's workspace read-write and its ``.git`` read-only, runs
 as the host user so files stay theirs, has a read-only root filesystem with a small
-``/tmp``, drops every capability and has CPU, memory and process limits. The network
+``/tmp``, drops every capability and has CPU, memory and process limits. Core dumps
+are off, so a crashing binary can't leave a ``core`` file in the workspace. The network
 is off unless the command asks for it, which only install_deps does.
 
 Every container carries labels naming this harness, its runs folder, the process that
@@ -162,6 +163,7 @@ class DockerRunner:
                 memswap_limit=self.config.memory,
                 nano_cpus=int(self.config.cpus * 1_000_000_000),
                 pids_limit=self.config.pids_limit,
+                ulimits=[{"name": "core", "soft": 0, "hard": 0}],
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges"],
                 read_only=True,

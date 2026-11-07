@@ -7,7 +7,9 @@ attempt spans (``span_started``/``span_finished`` of kind ``attempt``); the agen
 behind each task comes from the task store. An agent's time is the time inside its
 attempts, checks included for the auditor. A run's time is the time any attempt was
 running, so hours spent waiting on the user, or stopped, don't count. A task passes
-first time when the first verdict on it passed. Every task counts toward that rate
+first time when the first verdict on it passed and no attempt before it failed its
+own output (``OWN_OUTPUT_ERRORS``, such as JSON that never validated), which counts
+like a failed check. Every task counts toward that rate
 except fixes, which exist because a check failed on that work: a retry is another
 attempt of the same task, so only its first verdict counts, and a revision for a
 change request is new work with a first verdict of its own.
@@ -20,6 +22,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_team.core.errors import OWN_OUTPUT_ERRORS
 from agent_team.core.interfaces import TaskStore
 from agent_team.core.models import AgentName, Event, EventName, Run, Task, TaskOrigin
 from agent_team.core.tracing import SpanRecord, read_events, spans_from_events
@@ -39,8 +42,8 @@ class Stats:
     seconds: float = 0.0
     tasks: int = 0
     retries: int = 0
-    audited: int = 0  # planned tasks with at least one verdict
-    first_pass: int = 0  # ...whose first verdict passed
+    audited: int = 0  # planned tasks with a verdict or an output that failed validation
+    first_pass: int = 0  # ...whose first verdict passed with no failed output before it
 
     @property
     def first_pass_rate(self) -> float | None:
@@ -98,6 +101,13 @@ def compute(run: Run, tasks: list[Task], events: list[Event]) -> RunStats:
             and event.task_id not in first_verdict
         ):
             first_verdict[event.task_id] = bool(event.data.get("passed"))
+        elif (
+            event.name is EventName.ERROR
+            and event.data.get("error_type") in OWN_OUTPUT_ERRORS
+            and event.task_id in by_id
+            and event.task_id not in first_verdict
+        ):
+            first_verdict[event.task_id] = False  # its output failed before any check
     for task_id, passed in first_verdict.items():
         task = by_id[task_id]
         if task.origin is TaskOrigin.FIX or task.agent not in WORK_AGENTS:
@@ -155,7 +165,8 @@ HEADER = ("", "calls", "tokens in", "tokens out", "cost", "time", "tasks", "retr
 #: Printed under the table, so the time column can't be misread.
 FOOTNOTE = (
     "time: inside each agent's attempts (checks for the auditor); for a run, while any "
-    "attempt ran. 1st pass: share of tasks, fixes left out, whose first check passed."
+    "attempt ran. 1st pass: share of tasks, fixes left out, whose first check passed "
+    "with no invalid output before it."
 )
 
 

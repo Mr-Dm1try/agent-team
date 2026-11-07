@@ -153,3 +153,18 @@ def test_tables_show_each_run_and_agent() -> None:
 def test_a_run_with_no_events_has_zero_time() -> None:
     stats = compute(RUN, [], [])
     assert stats.total.seconds == 0.0 and stats.total.first_pass_rate is None
+
+
+def test_an_output_that_failed_validation_is_not_a_first_pass() -> None:
+    error = {"error_type": "OutputValidationError", "error": "files_written: none"}
+    events = [
+        _event(EventName.ERROR, 10, task_id="code", data=error),
+        _event(EventName.ERROR, 20, task_id="prd", data={"error_type": "BudgetExceeded"}),
+        _verdict(30, "code", True),
+        _verdict(31, "prd", True),
+    ]
+    stats = compute(RUN, TASKS[:2], events)
+    engineer, product = stats.agents["engineer"], stats.agents["product"]
+    assert (engineer.audited, engineer.first_pass) == (1, 0)
+    # A pause isn't the agent's output failing.
+    assert (product.audited, product.first_pass) == (1, 1)

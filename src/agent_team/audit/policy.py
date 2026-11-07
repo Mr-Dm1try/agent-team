@@ -19,6 +19,11 @@ policy first works out whose output each blocker is about:
    fixes; the user is asked.
 6. Still failing after an upstream re-run, or past a cap: ASK_USER.
 
+An attempt whose own output failed validation (``OWN_OUTPUT_ERRORS``) climbs the
+same ladder once the dispatcher escalates it, for no attempts left or for the same
+failure as the attempt before (no progress): one STRONGER_MODEL attempt, then
+ASK_USER (``decide_error``).
+
 Two more come from the auditor section: a dangerous agent action (S5, S6, S7) STOPs
 the run and asks the user, since it already happened, and this wins over everything
 else, including a fail-closed verdict that still carries such a helper hit; and a
@@ -40,6 +45,7 @@ from typing import Any
 
 from agent_team.audit.evidence import KIND_ORDER, KIND_PHASE
 from agent_team.core.artifacts import Artifact, ArtifactRef, CodeChange, plain_kind
+from agent_team.core.errors import is_own_output_error, repeats_error
 from agent_team.core.interfaces import ArtifactStore, DecisionLog, TaskStore, VerdictStore
 from agent_team.core.models import (
     AUDIT_RULE,
@@ -405,10 +411,7 @@ def decide_task(
             finding_ids=fids,
         )
     )
-    tried_stronger = task.model == limits.stronger_model or any(
-        d.kind is DecisionKind.STRONGER_MODEL and d.task_id in lineage for d in past
-    )
-    if tried_stronger:
+    if _tried_stronger(task, past, limits, lineage):
         out.append(
             _ask(
                 run,
@@ -430,6 +433,64 @@ def decide_task(
                 rule="policy.stronger_model",
                 model=limits.stronger_model,
                 finding_ids=fids,
+            )
+        )
+    return out
+
+
+def _tried_stronger(
+    task: Task, past: list[Decision], limits: PolicyLimits, lineage: set[str]
+) -> bool:
+    """Whether the task already ran on the stronger model, or was sent to it before."""
+    return task.model == limits.stronger_model or any(
+        d.kind is DecisionKind.STRONGER_MODEL and d.task_id in lineage for d in past
+    )
+
+
+def decide_error(
+    run: Run, task: Task, past: list[Decision], limits: PolicyLimits
+) -> list[Decision]:
+    """Decisions for a task the dispatcher escalated after an attempt whose own output
+    failed validation: no attempts left, or the same failure as the attempt before (no
+    progress). One last attempt on the stronger model, then the user is asked. Any
+    other error gets none, and the orchestrator asks the user."""
+    error = task.last_error
+    if task.status is not TaskStatus.ESCALATED or not is_own_output_error(error):
+        return []
+    stuck = repeats_error(error, task.previous_error)
+    out = [
+        _decision(
+            run,
+            DecisionKind.NO_PROGRESS if stuck else DecisionKind.ESCALATE,
+            task_id=task.id,
+            choice="escalate now" if stuck else "escalate",
+            reason=("the same failure as the attempt before" if stuck else "no attempts left")
+            + f": {error}",
+            rule="policy.error_no_progress" if stuck else "policy.error_escalate",
+            error=error,
+        )
+    ]
+    if _tried_stronger(task, past, limits, _lineage(task)):
+        out.append(
+            _ask(
+                run,
+                task.id,
+                f"The {_who(task)} still can't produce valid output after its attempts and "
+                f"the stronger model ({error}). Reply with guidance to retry it, or 'stop'.",
+                "policy.ask_after_stronger_model",
+                [],
+            )
+        )
+    else:
+        out.append(
+            _decision(
+                run,
+                DecisionKind.STRONGER_MODEL,
+                task_id=task.id,
+                choice=f"one last attempt on {limits.stronger_model}",
+                reason=f"the task's own output failed: {error}",
+                rule="policy.stronger_model",
+                model=limits.stronger_model,
             )
         )
     return out
@@ -609,3 +670,7 @@ class CodeVerdictPolicy:
             ):
                 outputs[t.id] = await self.artifacts.load(run.id, t.output)
         return decide_task(run, task, verdict, history, past, self.limits, tasks, outputs)
+
+    async def on_task_error(self, run: Run, task: Task) -> list[Decision]:
+        """Decisions for a task escalated after a failed attempt; see ``decide_error``."""
+        return decide_error(run, task, await self.decisions.list(run.id), self.limits)

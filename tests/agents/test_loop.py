@@ -25,6 +25,7 @@ from agent_team.core.models import (
     Usage,
 )
 from agent_team.llm.types import (
+    ContentBlock,
     LLMRequest,
     LLMResponse,
     Message,
@@ -531,3 +532,75 @@ def _summary(request: LLMRequest) -> str | None:
     if request.system.startswith("You compress"):
         return '{"done": [], "decisions": [], "remaining": []}'
     return None
+
+
+async def test_a_tool_call_cut_off_at_the_token_limit_is_not_run(tmp_path: Path) -> None:
+    env = envelope(tmp_path, AgentName.ENGINEER, "code_change")
+    replies: list[tuple[list[ContentBlock], str]] = [
+        (
+            [
+                ToolUseBlock(
+                    id="c1", name="write_file", arguments={"path": "a.py", "content": "a\n"}
+                ),
+                ToolUseBlock(
+                    id="c2", name="write_file", arguments={"path": "app.py", "content": "x"}
+                ),
+            ],
+            "max_tokens",
+        ),
+        (
+            [
+                ToolUseBlock(
+                    id="c3", name="write_file", arguments={"path": "app.py", "content": "x\n"}
+                )
+            ],
+            "tool_use",
+        ),
+        ([TextBlock(text=json.dumps(CODE))], "end_turn"),
+    ]
+
+    class CutOff(FakeLLM):
+        """Replies in order, the first one cut off at the output token limit."""
+
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            """The next scripted reply."""
+            self.requests.append(request)
+            blocks, stop = replies.pop(0)
+            return LLMResponse(
+                content=blocks,
+                stop_reason=stop,  # type: ignore[arg-type]
+                usage=Usage(),
+                provider="fake",
+                model="fake-1",
+            )
+
+    llm = CutOff()
+    result = await Engineer().run(env, ctx(llm))
+    assert result.status is ResultStatus.OK
+    ws = Path(env.run.workspace)
+    assert (ws / "a.py").read_text() == "a\n"  # the complete call ran
+    results = [b for b in llm.requests[1].messages[-1].content if isinstance(b, ToolResultBlock)]
+    assert [r.tool_use_id for r in results] == ["c1", "c2"]
+    assert results[1].is_error and "output token limit" in results[1].content
+    assert (ws / "app.py").read_text() == "x\n"  # written by the retried call
+
+
+async def test_repair_prompt_allows_a_tool_call_first(tmp_path: Path) -> None:
+    env = envelope(tmp_path, AgentName.ENGINEER, "code_change")
+    llm = FakeLLM(
+        {
+            AgentName.ENGINEER: [
+                json.dumps({"summary": "nothing yet", "files_written": []}),
+                tool_call("write_file", {"path": "app.py", "content": "x = 1\n"}),
+                json.dumps(CODE),
+            ]
+        }
+    )
+    result = await Engineer().run(env, ctx(llm))
+    assert result.status is ResultStatus.OK
+    repair = llm.requests[1].messages[-1].content[0]
+    text = getattr(repair, "text", "")
+    assert (
+        "write the spec's files with write_file" in text
+        and "tool call first, make that call" in text
+    )

@@ -405,6 +405,12 @@ class VerdictPolicy(Protocol):
         output in the same phase revises that task (FIX)."""
         ...
 
+    async def on_task_error(self, run: Run, task: Task) -> list[Decision]:
+        """What to do after the dispatcher escalated ``task`` for a failed attempt
+        (its ``last_error`` and ``previous_error`` say how). An empty list leaves it
+        to the orchestrator, which asks the user."""
+        ...
+
 
 class Dispatcher(Protocol):
     """Runs one task on its agent and records the outcome."""

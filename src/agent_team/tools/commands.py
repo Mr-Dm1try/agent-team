@@ -6,7 +6,8 @@ options, URLs or paths, and the pre-check can read every package it installs (S4
 
 Each call's ``data`` carries ``argv`` and ``exit_code``, which the auditor reads from
 the tool log: R6 matches the reported test command against ``argv`` and compares the
-exit codes.
+exit codes. A command killed by SIGILL (exit 132) or SIGSEGV (exit 139) gets a line
+saying so in plain words, with the likely cause and what to try.
 """
 
 from __future__ import annotations
@@ -44,6 +45,33 @@ MAX_PACKAGES = 100
 _ARCHIVE = re.compile(r"\.(?:whl|zip|tar|tgz|tbz|txz|gz|bz2|xz|egg)$", re.IGNORECASE)
 
 log = logging.getLogger(__name__)
+
+#: What an exit code from a crash signal means, and what to try, keyed by exit code.
+SIGNAL_HINTS: dict[int, tuple[str, str]] = {
+    132: (
+        "SIGILL",
+        "the process ran a CPU instruction this machine doesn't offer. That almost "
+        "always means a compiled package (a binary wheel) was built for a newer CPU "
+        "baseline than the sandbox exposes, as in Linux VMs on Apple Silicon, where "
+        "cryptography 47 and later crash on import. Find the package whose import "
+        "crashes and pin an older release, such as cryptography<47 (46.0.7).",
+    ),
+    139: (
+        "SIGSEGV",
+        "compiled code crashed (a segmentation fault). If it happens on import, a "
+        "binary wheel probably doesn't match the sandbox's CPU or C library: find the "
+        "package whose import crashes and pin an older release.",
+    ),
+}
+
+
+def signal_hint(exit_code: int) -> str | None:
+    """A plain-words line for an exit code that means a crash signal, else None."""
+    hint = SIGNAL_HINTS.get(exit_code)
+    if hint is None:
+        return None
+    name, meaning = hint
+    return f"note: exit {exit_code} means the process was killed by {name}: {meaning}"
 
 
 def _workspace_cwd(raw: Any, ctx: ToolContext, tool: str) -> str:
@@ -98,6 +126,9 @@ def _render(argv: list[str], result: CommandResult, *, label: str = "$") -> str:
         else f"exit {result.exit_code} in {result.duration_s}s"
     )
     parts = [f"{label} {' '.join(argv)}", status]
+    hint = None if result.timed_out else signal_hint(result.exit_code)
+    if hint:
+        parts.append(hint)
     if result.stdout.strip():
         parts += ["--- stdout ---", result.stdout.rstrip()]
     if result.stderr.strip():
@@ -113,6 +144,9 @@ def _data(argv: list[str], result: CommandResult, *, network: bool) -> dict[str,
         "duration_s": result.duration_s,
         "timed_out": result.timed_out,
         "network": network,
+        "signal": SIGNAL_HINTS[result.exit_code][0]
+        if result.exit_code in SIGNAL_HINTS and not result.timed_out
+        else None,
     }
 
 

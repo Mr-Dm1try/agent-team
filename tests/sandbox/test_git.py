@@ -132,3 +132,35 @@ async def test_a_failed_commit_is_logged_not_raised(
     with caplog.at_level(logging.WARNING):
         await make_commit_hook(tasks)(_verdict(run, task))
     assert "couldn't commit" in caplog.text
+
+
+def _elf(kind: int) -> bytes:
+    """The start of a little-endian ELF file of type ``kind`` (4 is a core file)."""
+    return b"\x7fELF\x02\x01\x01" + bytes(9) + kind.to_bytes(2, "little") + bytes(46)
+
+
+async def test_a_core_dump_is_never_committed(tmp_path: Path) -> None:
+    ws = tmp_path / "workspace"
+    (ws / "src" / "core").mkdir(parents=True)  # a package called core is code
+    (ws / "src" / "core" / "__init__.py").write_text("")
+    (ws / "core.py").write_text("x = 1\n")
+    (ws / "core").write_bytes(_elf(4))
+    (ws / "src" / "core.1234").write_bytes(_elf(4))
+    (ws / "core.bin").write_bytes(_elf(2))  # an executable named core.* is kept
+    await WorkspaceGit(ws).commit_version(V1, subject="s")
+    assert sorted(git(ws, "ls-files")) == [
+        ".gitignore",
+        "core.bin",
+        "core.py",
+        "src/core/__init__.py",
+    ]
+    # Nor was it hashed into the object store on the way.
+    [blob] = git(ws, "hash-object", "core")
+    with pytest.raises(subprocess.CalledProcessError):
+        git(ws, "cat-file", "-e", blob)
+    # One committed before is dropped from the next version.
+    git(ws, "-c", "user.name=t", "-c", "user.email=t@t", "add", "-f", "core")
+    git(ws, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "oops")
+    await WorkspaceGit(ws).commit_version(V2, subject="s")
+    assert "core" not in git(ws, "ls-files")
+    assert (ws / "core").is_file()  # left in place, just not committed

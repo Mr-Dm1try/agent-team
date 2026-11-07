@@ -38,7 +38,8 @@ rules:
     statement: >-
       Every finding, answer and excerpt cites a file or URL that the Researcher actually
       opened in this task, according to the tool-call log. A URL seen only in search
-      results was not opened.
+      results was not opened. A version claim, such as a pinned package version, is a
+      claim like any other: a source opened in this task must show that version.
 
   - id: P2
     title: Brief complete

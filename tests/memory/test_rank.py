@@ -32,6 +32,8 @@ def match(
     age_days: float = 0,
     used: int = 0,
     run: str = RUN,
+    words: float = 0.0,
+    covered: float = 0.0,
 ) -> MemoryMatch:
     """A search match with fixed scores."""
     memory = Memory(
@@ -42,7 +44,7 @@ def match(
         created_at=NOW - timedelta(days=age_days),
         usefulness=used,
     )
-    return MemoryMatch(memory=memory, cosine=cosine, bm25=bm25)
+    return MemoryMatch(memory=memory, cosine=cosine, bm25=bm25, words=words, covered=covered)
 
 
 #: Scores by hand with the default weights (cosine .5, bm25 .3, recency .1,
@@ -51,7 +53,8 @@ FIXTURE = [
     match("mem_a", K.LESSON, 0.80, 3.0),  # relevance .781, score .725
     match("mem_b", K.LESSON, 0.70, 1.0, age_days=60, used=4),  # .625, .592
     match("mem_c", K.PREFERENCE, 0.60, 0.0),  # .375, .400
-    match("mem_d", K.DECISION, 0.70, 1.0, age_days=30, run="run_old"),  # .625, .550
+    # Other run: strong on the memory's words the query has too (.6625)
+    match("mem_d", K.DECISION, 0.70, 1.0, age_days=30, run="run_old", covered=0.6),  # .625, .550
     match("mem_e", K.DECISION, 0.60, 0.5, run="run_old"),  # .500: other run, not strong
     match("mem_f", K.LESSON, 0.30, 0.0),  # .188: too weak
     match("mem_g", K.RESEARCH_FACT, 0.50, 0.0),  # .3125, .350: this run, kept
@@ -87,6 +90,20 @@ def test_other_runs_need_a_strong_match_unless_no_run_asks() -> None:
     assert "mem_d" in ids and "mem_e" not in ids
     ids = [r.memory.id for r in rank(FIXTURE, MemoryConfig(), now=NOW, run_id=None)]
     assert "mem_e" in ids and "mem_f" not in ids
+
+
+def test_another_runs_decision_needs_its_words_in_the_query_not_just_bm25() -> None:
+    # One rare shared word gives BM25 a strong squashed score on its own.
+    one_word = match("mem_x", K.DECISION, None, 1.94, run="run_old", covered=0.33)
+    vector = match("mem_y", K.RESEARCH_FACT, 0.55, 1.94, run="run_old", covered=0.17)
+    # Most of what it says is about this task, found by meaning or by keywords alone.
+    same_topic = match("mem_z", K.DECISION, 0.75, 0.0, run="run_old", covered=0.83)
+    keywords = match("mem_w", K.DECISION, None, 2.5, run="run_old", covered=0.83)
+    ranked = rank([one_word, vector, same_topic, keywords], MemoryConfig(), now=NOW, run_id=RUN)
+    assert sorted(r.memory.id for r in ranked) == ["mem_w", "mem_z"]
+    # The same match from this run is kept: only other runs need a strong match.
+    here = match("mem_x", K.DECISION, None, 1.94, covered=0.33)
+    assert [r.memory.id for r in rank([here], MemoryConfig(), now=NOW, run_id=RUN)] == ["mem_x"]
 
 
 def test_fit_stops_at_the_item_and_token_caps() -> None:

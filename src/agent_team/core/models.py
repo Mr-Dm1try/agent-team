@@ -249,6 +249,9 @@ class Task(Contract):
     output: ArtifactRef | None = None
     finding_ids: list[str] = Field(default_factory=list)  # findings from the last verdict
     last_error: str | None = None
+    #: The error the attempt before the current one ended with, if it ended with one:
+    #: for spotting a repeat (no progress) and telling the next attempt what happened.
+    previous_error: str | None = None
     last_traceback: str | None = None
     trace_id: str | None = None
     span_id: str | None = None
@@ -268,6 +271,7 @@ class FeedbackSource(StrEnum):
     AUDITOR = "auditor"
     QA = "qa"
     HARNESS = "harness"  # a limit the harness applied, such as on research requests
+    ENGINEER = "engineer"  # where passed code departs from the spec it was built from
 
 
 class Feedback(Contract):
@@ -298,6 +302,9 @@ class TaskEnvelope(Contract):
     findings: list[Finding] = Field(default_factory=list)  # from the last failed verdict
     previous_output: Artifact | None = None  # set on retries and revisions
     upstream_diff: str | None = None  # set on revisions
+    #: How the attempt before this one failed and what it did, so a retry after an
+    #: error builds on it instead of starting over.
+    previous_attempt: str | None = None
     #: False when the task can't ask for research (a depth or run limit); its
     #: requests are then turned into open gaps or assumptions.
     research_allowed: bool = True
@@ -377,6 +384,9 @@ class Verdict(Contract):
     summary: str | None = None  # the auditor model's short explanation of the verdict
     findings: list[Finding] = Field(default_factory=list)
     rules_checked: list[str] = Field(default_factory=list)
+    #: The evidence helpers' notes the auditor model read, by rule id, such as the
+    #: logged test run R6 matched, so a pass can be audited afterwards.
+    notes: dict[str, list[str]] = Field(default_factory=dict)
     model: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
 
@@ -516,12 +526,14 @@ class MemoryMatch(Contract):
     or the memory has no vector, ``bm25`` is SQLite's score made positive (higher is
     better, 0 when no query term matched) and ``words`` the share of words the two
     have in common, 0 to 1, which still counts when there are too few memories for
-    BM25 to weigh terms."""
+    BM25 to weigh terms. ``covered`` is the share of the memory's own words that the
+    query has, 0 to 1: how much of what it says is about this task."""
 
     memory: Memory
     cosine: float | None = None
     bm25: float = 0.0
     words: float = 0.0
+    covered: float = 0.0
 
 
 class EventName(StrEnum):

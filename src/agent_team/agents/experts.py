@@ -138,7 +138,10 @@ class Engineer(BaseAgent):
         if not isinstance(artifact, CodeChange):
             return errors
         if not artifact.files_written:
-            errors.append("files_written: list the files you wrote")
+            errors.append(
+                "files_written: no files listed; write the spec's files with write_file "
+                "first, then list their workspace-relative paths here"
+            )
         for f in artifact.files_written:
             try:
                 path = resolve_path(f, envelope.run, write=True, tool="check")

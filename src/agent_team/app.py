@@ -188,6 +188,7 @@ async def build_app(
             chaos=Chaos(config.chaos),
             runs=stores.tasks,
         )
+    tool_log = EventFileToolCallLog(runs_dir)
     if auditor is None:
         rules = SqliteRuleStore(config.paths.db)
         closers.append(rules.close)
@@ -199,7 +200,7 @@ async def build_app(
             artifacts=stores.artifacts,
             verdicts=stores.verdicts,
             decisions=stores.decisions,
-            tool_log=EventFileToolCallLog(runs_dir),
+            tool_log=tool_log,
         )
     bus.on_before(EventName.TOOL_CALL_BEFORE, make_precheck_hook(auditor, stores.tasks))
     if config.sandbox.commit_versions:
@@ -250,6 +251,7 @@ async def build_app(
         timeout_s=config.limits.task_timeout_s,
         auditor=auditor,
         research=research_limits,
+        tool_log=tool_log,
     )
     if policy is None:
         stronger = config.stronger_model

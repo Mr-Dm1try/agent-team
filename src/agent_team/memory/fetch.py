@@ -56,7 +56,7 @@ class MemorySearch:
         now: datetime | None = None,
     ) -> Found:
         """Memories of ``kinds`` matching ``text``, best first. ``run_id`` is the run
-        asking: decisions, facts and lessons from other runs need a strong match.
+        asking: decisions and research facts from other runs need a strong match.
         ``agent`` is who asks: other agents' lessons are left out. A query is cut to
         ``MAX_QUERY`` characters, since a search needs a few words, not a page."""
         text = text[:MAX_QUERY]

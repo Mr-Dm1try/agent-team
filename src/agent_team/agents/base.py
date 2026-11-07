@@ -89,6 +89,12 @@ def render_envelope(envelope: TaskEnvelope, tools: dict[str, Tool]) -> str:
             f"\n## Your previous output {prev.kind}@v{prev.version}\n"
             "Revise it; keep what the feedback doesn't ask you to change.\n" + dumped
         )
+    if envelope.previous_attempt:
+        parts.append(
+            "\n## Your previous attempt failed\nBuild on what it did instead of starting "
+            "over: don't repeat installs or checks that already worked.\n"
+            + envelope.previous_attempt
+        )
     if envelope.upstream_diff:
         parts.append(
             "\n## What changed upstream\nChange only what this diff requires.\n"

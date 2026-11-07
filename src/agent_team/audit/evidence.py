@@ -543,6 +543,7 @@ def sources_opened(ctx: AuditContext, rule: Rule) -> HelperResult:
         if isinstance(final, str):
             opened.add(patterns.normalize_source(final, ws))
     res = HelperResult(notes=[f"opened in this task: {sorted(opened)}"])
+    res.findings += _unsourced_pins(ctx, rule, artifact)
     for ref in sorted(set(cited)):
         norm = patterns.normalize_source(ref, ws)
         if norm not in opened:  # exact: fetching a site root doesn't open its pages
@@ -556,6 +557,87 @@ def sources_opened(ctx: AuditContext, rule: Rule) -> HelperResult:
                 )
             )
     return res
+
+
+#: A version pin in research text, written as a requirement: a package name, ==, ===
+#: or ~= with no spaces, and a version with at least one dot (``mcp==2.3.0``). Prose
+#: such as ``status_code == 200`` or ``timeout>=30`` isn't one.
+_PIN = re.compile(r"(?<![\w.-])([A-Za-z][A-Za-z0-9._-]*)(===|==|~=)(\d+(?:\.\w+)+)(?!\w|\.\w)")
+#: Names a pin can't be about: the interpreter, not a package.
+_NOT_PACKAGES = frozenset({"python", "py"})
+#: Most characters read from one saved tool result when looking for a version.
+_MAX_SOURCE_CHARS = 2_000_000
+
+
+def _package(name: str) -> str:
+    """A package name in its normal form, so ``Py_JWT`` and ``py-jwt`` match."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _source_texts(ctx: AuditContext) -> list[str]:
+    """The text of every source the task opened: each successful read tool's result,
+    in full when it was saved to a file for being long."""
+    texts: list[str] = []
+    for call in ctx.ran():
+        if call.tool not in READ_TOOLS or call.is_error:
+            continue
+        text = call.result
+        if call.stored_at:
+            try:
+                with open(call.stored_at, encoding="utf-8", errors="replace") as f:
+                    text = f.read(_MAX_SOURCE_CHARS)
+            except OSError:
+                pass
+        texts.append(text)
+    return texts
+
+
+def _research_text(artifact: ResearchBrief | ResearchAnswer) -> str:
+    """The claims of a brief or answer, where a version pin would be stated."""
+    if isinstance(artifact, ResearchAnswer):
+        return "\n".join([artifact.summary, artifact.answer])
+    parts = [artifact.summary, *artifact.constraints]
+    parts += [f.claim for f in artifact.findings]
+    parts += [a.answer or "" for a in artifact.answers]
+    return "\n".join(parts)
+
+
+def _unsourced_pins(
+    ctx: AuditContext, rule: Rule, artifact: ResearchBrief | ResearchAnswer
+) -> list[Finding]:
+    """R2 for version claims: every pin the research states (``mcp==2.3.0``) shows up
+    in a source the task opened, with the package's name in the same source. A pin
+    the user's request already gives needs no source."""
+    pins = {
+        (_package(m[1]), m[1], m[2], m[3])
+        for m in _PIN.finditer(_research_text(artifact))
+        if m[1].lower() not in _NOT_PACKAGES
+    }
+    if not pins:
+        return []
+    texts = _source_texts(ctx)
+    request = ctx.run.request.lower()
+    out: list[Finding] = []
+    for package, name, op, version in sorted(pins):
+        if f"{name}{op}{version}".lower() in request.replace(" ", ""):
+            continue
+        # A release tag may read v2.3.0, and ==2.0 is the release 2.0.0.
+        shown = re.compile(rf"(?<![\w.])v?{re.escape(version)}(?:\.0)*(?![\w]|\.\d)")
+        spelled = "[-_.]+".join(re.escape(part) for part in package.split("-"))
+        named = re.compile(rf"(?<![\w.-]){spelled}(?![\w-])", re.IGNORECASE)
+        if any(shown.search(t) and named.search(t) for t in texts):
+            continue
+        out.append(
+            hit(
+                rule,
+                f"states {name}{op}{version} but no source opened in this task shows that version",
+                item=f"{name}{op}{version}",
+                artifact=artifact,
+                fix=f"fetch https://pypi.org/pypi/{name}/json, which lists every released "
+                "version, and cite it; or drop the pin",
+            )
+        )
+    return out
 
 
 @helper("brief_complete")
@@ -939,6 +1021,14 @@ def interface_names(ctx: AuditContext, rule: Rule) -> HelperResult:
         return HelperResult()
     code = "\n".join(text for *_, text in ctx.code_files())
     res = HelperResult()
+    declared = [
+        line
+        for _, out in ctx.outputs
+        if isinstance(out, CodeChange)
+        for line in out.spec_deviations
+    ]
+    if declared:
+        res.notes.append(f"departures from the spec the Engineer declared: {declared}")
     for iface in spec.interfaces:
         needle = _interface_needle(iface.name)
         if not needle:

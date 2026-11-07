@@ -10,6 +10,8 @@ fsmonitor, no external diff drivers and no signing, so the user's git config can
 change or stall it. The command tools create the repository before the first command
 runs, so the container only ever sees ``.git`` read-only, and the file tools refuse to
 write there: agents can't rewrite the history or plant config the host's git would run.
+A core dump (a file named ``core`` or ``core.*`` that is an ELF core file) is never
+committed, should a crash leave one.
 """
 
 from __future__ import annotations
@@ -26,6 +28,28 @@ from agent_team.core.models import AgentName, Event
 from agent_team.sandbox.base import ensure_gitignore
 
 log = logging.getLogger(__name__)
+
+#: ELF type of a core file (``ET_CORE``).
+_ET_CORE = 4
+#: Paths a core dump can have: ``core`` or ``core.*`` in any folder.
+_CORE_PATHS = (":(glob)**/core", ":(glob)**/core.*")
+
+
+def is_core_dump(path: Path) -> bool:
+    """Whether ``path`` is a core dump: named ``core`` or ``core.*`` and an ELF core
+    file, so a ``core.py`` or a ``core`` package folder never counts."""
+    if not (path.name == "core" or path.name.startswith("core.")) or not path.is_file():
+        return False
+    try:
+        with path.open("rb") as f:
+            head = f.read(18)
+    except OSError:
+        return False
+    if len(head) < 18 or head[:4] != b"\x7fELF" or head[5] not in (1, 2):
+        return False
+    kind = int.from_bytes(head[16:18], "little" if head[5] == 1 else "big")
+    return kind == _ET_CORE
+
 
 _GIT_CONFIG = (
     "-c",
@@ -94,13 +118,30 @@ class WorkspaceGit:
         """Commit everything in the workspace for one artifact version, tag it and
         return the commit sha. A version with no file changes still gets a commit."""
         await self.ensure_repo()
-        await self._git("add", "-A")
+        dumps = await self.core_dumps()
+        await self._git("add", "-A", "--", ".", *(f":(exclude,literal){d}" for d in dumps))
+        if dumps:
+            log.warning("leaving core dumps out of the commit: %s", ", ".join(dumps))
+            # One a version before this committed leaves the history from here on.
+            await self._git(
+                "rm", "-q", "--cached", "--ignore-unmatch", "--", *(f":(literal){d}" for d in dumps)
+            )
         message = f"{ref.kind} v{ref.version}: {subject}".strip()
         if body:
             message += f"\n\n{body}"
         await self._git("commit", "-q", "--allow-empty", "-m", message)
         await self._git("tag", "-f", version_tag(ref))
         return (await self._git("rev-parse", "HEAD")).strip()
+
+    async def core_dumps(self) -> list[str]:
+        """The workspace's core dumps that git would see (tracked, or untracked and not
+        ignored), found by name through git and confirmed by their ELF header, so
+        nothing is hashed or walked that the commit wouldn't touch."""
+        out = await self._git(
+            "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *_CORE_PATHS
+        )
+        names = {n for n in out.split("\0") if n}
+        return sorted(n for n in names if is_core_dump(self.workspace / n))
 
     async def diff(self, old: ArtifactRef, new: ArtifactRef) -> str:
         """The workspace diff between two committed versions."""

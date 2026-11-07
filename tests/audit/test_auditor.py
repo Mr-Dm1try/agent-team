@@ -424,9 +424,10 @@ async def test_r6_passes_a_wrapped_run_and_fails_a_masked_failure(rig: Rig, run:
     passed = call(run, eng, "run_command", "73 passed in 2.10s\nEXIT=0", argv=wrapped)
     rig.tool_log.record(passed.model_copy(update={"data": {"argv": wrapped, "exit_code": 0}}))
     rig.llm.push(PASS)
-    assert "R6" not in {
-        f.rule_id for f in (await rig.auditor.audit_task(eng, change, run)).blockers
-    }
+    ok = await rig.auditor.audit_task(eng, change, run)
+    assert "R6" not in {f.rule_id for f in ok.blockers}
+    # The matched run is kept on the stored verdict, so the pass can be checked later.
+    assert any("python -m pytest -q" in n for n in ok.notes["R6"]), ok.notes
 
     failed = call(run, eng, "run_command", "2 failed, 71 passed in 2.3s\nEXIT=1", argv=wrapped)
     rig.tool_log.record(failed.model_copy(update={"data": {"argv": wrapped, "exit_code": 0}}))

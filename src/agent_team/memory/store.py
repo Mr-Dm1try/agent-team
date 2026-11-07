@@ -211,9 +211,17 @@ class SqliteMemoryIndex:
                 stored = np.frombuffer(row["vector"], dtype=np.float32)
                 cos = float(stored @ query) if stored.shape == query.shape else None
             memory = _memory(row)
-            words = overlap(asked, terms(memory.text)) if memory_id in bm25 else 0.0
+            own = terms(memory.text)
+            words = overlap(asked, own) if memory_id in bm25 else 0.0
+            covered = len(asked & own) / len(own) if own else 0.0
             out.append(
-                MemoryMatch(memory=memory, cosine=cos, bm25=bm25.get(memory_id, 0.0), words=words)
+                MemoryMatch(
+                    memory=memory,
+                    cosine=cos,
+                    bm25=bm25.get(memory_id, 0.0),
+                    words=words,
+                    covered=covered,
+                )
             )
         return out
 

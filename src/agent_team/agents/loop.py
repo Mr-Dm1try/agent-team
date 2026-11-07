@@ -40,6 +40,18 @@ Level = Literal["debug", "info", "warning", "error"]
 #: Extra checks beyond the schema, such as "every planned file exists". Returns errors.
 Check = Callable[[Any], Awaitable[list[str]]]
 
+#: The result of a tool call the model was still writing when its reply hit the
+#: output token limit.
+CUT_OFF_NOTE = (
+    "Not run: your reply hit the output token limit while writing this call, so its "
+    "arguments may be cut off. Make the call again with less in it: one file per "
+    "write_file call, and split a long file into smaller modules."
+)
+#: The first repair error for a final reply cut off at the output token limit.
+CUT_OFF_REPLY = (
+    "the reply hit the output token limit; reply with shorter JSON that reports what "
+    "you did, such as the paths of files you wrote, without repeating their contents"
+)
 INTERRUPTED_NOTE = (
     "This tool call was running when the process stopped. It was not repeated because "
     "it is not safe to repeat. Check the current state before trying it again."
@@ -214,9 +226,18 @@ class ToolLoop[M: BaseModel]:
             tool_use_id=call.id, content=content, is_error=result.is_error, stored_at=stored_at
         )
 
-    async def _run_tools(self, calls: list[ToolUseBlock], *, resumed: bool = False) -> Message:
-        """Run a turn's tool calls in order and return their results as one user turn."""
-        results: list[ContentBlock] = [await self._call_tool(c, resumed=resumed) for c in calls]
+    async def _run_tools(
+        self, calls: list[ToolUseBlock], *, resumed: bool = False, cut_off: bool = False
+    ) -> Message:
+        """Run a turn's tool calls in order and return their results as one user turn.
+        When the reply hit the output token limit (``cut_off``), its last call may be
+        missing the end of its arguments, so it isn't run and the model is told why."""
+        run, last = (calls[:-1], calls[-1]) if cut_off else (calls, None)
+        results: list[ContentBlock] = [await self._call_tool(c, resumed=resumed) for c in run]
+        if last is not None:
+            results.append(
+                ToolResultBlock(tool_use_id=last.id, content=CUT_OFF_NOTE, is_error=True)
+            )
         return Message(role="user", content=results)
 
     # --- the loop ------------------------------------------------------------------
@@ -376,7 +397,8 @@ class ToolLoop[M: BaseModel]:
             await self._save(messages)
 
             if response.tool_calls:
-                messages.append(await self._run_tools(response.tool_calls))
+                cut_off = response.stop_reason == "max_tokens"
+                messages.append(await self._run_tools(response.tool_calls, cut_off=cut_off))
                 await self._save(messages)
                 continue
             if response.stop_reason == "max_tokens":
@@ -385,7 +407,7 @@ class ToolLoop[M: BaseModel]:
                 value, errors = await self._validate(final_text)
                 if value is not None:
                     return self._outcome(value, messages)
-                errors = ["the reply hit the token limit; reply with shorter JSON", *errors]
+                errors = [CUT_OFF_REPLY, *errors]
                 if repairs >= self.settings.max_repairs:
                     err = OutputValidationError("output was cut off", errors=errors)
                     return self._outcome(None, messages, error=err)
@@ -415,5 +437,6 @@ def _repair_prompt(errors: list[str], model: type[BaseModel]) -> str:
     listed = "\n".join(f"- {e}" for e in errors[:20])
     return (
         f"Your final answer did not validate as {model.__name__}:\n{listed}\n"
-        "Reply again with only the corrected JSON object, no prose and no code fences."
+        "If fixing it needs a tool call first, make that call. "
+        "Then reply with only the corrected JSON object, no prose and no code fences."
     )

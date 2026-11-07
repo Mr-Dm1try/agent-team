@@ -5,6 +5,7 @@ passed in. It implements the VerdictPolicy Protocol:
 - fail with attempts left -> RETRY
 - fail with none left, or a check that failed closed -> ESCALATE. A check that could
   not be completed already used its own attempts; it never costs the task one.
+- a task escalated after an error -> no decisions, so the orchestrator asks the user.
 """
 
 from __future__ import annotations
@@ -50,3 +51,7 @@ class SimplePolicy:
                 rule="simple_policy.escalate",
             )
         ]
+
+    async def on_task_error(self, run: Run, task: Task) -> list[Decision]:
+        """Nothing: the orchestrator asks the user about an escalated task."""
+        return []

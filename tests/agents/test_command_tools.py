@@ -93,6 +93,35 @@ async def test_a_timeout_is_reported(ctx: ToolContext) -> None:
 
 
 @pytest.mark.parametrize(
+    ("code", "signal", "words"),
+    [(132, "SIGILL", "pin an older release"), (139, "SIGSEGV", "segmentation fault")],
+)
+async def test_a_crash_signal_is_explained(
+    ctx: ToolContext, code: int, signal: str, words: str
+) -> None:
+    def crash(spec: CommandSpec) -> CommandResult:
+        """A command killed by a signal, as the shell reports it."""
+        return CommandResult(
+            exit_code=code, stdout="", stderr="Illegal instruction (core dumped)", duration_s=1
+        )
+
+    out = await command_tools(FakeRunner(answer=crash), CONFIG)["run_command"](
+        {"argv": ["python", "-c", "import cryptography.hazmat.bindings._rust"]}, ctx
+    )
+    second = out.content.splitlines()[2]
+    assert second.startswith(f"note: exit {code} means the process was killed by {signal}")
+    assert words in out.content
+    assert out.is_error and out.data is not None and out.data["signal"] == signal
+
+
+async def test_an_ordinary_failure_gets_no_signal_note(ctx: ToolContext) -> None:
+    out = await command_tools(FakeRunner(answer=failing), CONFIG)["run_command"](
+        {"argv": ["x"]}, ctx
+    )
+    assert "note:" not in out.content and out.data is not None and out.data["signal"] is None
+
+
+@pytest.mark.parametrize(
     ("args", "message"),
     [
         ({"argv": "pytest -q"}, "list of strings"),
